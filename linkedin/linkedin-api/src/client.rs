@@ -15,6 +15,7 @@ use std::sync::Arc;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
+use crate::auth::Session;
 use crate::error::Error;
 
 /// Base URL for all LinkedIn API requests. There is no separate API subdomain;
@@ -200,6 +201,77 @@ impl LinkedInClient {
         Ok(Self {
             http,
             jsessionid,
+            device_id,
+            x_li_track,
+        })
+    }
+
+    /// Create a client from a persisted [`Session`].
+    ///
+    /// Uses the session's JSESSIONID and injects the `li_at` cookie into the
+    /// cookie jar on the `.linkedin.com` domain. A new device ID is generated
+    /// (the session doesn't persist device identity -- that's a separate concern).
+    pub fn with_session(session: &Session) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let x_li_track = build_x_li_track(&device_id);
+
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            "X-RestLi-Protocol-Version",
+            HeaderValue::from_static("2.0.0"),
+        );
+        default_headers.insert("X-LI-Lang", HeaderValue::from_static("en_US"));
+        default_headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
+        default_headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        default_headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("ANDROID OS"),
+        );
+        default_headers.insert(
+            "X-UDID",
+            HeaderValue::from_str(&device_id)
+                .map_err(|e| Error::Auth(format!("invalid device_id header value: {e}")))?,
+        );
+        default_headers.insert(
+            "X-LI-Track",
+            HeaderValue::from_str(&x_li_track)
+                .map_err(|e| Error::Auth(format!("invalid X-LI-Track header value: {e}")))?,
+        );
+
+        let jar = Arc::new(reqwest::cookie::Jar::default());
+        let base_url: url::Url = BASE_URL
+            .parse()
+            .map_err(|e| Error::Auth(format!("invalid base URL: {e}")))?;
+
+        // Set JSESSIONID cookie (CSRF token).
+        jar.add_cookie_str(
+            &format!(
+                "JSESSIONID=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
+                session.jsessionid
+            ),
+            &base_url,
+        );
+
+        // Set li_at cookie (session authentication).
+        jar.add_cookie_str(
+            &format!(
+                "li_at={}; Domain=.linkedin.com; Path=/; Secure",
+                session.li_at
+            ),
+            &base_url,
+        );
+
+        let http = reqwest::Client::builder()
+            .cookie_provider(jar)
+            .default_headers(default_headers)
+            .build()?;
+
+        Ok(Self {
+            http,
+            jsessionid: session.jsessionid.clone(),
             device_id,
             x_li_track,
         })
