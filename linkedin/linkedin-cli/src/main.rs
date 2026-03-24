@@ -5,8 +5,7 @@ use clap::{Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{
-    ConnectionsResponse, ConversationsResponse, FeedResponse, NotificationCardsResponse,
-    SearchResponse,
+    ConnectionsResponse, FeedResponse, NotificationCardsResponse, SearchResponse,
 };
 
 #[derive(Parser)]
@@ -177,9 +176,9 @@ enum MessagesAction {
         #[arg(long, default_value = "10")]
         count: u32,
 
-        /// Pagination offset (default: 0)
-        #[arg(long, default_value = "0")]
-        start: u32,
+        /// Cursor for pagination: epoch-millis timestamp to fetch conversations created before
+        #[arg(long)]
+        before: Option<u64>,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -190,13 +189,9 @@ enum MessagesAction {
         /// Conversation ID (thread ID portion of URN, e.g. 2-abc123)
         conversation_id: String,
 
-        /// Number of messages to fetch (default: 20)
-        #[arg(long, default_value = "20")]
-        count: u32,
-
-        /// Pagination offset (default: 0)
-        #[arg(long, default_value = "0")]
-        start: u32,
+        /// Cursor for pagination: epoch-millis timestamp to fetch messages created before
+        #[arg(long)]
+        before: Option<u64>,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -244,19 +239,22 @@ async fn main() {
             }
         },
         Commands::Messages { action } => match action {
-            MessagesAction::List { count, start, json } => {
-                if let Err(e) = cmd_messages_list(start, count, json).await {
+            MessagesAction::List {
+                count,
+                before,
+                json,
+            } => {
+                if let Err(e) = cmd_messages_list(count, before, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
             }
             MessagesAction::Read {
                 conversation_id,
-                count,
-                start,
+                before,
                 json,
             } => {
-                if let Err(e) = cmd_messages_read(&conversation_id, start, count, json).await {
+                if let Err(e) = cmd_messages_read(&conversation_id, before, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -763,11 +761,15 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
 ///
 /// Loads the session, calls GET /voyager/api/messaging/conversations with
 /// pagination params, and prints the results.
-async fn cmd_messages_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+async fn cmd_messages_list(
+    count: u32,
+    created_before: Option<u64>,
+    raw_json: bool,
+) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let value = client
-        .get_conversations(start, count)
+        .get_conversations(count, created_before)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
@@ -778,49 +780,45 @@ async fn cmd_messages_list(start: u32, count: u32, raw_json: bool) -> Result<(),
         return Ok(());
     }
 
-    let resp: ConversationsResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse conversations response: {e}"))?;
+    // GraphQL response: data.messengerConversationsByCategory.elements
+    let elements = value
+        .get("data")
+        .and_then(|d| d.get("messengerConversationsByCategory"))
+        .and_then(|c| c.get("elements"))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    if let Some(ref paging) = resp.paging {
-        let total_str = paging
-            .total
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Conversations (offset {}, showing {}, total {})",
-            paging.start, paging.count, total_str
-        );
-    }
+    println!("Conversations ({})", elements.len());
     println!("---");
 
-    if resp.elements.is_empty() {
+    if elements.is_empty() {
         println!("(no conversations)");
         return Ok(());
     }
 
-    for (i, element) in resp.elements.iter().enumerate() {
-        let idx = start as usize + i + 1;
-        print_conversation(idx, element);
+    for (i, element) in elements.iter().enumerate() {
+        let idx = i + 1;
+        print_graphql_conversation(idx, element);
         println!();
     }
 
     Ok(())
 }
 
-/// Handle `messages read <conversation_id> [--count N] [--start N] [--json]`.
+/// Handle `messages read <conversation_id> [--before TS] [--json]`.
 ///
 /// Loads the session, calls GET /voyager/api/messaging/conversations/{id}/events
-/// with pagination params, and prints the messages.
+/// with cursor-based pagination, and prints the messages.
 async fn cmd_messages_read(
     conversation_id: &str,
-    start: u32,
-    count: u32,
+    created_before: Option<u64>,
     raw_json: bool,
 ) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let value = client
-        .get_conversation_events(conversation_id, start, count)
+        .get_conversation_events(conversation_id, created_before)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
@@ -831,25 +829,16 @@ async fn cmd_messages_read(
         return Ok(());
     }
 
+    // GraphQL response: data.messengerMessagesByConversation.elements
     let elements = value
-        .get("elements")
+        .get("data")
+        .and_then(|d| d.get("messengerMessagesByConversation"))
+        .and_then(|c| c.get("elements"))
         .and_then(|e| e.as_array())
         .cloned()
         .unwrap_or_default();
 
-    if let Some(paging) = value.get("paging") {
-        let pg_start = paging.get("start").and_then(|v| v.as_u64()).unwrap_or(0);
-        let pg_count = paging.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let total_str = paging
-            .get("total")
-            .and_then(|v| v.as_u64())
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Messages in {} (offset {}, showing {}, total {})",
-            conversation_id, pg_start, pg_count, total_str
-        );
-    }
+    println!("Messages in {} ({})", conversation_id, elements.len());
     println!("---");
 
     if elements.is_empty() {
@@ -858,7 +847,7 @@ async fn cmd_messages_read(
     }
 
     for event in &elements {
-        print_messaging_event(event);
+        print_graphql_message(event);
         println!();
     }
 
@@ -1244,19 +1233,15 @@ fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), String>
 /// Truncate a string to at most `max_chars` characters, safely handling
 /// multi-byte UTF-8. Returns the original string if it is shorter than
 /// `max_chars`.
-fn truncate(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
-
-/// Print a brief human-readable summary of a single conversation.
-fn print_conversation(index: usize, conv: &serde_json::Value) {
-    let urn = conv.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
-
-    // Extract conversation ID from URN for easy use with `messages read`.
-    let conv_id = urn.strip_prefix("urn:li:messagingThread:").unwrap_or(urn);
+/// Print a conversation from the GraphQL `messengerConversationsByCategory` response.
+fn print_graphql_conversation(index: usize, conv: &serde_json::Value) {
+    let backend_urn = conv
+        .get("backendUrn")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    let conv_id = backend_urn
+        .strip_prefix("urn:li:messagingThread:")
+        .unwrap_or(backend_urn);
 
     let read = conv.get("read").and_then(|r| r.as_bool()).unwrap_or(true);
     let unread_marker = if read { " " } else { "*" };
@@ -1266,15 +1251,55 @@ fn print_conversation(index: usize, conv: &serde_json::Value) {
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
 
-    // Try to extract participant names.
-    let participants = extract_participant_names(conv);
+    // Extract participant names from conversationParticipants.
+    let mut names = Vec::new();
+    if let Some(participants) = conv
+        .get("conversationParticipants")
+        .and_then(|p| p.as_array())
+    {
+        for p in participants {
+            let name = p
+                .get("participantType")
+                .and_then(|pt| pt.get("member"))
+                .and_then(|member| {
+                    let first = member
+                        .get("firstName")
+                        .and_then(|f| f.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let last = member
+                        .get("lastName")
+                        .and_then(|l| l.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if first.is_empty() && last.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{} {}", first, last).trim().to_string())
+                    }
+                });
+            if let Some(n) = name {
+                names.push(n);
+            }
+        }
+    }
 
-    // Try to get the last message preview from inline events.
+    // Last message from inline messages.elements.
     let last_message = conv
-        .get("events")
+        .get("messages")
+        .and_then(|m| m.get("elements"))
         .and_then(|e| e.as_array())
         .and_then(|arr| arr.first())
-        .and_then(extract_message_body)
+        .and_then(|msg| msg.get("body"))
+        .and_then(|b| {
+            if b.is_string() {
+                b.as_str().map(|s| s.to_string())
+            } else {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            }
+        })
         .unwrap_or_default();
 
     let truncated_msg = truncate(&last_message, 80);
@@ -1284,13 +1309,11 @@ fn print_conversation(index: usize, conv: &serde_json::Value) {
         last_message
     };
 
-    // Group chat name.
-    let name = conv.get("name").and_then(|n| n.as_str()).unwrap_or("");
-
-    let display_name = if !name.is_empty() {
-        name.to_string()
-    } else if !participants.is_empty() {
-        participants.join(", ")
+    let title = conv.get("title").and_then(|n| n.as_str()).unwrap_or("");
+    let display_name = if !title.is_empty() {
+        title.to_string()
+    } else if !names.is_empty() {
+        names.join(", ")
     } else {
         "(unknown)".to_string()
     };
@@ -1307,113 +1330,67 @@ fn print_conversation(index: usize, conv: &serde_json::Value) {
     }
 }
 
-/// Extract participant names from a conversation's participants array.
-fn extract_participant_names(conv: &serde_json::Value) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(participants) = conv.get("participants").and_then(|p| p.as_array()) {
-        for participant in participants {
-            // Participants are a union type; try MessagingMember path.
-            let name = participant
-                .get("com.linkedin.voyager.messaging.MessagingMember")
-                .or_else(|| participant.get("messagingMember"))
-                .and_then(|member| member.get("miniProfile"))
-                .and_then(|profile| {
-                    let first = profile
-                        .get("firstName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let last = profile
-                        .get("lastName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if first.is_empty() && last.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} {}", first, last).trim().to_string())
-                    }
-                });
-            if let Some(n) = name {
-                names.push(n);
-            }
-        }
-    }
-    names
-}
-
-/// Extract message body text from an event's eventContent.
-fn extract_message_body(event: &serde_json::Value) -> Option<String> {
-    let content = event.get("eventContent")?;
-    // eventContent is a union; try MessageEvent variant.
-    let msg = content
-        .get("com.linkedin.voyager.messaging.event.MessageEvent")
-        .or_else(|| content.get("messageEvent"))?;
-
-    // Prefer attributedBody.text, fall back to body.
-    let body = msg
-        .get("attributedBody")
-        .and_then(|ab| ab.get("text"))
-        .and_then(|t| t.as_str())
-        .or_else(|| msg.get("body").and_then(|b| b.as_str()))?;
-
-    if body.is_empty() {
-        None
-    } else {
-        Some(body.to_string())
-    }
-}
-
-/// Print a single messaging event in human-readable format.
-fn print_messaging_event(event: &serde_json::Value) {
-    let subtype = event
-        .get("subtype")
-        .and_then(|s| s.as_str())
-        .unwrap_or("UNKNOWN");
-
-    // Timestamp.
-    let created_at = event.get("createdAt").and_then(|c| c.as_u64()).unwrap_or(0);
-    let time_str = if created_at > 0 {
-        // Convert epoch millis to a readable format.
-        let secs = (created_at / 1000) as i64;
-        let nanos = ((created_at % 1000) * 1_000_000) as u32;
+/// Print a message from the GraphQL `messengerMessagesByConversation` response.
+fn print_graphql_message(msg: &serde_json::Value) {
+    // Timestamp from deliveredAt.
+    let delivered_at = msg.get("deliveredAt").and_then(|c| c.as_u64()).unwrap_or(0);
+    let time_str = if delivered_at > 0 {
+        let secs = (delivered_at / 1000) as i64;
+        let nanos = ((delivered_at % 1000) * 1_000_000) as u32;
         chrono::DateTime::from_timestamp(secs, nanos)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| created_at.to_string())
+            .unwrap_or_else(|| delivered_at.to_string())
     } else {
         String::new()
     };
 
-    // Sender name.
-    let sender = event
-        .get("from")
-        .and_then(|from| {
-            from.get("com.linkedin.voyager.messaging.MessagingMember")
-                .or_else(|| from.get("messagingMember"))
-        })
-        .and_then(|member| member.get("miniProfile"))
-        .and_then(|profile| {
-            let first = profile
-                .get("firstName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let last = profile
-                .get("lastName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if first.is_empty() && last.is_empty() {
-                None
-            } else {
-                Some(format!("{} {}", first, last).trim().to_string())
-            }
-        })
-        .unwrap_or_else(|| "(unknown)".to_string());
+    // Sender URN (we can't resolve name without a separate lookup).
+    let sender_urn = msg
+        .get("sender")
+        .and_then(|s| s.get("hostIdentityUrn"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("unknown");
+    // Try to shorten the URN for display.
+    let sender_display = sender_urn
+        .strip_prefix("urn:li:fsd_profile:")
+        .unwrap_or(sender_urn);
 
     // Message body.
-    let body = extract_message_body(event).unwrap_or_else(|| format!("[{} event]", subtype));
+    let body = msg
+        .get("body")
+        .and_then(|b| {
+            if b.is_string() {
+                b.as_str().map(|s| s.to_string())
+            } else {
+                b.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            }
+        })
+        .unwrap_or_default();
+
+    let subject = msg.get("subject").and_then(|s| s.as_str()).unwrap_or("");
 
     if !time_str.is_empty() {
-        println!("[{}] {}", time_str, sender);
-    } else {
-        println!("{}", sender);
+        print!("[{}] ", time_str);
     }
-    println!("  {}", body);
+    println!("{}", sender_display);
+    if !subject.is_empty() {
+        println!("  Subject: {}", subject);
+    }
+    if !body.is_empty() {
+        println!("  {}", body);
+    }
 }
+
+fn truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+// NOTE: The old REST-based print_conversation, extract_participant_names,
+// extract_message_body, and print_messaging_event functions have been removed.
+// They relied on the now-defunct messaging/conversations REST endpoint.
+// The GraphQL equivalents are print_graphql_conversation and print_graphql_message.

@@ -213,6 +213,26 @@ impl LinkedInClient {
         check_response(resp).await
     }
 
+    /// Send a GET request to the Voyager GraphQL endpoint.
+    ///
+    /// The `query_params` string is appended to `/voyager/api/graphql?`.
+    /// This adds the `x-li-graphql-pegasus-client: true` header that LinkedIn
+    /// requires for GraphQL requests (discovered in `BaseGraphQLClient.java`).
+    ///
+    /// The CSRF token header is added automatically.
+    /// Returns an [`Error::Api`] if the server responds with a non-success status code.
+    pub async fn graphql_get(&self, query_params: &str) -> Result<Value, Error> {
+        let url = format!("{}{}graphql?{}", BASE_URL, API_PREFIX, query_params);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .header("x-li-graphql-pegasus-client", "true")
+            .send()
+            .await?;
+        check_response(resp).await
+    }
+
     /// Send a GET request to an arbitrary path on the LinkedIn host.
     ///
     /// Unlike [`get`](Self::get), the `path` is NOT prefixed with `/voyager/api/`.
@@ -313,20 +333,79 @@ impl LinkedInClient {
 
     /// Fetch the user's messaging conversations.
     ///
-    /// Calls `GET /voyager/api/messaging/conversations` with pagination.
-    /// Returns the raw JSON response containing `elements` (array of
-    /// `Conversation` items) and `paging`.
+    /// Calls `GET /voyager/api/messaging/conversations` with cursor-based
+    /// pagination. LinkedIn uses `createdBefore` timestamps for pagination
+    /// rather than offset-based `start` parameters.
     ///
     /// # Parameters
     ///
-    /// - `start`: 0-based offset for pagination.
     /// - `count`: Number of conversations to request per page.
+    /// - `created_before`: Optional epoch-millis cursor for pagination.
+    ///   Omit (pass `None`) for the first page.
     ///
     /// See `re/api_endpoint_catalog.md` section 6 and `re/pegasus_models.md`
     /// for the `Conversation` model definition.
-    pub async fn get_conversations(&self, start: u32, count: u32) -> Result<Value, Error> {
-        let path = format!("messaging/conversations?start={}&count={}", start, count);
-        self.get(&path).await
+    pub async fn get_conversations(
+        &self,
+        _count: u32,
+        created_before: Option<u64>,
+    ) -> Result<Value, Error> {
+        // The REST endpoint messaging/conversations returns HTTP 500
+        // (deprecated server-side for the international build).
+        //
+        // Use the Messenger GraphQL query `messengerConversationsByCategory`
+        // from MessengerGraphQLClient.java in the decompiled code.
+        // queryId: voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6
+        //
+        // Required variables:
+        //   mailboxUrn: urn:li:fsd_profile:{member_id}
+        //   category: PRIMARY_INBOX (or other category)
+        //   count: number of conversations
+        // Optional:
+        //   lastActivityBefore: epoch-millis cursor for pagination
+
+        // First, get the dash entity URN from the /me endpoint to construct the mailboxUrn.
+        // The mailboxUrn format is urn:li:fsd_profile:{opaque_id} (from dashEntityUrn).
+        let me = self.get("me").await?;
+        let mailbox_urn = me
+            .get("miniProfile")
+            .and_then(|mp| mp.get("dashEntityUrn"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: "could not extract miniProfile.dashEntityUrn from /me response".to_string(),
+            })?
+            .to_string();
+
+        // Use the Voyager GraphQL endpoint to fetch messaging conversations.
+        // The REST endpoint messaging/conversations returns HTTP 500
+        // (deprecated/removed server-side for the international build).
+        //
+        // The `messengerConversationsByCategory` query from
+        // MessengerGraphQLClient.java fetches conversations by category.
+        //
+        // In Rest.li encoding, string values containing special characters
+        // (colons, commas, parentheses) must be percent-encoded within the
+        // variables map. The `DataEncoder` in the Android app does this
+        // via `AndroidUriCodec`.
+        let encoded_urn: String =
+            url::form_urlencoded::byte_serialize(mailbox_urn.as_bytes()).collect();
+        let vars = if let Some(ts) = created_before {
+            format!(
+                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{},lastActivityBefore:{})",
+                encoded_urn, _count, ts
+            )
+        } else {
+            format!(
+                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{})",
+                encoded_urn, _count
+            )
+        };
+        let params = format!(
+            "variables={}&queryId=voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6&queryName=MessengerConversationsByCategory",
+            vars
+        );
+        self.graphql_get(&params).await
     }
 
     /// Fetch the user's connections.
@@ -405,30 +484,64 @@ impl LinkedInClient {
 
     /// Fetch events (messages) within a specific conversation.
     ///
-    /// Calls `GET /voyager/api/messaging/conversations/{id}/events` with pagination.
-    /// The `conversation_urn` should be the conversation ID portion of the URN
-    /// (e.g., the `2-abc123` part from `urn:li:messagingThread:2-abc123`).
+    /// Calls the Voyager GraphQL endpoint to fetch messages for a conversation.
+    /// Uses the `messengerMessagesByConversation` query from
+    /// `MessengerGraphQLClient.java`.
     ///
     /// # Parameters
     ///
-    /// - `conversation_urn`: The conversation ID (thread ID portion).
-    /// - `start`: 0-based offset for pagination.
-    /// - `count`: Number of events to request per page.
-    ///
-    /// See `re/pegasus_models.md` for the `Event` model definition.
+    /// - `conversation_urn`: The conversation URN or ID. If a plain ID like
+    ///   `2-abc123` is provided, it is wrapped as
+    ///   `urn:li:messagingThread:2-abc123`.
+    /// - `created_before`: Optional epoch-millis cursor for pagination.
+    ///   Omit for the most recent messages.
     pub async fn get_conversation_events(
         &self,
         conversation_urn: &str,
-        start: u32,
-        count: u32,
+        created_before: Option<u64>,
     ) -> Result<Value, Error> {
-        let encoded_urn =
-            url::form_urlencoded::byte_serialize(conversation_urn.as_bytes()).collect::<String>();
-        let path = format!(
-            "messaging/conversations/{}/events?start={}&count={}",
-            encoded_urn, start, count
+        // The GraphQL query expects a `msg_conversation` URN format:
+        //   urn:li:msg_conversation:(urn:li:fsd_profile:XXXX,<thread_id>)
+        // If a plain thread ID or messagingThread URN is provided,
+        // we need the user's fsd_profile URN to construct it.
+        let full_urn = if conversation_urn.starts_with("urn:li:msg_conversation:") {
+            conversation_urn.to_string()
+        } else {
+            // Extract the thread ID.
+            let thread_id = conversation_urn
+                .strip_prefix("urn:li:messagingThread:")
+                .unwrap_or(conversation_urn);
+
+            // Get the user's fsd_profile URN from /me.
+            let me = self.get("me").await?;
+            let profile_urn = me
+                .get("miniProfile")
+                .and_then(|mp| mp.get("dashEntityUrn"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Api {
+                    status: 0,
+                    body: "could not extract miniProfile.dashEntityUrn from /me".to_string(),
+                })?;
+
+            format!("urn:li:msg_conversation:({},{})", profile_urn, thread_id)
+        };
+        // Percent-encode the URN for Rest.li variables format.
+        let encoded_urn: String =
+            url::form_urlencoded::byte_serialize(full_urn.as_bytes()).collect();
+
+        // Use the Messenger GraphQL query `messengerMessagesByConversation`
+        // from MessengerGraphQLClient.java.
+        // queryId: voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a
+        let variables = if let Some(ts) = created_before {
+            format!("(conversationUrn:{},deliveredBefore:{})", encoded_urn, ts)
+        } else {
+            format!("(conversationUrn:{})", encoded_urn)
+        };
+        let params = format!(
+            "variables={}&queryId=voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a&queryName=MessengerMessagesByConversation",
+            variables
         );
-        self.get(&path).await
+        self.graphql_get(&params).await
     }
 }
 
