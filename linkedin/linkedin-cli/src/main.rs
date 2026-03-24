@@ -1277,6 +1277,20 @@ fn load_session() -> Result<(Session, std::path::PathBuf), String> {
 
 /// Load the stored session and create an authenticated client.
 fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), String> {
+    // Check for browser cookies file first (enables write operations).
+    let cookies_path = std::path::Path::new("secrets/browser_cookies.json");
+    if cookies_path.exists() {
+        let data = std::fs::read_to_string(cookies_path)
+            .map_err(|e| format!("failed to read browser cookies: {e}"))?;
+        let cookies: std::collections::HashMap<String, String> = serde_json::from_str(&data)
+            .map_err(|e| format!("failed to parse browser cookies: {e}"))?;
+        let client = LinkedInClient::with_browser_cookies(&cookies)
+            .map_err(|e| format!("client error: {e}"))?;
+        let (_, path) = load_session()?;
+        eprintln!("Using browser cookies from secrets/browser_cookies.json");
+        return Ok((client, path));
+    }
+
     let (session, path) = load_session()?;
     let client =
         LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;

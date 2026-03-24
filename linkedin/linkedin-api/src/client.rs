@@ -51,6 +51,9 @@ pub struct LinkedInClient {
     /// The underlying reqwest HTTP client with cookie jar enabled.
     http: reqwest::Client,
 
+    /// Cookie jar reference for adding cookies after construction.
+    cookie_jar: Arc<reqwest::cookie::Jar>,
+
     /// JSESSIONID value used for CSRF protection.
     /// Format: `ajax:{19-digit zero-padded random number}`.
     /// Echoed as the `Csrf-Token` header on every request.
@@ -104,6 +107,43 @@ impl LinkedInClient {
     pub fn with_session(session: &Session) -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
         Self::build(&device_id, &session.jsessionid, Some(&session.li_at))
+    }
+
+    /// Create a client using full browser cookies (from a cookies JSON file).
+    ///
+    /// This injects all cookies from the browser session, enabling write
+    /// operations that require more than just `li_at` + `JSESSIONID`.
+    pub fn with_browser_cookies(
+        cookies: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let jsessionid = cookies
+            .get("JSESSIONID")
+            .cloned()
+            .unwrap_or_else(generate_jsessionid);
+
+        let li_at = cookies.get("li_at").map(|s| s.as_str());
+        let client = Self::build(&device_id, &jsessionid, li_at)?;
+
+        // Inject all remaining cookies into the jar.
+        let base_url: url::Url = BASE_URL.parse().unwrap();
+        for (name, value) in cookies {
+            if name == "JSESSIONID" || name == "li_at" {
+                continue; // already set by build()
+            }
+            // Quote values that contain special chars.
+            let cookie_str = if value.contains(';') || value.contains(',') || value.contains(' ') {
+                format!(
+                    "{}=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
+                    name, value
+                )
+            } else {
+                format!("{}={}; Domain=.linkedin.com; Path=/; Secure", name, value)
+            };
+            client.cookie_jar.add_cookie_str(&cookie_str, &base_url);
+        }
+
+        Ok(client)
     }
 
     /// Shared client construction logic.
@@ -170,11 +210,12 @@ impl LinkedInClient {
         }
 
         let http = reqwest::Client::builder()
-            .cookie_provider(jar)
+            .cookie_provider(jar.clone())
             .default_headers(default_headers)
             .build()?;
 
         Ok(Self {
+            cookie_jar: jar,
             http,
             jsessionid: jsessionid.to_string(),
             device_id: device_id.to_string(),
@@ -657,9 +698,11 @@ impl LinkedInClient {
 
         // Captured from live browser traffic via Chrome DevTools MCP.
         // Endpoint: POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
-        // Note: action is "createMessage" NOT "create".
-        // Content-Type from browser is text/plain;charset=UTF-8 but JSON body.
-        let tracking_id = uuid::Uuid::new_v4().to_string();
+        // Key discovery: trackingId must be 16 random bytes as a raw string in JSON.
+        // Without it, LinkedIn returns 400.
+        let tracking_bytes: [u8; 16] = rand::random();
+        let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
+
         let payload = serde_json::json!({
             "message": {
                 "body": {
@@ -675,24 +718,11 @@ impl LinkedInClient {
             "hostRecipientUrns": [recipient_profile_urn]
         });
 
-        // Captured from live browser traffic: the web client sends specific headers
-        // that differ from the Android app defaults we use elsewhere.
-        let url = format!(
-            "{}{}voyagerMessagingDashMessengerMessages?action=createMessage",
-            BASE_URL, API_PREFIX
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .header("Csrf-Token", &self.jsessionid)
-            .header("Content-Type", "text/plain;charset=UTF-8")
-            .header("Accept", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            .header("X-LI-Track", r#"{"clientVersion":"1.13.42962","mpVersion":"1.13.42962","osName":"web","timezoneOffset":1,"timezone":"Europe/Copenhagen","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":1920,"displayHeight":1080}"#)
-            .body(payload.to_string())
-            .send()
-            .await?;
-        check_response(resp).await
+        self.post(
+            "voyagerMessagingDashMessengerMessages?action=createMessage",
+            &payload,
+        )
+        .await
     }
 
     /// Resolve a public identifier (vanity URL slug) to an `fsd_profile` URN.
