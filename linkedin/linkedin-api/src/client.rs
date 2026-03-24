@@ -1088,6 +1088,71 @@ impl LinkedInClient {
         .await
     }
 
+    /// Comment on a feed post (activity).
+    ///
+    /// Uses the Dash GraphQL CREATE mutation `createSocialDashNormComments`
+    /// discovered in `ConversationsGraphQLClient.java` in the decompiled
+    /// international APK (queryId:
+    /// `voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e`).
+    ///
+    /// The mutation variables mirror the `NormCommentForUpdate` model fields:
+    /// - `commentary`: `{ text: "..." }` matching `TextViewModel`
+    /// - `threadUrn`: The post/activity URN to comment on
+    /// - `origin`: `FEED` (standard comment origin)
+    ///
+    /// # Parameters
+    ///
+    /// - `post_urn`: The URN of the post/activity to comment on. Accepted formats:
+    ///   - Full URN: `urn:li:activity:7312345678901234567`
+    ///   - Activity ID only: `7312345678901234567` (will be wrapped)
+    /// - `text`: The comment text content.
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response from the API. On success LinkedIn typically
+    /// returns the created comment entity.
+    ///
+    /// # Warning
+    ///
+    /// This creates a **real comment** on a LinkedIn post. There is no
+    /// draft/preview mode.
+    ///
+    /// See `re/comments.md` for the full analysis.
+    pub async fn comment_on_post(&self, post_urn: &str, text: &str) -> Result<Value, Error> {
+        // Normalize the post URN: if just an activity ID, wrap it.
+        let thread = if post_urn.starts_with("urn:li:") {
+            post_urn.to_string()
+        } else {
+            format!("urn:li:activity:{}", post_urn)
+        };
+
+        // Build the mutation variables matching the NormComment model.
+        // The `entity` field contains the comment data for the CREATE mutation,
+        // structured as a NormCommentForCreate record:
+        // - commentary: TextViewModel with the comment text
+        // - threadUrn: the post being commented on
+        // - origin: FEED (standard origin for feed comments)
+        //
+        // queryId: voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e
+        // from ConversationsGraphQLClient.java static initializer.
+        let variables = serde_json::json!({
+            "entity": {
+                "commentary": {
+                    "text": text
+                },
+                "threadUrn": thread,
+                "origin": "FEED"
+            }
+        });
+
+        self.graphql_post(
+            &variables,
+            "voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e",
+            "CreateSocialDashNormComments",
+        )
+        .await
+    }
+
     /// Fetch "who viewed my profile" data.
     ///
     /// Calls `GET /voyager/api/identity/wvmpCards` which returns the WVMP

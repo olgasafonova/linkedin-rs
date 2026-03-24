@@ -116,6 +116,25 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// Comment on a feed post
+    ///
+    /// WARNING: This creates a REAL COMMENT on a LinkedIn post.
+    /// Use --yes to skip the confirmation prompt.
+    Comment {
+        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
+        post_urn: String,
+
+        /// The comment text
+        text: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new text post on your LinkedIn feed
     ///
     /// WARNING: This creates a REAL PUBLIC post on your LinkedIn account.
@@ -436,6 +455,17 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_feed_unreact(&post_urn, &reaction_type, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Comment {
+                post_urn,
+                text,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_comment(&post_urn, &text, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1332,6 +1362,41 @@ async fn cmd_feed_unreact(
         println!("{}", pretty);
     } else {
         println!("Removed {} reaction from {}", rt_upper, post_urn);
+    }
+
+    Ok(())
+}
+
+/// Handle `feed comment <post_urn> <text> [--yes] [--json]`.
+///
+/// Creates a comment on a feed post. Requires `--yes` to confirm,
+/// since this creates a REAL COMMENT on a LinkedIn post.
+async fn cmd_feed_comment(
+    post_urn: &str,
+    text: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err("this will create a REAL COMMENT on a LinkedIn post. \
+             Pass --yes to confirm."
+            .to_string());
+    }
+
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Commenting on {}...", post_urn);
+    let result = client
+        .comment_on_post(post_urn, text)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Commented on {}", post_urn);
     }
 
     Ok(())
