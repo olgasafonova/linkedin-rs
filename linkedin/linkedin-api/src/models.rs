@@ -5,6 +5,9 @@
 //! `Option<Value>`) because we haven't validated them against the live API yet.
 //! Fields will be tightened as we confirm the actual response shapes.
 //!
+//! See `re/model_corrections.md` for the full list of known risks, validation
+//! checklist, and per-field correction log.
+//!
 //! Reference: `re/pegasus_models.md`, `re/restli_protocol.md` section 7.
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,8 @@ pub struct Paging {
 pub struct FeedResponse {
     /// Array of feed update items. Each element is an `UpdateV2` record,
     /// but we keep it as `Value` until we've validated the full shape.
+    // TODO(live-validation): Replace Vec<Value> with Vec<UpdateV2> once live
+    // response shape is confirmed. Check if response uses entity deduplication.
     #[serde(default)]
     pub elements: Vec<Value>,
 
@@ -75,14 +80,21 @@ pub struct UpdateV2 {
     pub entity_urn: Option<String>,
 
     /// The actor (author) component of the update.
+    // TODO(live-validation): Type as ActorComponent once shape confirmed.
+    // Expected: {name, image, subDescription} from decompiled ActorComponent.
     #[serde(default)]
     pub actor: Option<Value>,
 
     /// Post text / commentary.
+    // TODO(live-validation): Type as TextComponent. May be {text: {text: "..."}}
+    // wrapper or flat string. Check live response.
     #[serde(default)]
     pub commentary: Option<Value>,
 
     /// Content attachment (article, image, video, etc.).
+    // TODO(live-validation): This is a union (FeedComponent) with variants for
+    // article, image, video, etc. Need to confirm union discriminator format
+    // (FQN key vs short key) before typing.
     #[serde(default)]
     pub content: Option<Value>,
 
@@ -103,6 +115,8 @@ pub struct UpdateV2 {
     pub header: Option<Value>,
 
     /// Reshared update (recursive -- contains another UpdateV2).
+    // TODO(live-validation): Type as Box<UpdateV2> once confirmed. Self-referential
+    // struct needs Box for serde. May hit depth limits on deeply reshared content.
     #[serde(default)]
     pub reshared_update: Option<Value>,
 }
@@ -201,10 +215,14 @@ pub struct MiniProfile {
     pub tracking_id: Option<String>,
 
     /// Profile photo.
+    // TODO(live-validation): This is an Image union (VectorImage, MediaProxyImage,
+    // URL string, MediaProcessorImage). Confirm union discriminator format --
+    // FQN key like "com.linkedin.common.VectorImage" or short key "vectorImage".
     #[serde(default)]
     pub picture: Option<Value>,
 
     /// Background/banner image.
+    // TODO(live-validation): Same Image union as picture. See above.
     #[serde(default)]
     pub background_image: Option<Value>,
 }
@@ -267,22 +285,29 @@ pub struct Profile {
     pub geo_country_urn: Option<String>,
 
     /// Structured location.
+    // TODO(live-validation): Type as ProfileLocation struct (countryCode, postalCode, etc.).
     #[serde(default)]
     pub location: Option<Value>,
 
     /// Structured geo location.
+    // TODO(live-validation): Type as ProfileGeoLocation struct (geoUrn, etc.).
     #[serde(default)]
     pub geo_location: Option<Value>,
 
     /// Embedded mini profile reference.
+    // TODO(live-validation): Type as MiniProfile once confirmed it's inlined (not a
+    // URN reference in deduped responses). May need entity resolution if deduped.
     #[serde(default)]
     pub mini_profile: Option<Value>,
 
     /// Profile picture.
+    // TODO(live-validation): Type as PhotoFilterPicture -- may wrap Image union with
+    // an extra layer. Confirm actual nesting depth in live response.
     #[serde(default)]
     pub profile_picture: Option<Value>,
 
     /// Background image.
+    // TODO(live-validation): May be BackgroundImage struct or direct Image union.
     #[serde(default)]
     pub background_image: Option<Value>,
 
@@ -450,10 +475,15 @@ pub struct Conversation {
     pub backend_urn: Option<String>,
 
     /// Participants in this conversation (union: member/company/bot).
+    // TODO(live-validation): Each element is a MessagingProfile union. Confirm union
+    // discriminator format (FQN "com.linkedin.voyager.messaging.MessagingMember" vs
+    // short key "messagingMember"). Type as Vec<MessagingProfile> enum after.
     #[serde(default)]
     pub participants: Option<Vec<Value>>,
 
     /// Messages/events in this conversation (may be inline or empty).
+    // TODO(live-validation): Check if events are inlined in conversation list response
+    // or if they require a separate fetch to messaging/conversations/{id}/events.
     #[serde(default)]
     pub events: Option<Vec<Value>>,
 
@@ -490,6 +520,8 @@ pub struct Conversation {
     pub with_non_connection: Option<bool>,
 
     /// Last activity timestamp.
+    // TODO(live-validation): This field is NOT in the decompiled Conversation model.
+    // May be computed client-side or from Dash endpoint. Verify if server returns it.
     #[serde(default)]
     pub last_activity_at: Option<u64>,
 
@@ -533,6 +565,8 @@ pub struct MessagingEvent {
     pub expires_at: Option<u64>,
 
     /// The sender of this event (union: MessagingProfile).
+    // TODO(live-validation): Union type -- confirm discriminator key format.
+    // Expected FQN: "com.linkedin.voyager.messaging.MessagingMember".
     #[serde(default)]
     pub from: Option<Value>,
 
@@ -541,6 +575,9 @@ pub struct MessagingEvent {
     pub subtype: Option<String>,
 
     /// The event content (union: MessageEvent, ParticipantChangeEvent, etc.).
+    // TODO(live-validation): Critical union type. Confirm whether key is FQN
+    // "com.linkedin.voyager.messaging.event.MessageEvent" or short "messageEvent".
+    // This determines the serde strategy for EventContent enum.
     #[serde(default)]
     pub event_content: Option<Value>,
 
@@ -609,6 +646,7 @@ pub struct Connection {
     pub entity_urn: Option<String>,
 
     /// Embedded mini profile of the connected member.
+    // TODO(live-validation): Type as MiniProfile once confirmed inlined (not URN ref).
     #[serde(default)]
     pub mini_profile: Option<Value>,
 
@@ -672,10 +710,13 @@ pub struct NotificationCard {
     pub entity_urn: Option<String>,
 
     /// Primary headline (TextViewModel with a `text` field).
+    // TODO(live-validation): Type as TextViewModel struct. Confirm shape -- may have
+    // {text: "..."} or {text: "...", attributedText: {...}} with rich formatting.
     #[serde(default)]
     pub headline: Option<Value>,
 
     /// Secondary headline (TextViewModel with a `text` field).
+    // TODO(live-validation): Same TextViewModel shape as headline.
     #[serde(default)]
     pub sub_headline: Option<Value>,
 
@@ -801,6 +842,8 @@ pub struct SearchHit {
 
     /// The actual result payload (union: SearchProfile, SearchJob, etc.).
     /// The union key indicates the result type.
+    // TODO(live-validation): Union type. Confirm discriminator key format and
+    // which variants appear for people search vs job search vs content search.
     #[serde(default)]
     pub hit_info: Option<Value>,
 
