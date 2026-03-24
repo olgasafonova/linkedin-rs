@@ -90,6 +90,32 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// React to a post (like, celebrate, etc.)
+    React {
+        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
+        post_urn: String,
+
+        /// Reaction type: LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION
+        #[arg(long = "type", default_value = "LIKE")]
+        reaction_type: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a reaction from a post
+    Unreact {
+        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
+        post_urn: String,
+
+        /// Reaction type to remove: LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION
+        #[arg(long = "type", default_value = "LIKE")]
+        reaction_type: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,6 +338,26 @@ async fn main() {
         Commands::Feed { action } => match action {
             FeedAction::List { count, start, json } => {
                 if let Err(e) = cmd_feed_list(start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::React {
+                post_urn,
+                reaction_type,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_react(&post_urn, &reaction_type, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Unreact {
+                post_urn,
+                reaction_type,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_unreact(&post_urn, &reaction_type, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1079,6 +1125,88 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         println!("    {}", commentary_display);
     }
     println!("    likes: {}  comments: {}", likes, comments);
+}
+
+/// Valid reaction type strings accepted by the LinkedIn API.
+///
+/// Extracted from `ReactionType.java` in the decompiled international APK
+/// (`com.linkedin.android.pegasus.dash.gen.voyager.dash.feed.social`).
+const VALID_REACTION_TYPES: &[&str] = &[
+    "LIKE",
+    "PRAISE",
+    "EMPATHY",
+    "INTEREST",
+    "APPRECIATION",
+    "ENTERTAINMENT",
+    "CELEBRATION",
+];
+
+/// Handle `feed react <post_urn> [--type LIKE] [--json]`.
+///
+/// Reacts to a feed post with the specified reaction type.
+async fn cmd_feed_react(post_urn: &str, reaction_type: &str, raw_json: bool) -> Result<(), String> {
+    let rt_upper = reaction_type.to_uppercase();
+    if !VALID_REACTION_TYPES.contains(&rt_upper.as_str()) {
+        return Err(format!(
+            "invalid reaction type '{}'. Valid types: {}",
+            reaction_type,
+            VALID_REACTION_TYPES.join(", ")
+        ));
+    }
+
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Reacting to {} with {}...", post_urn, rt_upper);
+    let result = client
+        .react_to_post(post_urn, &rt_upper)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Reacted with {} to {}", rt_upper, post_urn);
+    }
+
+    Ok(())
+}
+
+/// Handle `feed unreact <post_urn> [--type LIKE] [--json]`.
+///
+/// Removes a reaction from a feed post.
+async fn cmd_feed_unreact(
+    post_urn: &str,
+    reaction_type: &str,
+    raw_json: bool,
+) -> Result<(), String> {
+    let rt_upper = reaction_type.to_uppercase();
+    if !VALID_REACTION_TYPES.contains(&rt_upper.as_str()) {
+        return Err(format!(
+            "invalid reaction type '{}'. Valid types: {}",
+            reaction_type,
+            VALID_REACTION_TYPES.join(", ")
+        ));
+    }
+
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Removing {} reaction from {}...", rt_upper, post_urn);
+    let result = client
+        .unreact_from_post(post_urn, &rt_upper)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Removed {} reaction from {}", rt_upper, post_urn);
+    }
+
+    Ok(())
 }
 
 /// Handle `messages list [--count N] [--start N] [--json]`.

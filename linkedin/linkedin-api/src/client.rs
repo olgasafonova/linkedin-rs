@@ -299,6 +299,91 @@ impl LinkedInClient {
         Ok(json)
     }
 
+    /// Send a POST request to the Voyager GraphQL endpoint (mutation).
+    ///
+    /// Unlike [`graphql_get`](Self::graphql_get) which encodes variables into
+    /// the URL query string, GraphQL mutations are POSTed with a JSON body
+    /// containing `queryId`, `queryName`, and `variables`.
+    ///
+    /// Discovered from `BaseGraphQLClient.generateRequestBuilder()` in the
+    /// decompiled international APK: when `query.isMutation` is true, the
+    /// request builder serializes the query into a JSON body instead of
+    /// URL parameters.
+    ///
+    /// The variables are passed as a JSON value (not Rest.li-encoded).
+    ///
+    /// Returns [`Ok(Value::Null)`] for success responses with empty bodies.
+    pub async fn graphql_post(
+        &self,
+        variables: &Value,
+        query_id: &str,
+        query_name: &str,
+    ) -> Result<Value, Error> {
+        // GraphQLMutationRequestBuilder.fillInQueryParams() adds
+        // action=execute, queryId, and queryName as URL query parameters.
+        let url = format!(
+            "{}{}graphql?action=execute&queryId={}&queryName={}",
+            BASE_URL, API_PREFIX, query_id, query_name
+        );
+
+        let mut body = serde_json::json!({
+            "queryId": query_id,
+            "queryName": query_name,
+        });
+
+        if !variables.is_null() {
+            body["variables"] = variables.clone();
+        }
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .header("x-li-graphql-pegasus-client", "true")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            let text = resp.text().await?;
+            if text.is_empty() {
+                return Ok(Value::Null);
+            }
+            let json: Value = serde_json::from_str(&text)?;
+
+            // Check for GraphQL-level errors.
+            if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
+                if !errors.is_empty() {
+                    let messages: Vec<&str> = errors
+                        .iter()
+                        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                        .collect();
+                    return Err(Error::Api {
+                        status: 200,
+                        body: format!("GraphQL errors: {}", messages.join("; ")),
+                    });
+                }
+            }
+
+            return Ok(json);
+        }
+
+        let status_code = status.as_u16();
+        let body_text = resp.text().await.unwrap_or_default();
+
+        if status_code == 401 {
+            return Err(Error::Auth(format!(
+                "session expired or invalid (HTTP 401): {body_text}"
+            )));
+        }
+
+        Err(Error::Api {
+            status: status_code,
+            body: body_text,
+        })
+    }
+
     /// Send a GET request to an arbitrary path on the LinkedIn host.
     ///
     /// Unlike [`get`](Self::get), the `path` is NOT prefixed with `/voyager/api/`.
@@ -840,6 +925,116 @@ impl LinkedInClient {
                     public_id
                 ),
             })
+    }
+
+    /// React to a post or activity with a specific reaction type.
+    ///
+    /// Uses the Dash REST endpoint
+    /// `POST /voyager/api/voyagerSocialDashReactions?action=create`
+    /// discovered in `FeedFrameworkGraphQLClient.java` in the decompiled
+    /// international APK (queryId: `voyagerSocialDashReactions.fd68eadaf15da416b0d839e21399b763`,
+    /// operation type: CREATE).
+    ///
+    /// The payload was reverse-engineered from the `Reaction`,
+    /// `ReactionActorForCreate`, and `ReactionType` models in the
+    /// `com.linkedin.android.pegasus.dash.gen.voyager.dash.social` package.
+    ///
+    /// # Parameters
+    ///
+    /// - `thread_urn`: The URN of the post/activity to react to. This is the
+    ///   `urn:li:activity:...` or `urn:li:ugcPost:...` URN from the feed.
+    ///   Accepted formats:
+    ///   - Full URN: `urn:li:activity:7312345678901234567`
+    ///   - Activity ID only: `7312345678901234567` (will be wrapped)
+    /// - `reaction_type`: The reaction type string. One of:
+    ///   `LIKE`, `PRAISE`, `EMPATHY`, `INTEREST`, `APPRECIATION`,
+    ///   `ENTERTAINMENT`, `CELEBRATION`. (See `ReactionType.java` in the
+    ///   decompiled APK for the full enum.)
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response from the API. On success LinkedIn typically
+    /// returns HTTP 201 with a minimal response body or the created entity.
+    ///
+    /// See `re/reactions.md` for the full analysis.
+    pub async fn react_to_post(
+        &self,
+        thread_urn: &str,
+        reaction_type: &str,
+    ) -> Result<Value, Error> {
+        // Normalize the thread URN: if just an activity ID, wrap it.
+        let thread = if thread_urn.starts_with("urn:li:") {
+            thread_urn.to_string()
+        } else {
+            format!("urn:li:activity:{}", thread_urn)
+        };
+
+        // Use the GraphQL mutation endpoint discovered in
+        // FeedFrameworkGraphQLClient.java (createSocialDashReactions).
+        // queryId: voyagerSocialDashReactions.fd68eadaf15da416b0d839e21399b763
+        //
+        // The variables are JSON (not Rest.li-encoded) for mutations, as
+        // determined from BaseGraphQLClient.generateRequestBuilder().
+        //
+        // The mutation expects a top-level `entity` variable of type
+        // `dash_social_ReactionCreateInput!` containing `threadUrn` and
+        // `reactionType`. The `actorUnion` with `profileUrn` identifies
+        // who is reacting (required for non-personal page reactions).
+        let variables = serde_json::json!({
+            "threadUrn": thread,
+            "reactionType": reaction_type,
+            "entity": {
+                "threadUrn": thread,
+                "reactionType": reaction_type,
+            }
+        });
+
+        self.graphql_post(
+            &variables,
+            "voyagerSocialDashReactions.fd68eadaf15da416b0d839e21399b763",
+            "CreateSocialDashReactions",
+        )
+        .await
+    }
+
+    /// Remove a reaction from a post or activity.
+    ///
+    /// Uses the Dash REST endpoint for deleting reactions, discovered as
+    /// `doDeleteReactionSocialDashReactions` in `FeedFrameworkGraphQLClient.java`
+    /// (queryId: `voyagerSocialDashReactions.315cef4773de8e3a0ddad7655cc1685f`).
+    ///
+    /// # Parameters
+    ///
+    /// - `thread_urn`: The URN of the post/activity to un-react from.
+    /// - `reaction_type`: The reaction type to remove.
+    ///
+    /// See `re/reactions.md` for the full analysis.
+    pub async fn unreact_from_post(
+        &self,
+        thread_urn: &str,
+        reaction_type: &str,
+    ) -> Result<Value, Error> {
+        let thread = if thread_urn.starts_with("urn:li:") {
+            thread_urn.to_string()
+        } else {
+            format!("urn:li:activity:{}", thread_urn)
+        };
+
+        // Use the GraphQL mutation endpoint for deleting reactions.
+        // queryId: voyagerSocialDashReactions.315cef4773de8e3a0ddad7655cc1685f
+        // The ACTION mutation `doDeleteReaction` requires threadUrn and
+        // reactionType as top-level variables.
+        let variables = serde_json::json!({
+            "threadUrn": thread,
+            "reactionType": reaction_type,
+        });
+
+        self.graphql_post(
+            &variables,
+            "voyagerSocialDashReactions.315cef4773de8e3a0ddad7655cc1685f",
+            "DoDeleteReactionSocialDashReactions",
+        )
+        .await
     }
 
     /// Fetch "who viewed my profile" data.
