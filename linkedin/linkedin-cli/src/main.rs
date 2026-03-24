@@ -201,6 +201,34 @@ enum ConnectionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// List pending (received) connection invitations
+    Invitations {
+        /// Number of invitations to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a pending connection invitation
+    Accept {
+        /// Invitation ID (numeric portion of the invitation URN, e.g. 7312345678901234567)
+        invitation_id: String,
+
+        /// Shared secret from the invitation (required for CSRF protection).
+        /// Obtain from `connections invitations --json`.
+        #[arg(long)]
+        secret: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -422,6 +450,22 @@ async fn main() {
                 if let Err(e) =
                     cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await
                 {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            ConnectionsAction::Invitations { count, start, json } => {
+                if let Err(e) = cmd_connections_invitations(start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            ConnectionsAction::Accept {
+                invitation_id,
+                secret,
+                json,
+            } => {
+                if let Err(e) = cmd_connections_accept(&invitation_id, &secret, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1545,6 +1589,166 @@ async fn cmd_connections_invite(
     }
 
     Ok(())
+}
+
+/// Handle `connections invitations [--count N] [--start N] [--json]`.
+///
+/// Lists pending (received) connection invitations using the Dash GraphQL
+/// `voyagerRelationshipsDashInvitationViews` endpoint.
+async fn cmd_connections_invitations(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    let value = client
+        .get_invitations(start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    // Parse paging for the header line.
+    let paging: Option<Paging> = value
+        .get("paging")
+        .and_then(|p| serde_json::from_value(p.clone()).ok());
+
+    if let Some(ref paging) = paging {
+        print_paging_header("Pending invitations", paging);
+    }
+    println!("---");
+
+    let elements = value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    if elements.is_empty() {
+        println!("(no pending invitations)");
+        return Ok(());
+    }
+
+    for (i, element) in elements.iter().enumerate() {
+        let idx = start as usize + i + 1;
+        print_invitation(idx, element);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Handle `connections accept <invitation_id> --secret <shared_secret> [--json]`.
+///
+/// Accepts a pending connection invitation using the Dash REST endpoint.
+async fn cmd_connections_accept(
+    invitation_id: &str,
+    shared_secret: &str,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Build the full invitation URN if only the ID portion was given.
+    let invitation_urn = if invitation_id.starts_with("urn:li:") {
+        invitation_id.to_string()
+    } else {
+        format!("urn:li:fsd_invitation:{}", invitation_id)
+    };
+
+    let value = client
+        .accept_invitation(&invitation_urn, shared_secret)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Invitation accepted: {}", invitation_urn);
+    }
+
+    Ok(())
+}
+
+/// Print a brief human-readable summary of a single invitation view.
+///
+/// The GraphQL `relationshipsDashInvitationViewsByReceived` response returns
+/// `InvitationView` objects with:
+/// - `title.text`: inviter's name
+/// - `subtitle.text`: inviter's headline
+/// - `sentTimeLabel`: human-readable time (e.g. "2 days ago")
+/// - `invitation.entityUrn`: invitation URN (needed for accept/ignore)
+/// - `invitation.sharedSecret`: required for accept action
+/// - `invitation.message`: optional custom message from inviter
+/// - `invitation.genericInvitationType`: type of invitation (CONNECTION, etc.)
+fn print_invitation(index: usize, view: &serde_json::Value) {
+    let name = view
+        .get("title")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+
+    let headline = view
+        .get("subtitle")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let sent_time = view
+        .get("sentTimeLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let invitation = view.get("invitation");
+
+    let invitation_urn = invitation
+        .and_then(|inv| inv.get("entityUrn"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let shared_secret = invitation
+        .and_then(|inv| inv.get("sharedSecret"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let message = invitation
+        .and_then(|inv| inv.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let inv_type = invitation
+        .and_then(|inv| inv.get("genericInvitationType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Extract invitation ID from URN for easier accept command usage.
+    let invitation_id = invitation_urn.rsplit(':').next().unwrap_or(invitation_urn);
+
+    print!("[{}] {}", index, name);
+    if !sent_time.is_empty() {
+        print!("  ({})", sent_time);
+    }
+    println!();
+
+    if !headline.is_empty() {
+        println!("    {}", headline);
+    }
+    if !inv_type.is_empty() {
+        println!("    type: {}", inv_type);
+    }
+    if !message.is_empty() {
+        println!("    message: \"{}\"", message);
+    }
+    if !invitation_id.is_empty() {
+        println!("    id: {}  secret: {}", invitation_id, shared_secret);
+        println!(
+            "    accept: connections accept {} --secret \"{}\"",
+            invitation_id, shared_secret
+        );
+    }
 }
 
 /// Print a brief human-readable summary of a single connection.

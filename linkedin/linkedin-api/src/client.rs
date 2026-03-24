@@ -1269,6 +1269,107 @@ impl LinkedInClient {
 
         self.post("voyagerGrowthNormInvitations", &payload).await
     }
+
+    /// Fetch pending (received) connection invitations.
+    ///
+    /// Uses the Dash GraphQL endpoint `voyagerRelationshipsDashInvitationViews`
+    /// with the `ReceivedInvitationViews` finder query discovered in
+    /// `MynetworkGraphQLClient.receivedInvitationViews()` in the decompiled
+    /// international APK.
+    ///
+    /// queryId: `voyagerRelationshipsDashInvitationViews.48949225027e0a85d063176777f08e7f`
+    ///
+    /// Variables:
+    /// - `start` (Integer): pagination offset
+    /// - `count` (Integer): page size
+    /// - `includeInsights` (Boolean): always `true` to get connection insights
+    ///
+    /// The response contains `InvitationView` elements, each with an embedded
+    /// `invitation` object containing `entityUrn`, `sharedSecret`,
+    /// `genericInvitationType`, `inviter` (profile), `message`, `sentTime`.
+    ///
+    /// # Parameters
+    ///
+    /// - `start`: 0-based offset for pagination.
+    /// - `count`: Number of invitations to request per page.
+    ///
+    /// Returns the collection object (with `elements`, `paging`) unwrapped
+    /// from the GraphQL envelope.
+    ///
+    /// See `re/invitations.md` for the endpoint documentation and response
+    /// structure.
+    pub async fn get_invitations(&self, start: u32, count: u32) -> Result<Value, Error> {
+        let variables = format!("(start:{},count:{},includeInsights:true)", start, count);
+        let params = graphql_params(
+            &variables,
+            "voyagerRelationshipsDashInvitationViews.48949225027e0a85d063176777f08e7f",
+            "ReceivedInvitationViews",
+        );
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope:
+        //   data.relationshipsDashInvitationViewsByReceived
+        // which contains { elements, paging }.
+        raw.get("data")
+            .and_then(|d| d.get("relationshipsDashInvitationViewsByReceived"))
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.relationshipsDashInvitationViewsByReceived): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
+    }
+
+    /// Accept a pending connection invitation.
+    ///
+    /// Uses the Dash REST endpoint discovered in
+    /// `InvitationActionsRepository.Companion.buildInvitationActionRoute()`:
+    ///
+    /// ```text
+    /// POST /voyager/api/voyagerRelationshipsDashInvitations/{invitation_urn}?action=accept
+    /// ```
+    ///
+    /// The invitation URN and shared secret are obtained from the invitation
+    /// list response (`get_invitations`). The `sharedSecret` is required by
+    /// LinkedIn to prevent CSRF on invitation acceptance.
+    ///
+    /// # Parameters
+    ///
+    /// - `invitation_urn`: The full invitation URN from the invitation's
+    ///   `entityUrn` field (e.g. `urn:li:fsd_invitation:7...`).
+    /// - `shared_secret`: The `sharedSecret` string from the invitation object.
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response from the API. On success LinkedIn typically
+    /// returns the updated invitation or member relationship entity.
+    ///
+    /// See `re/invitations.md` for the full endpoint analysis.
+    pub async fn accept_invitation(
+        &self,
+        invitation_urn: &str,
+        shared_secret: &str,
+    ) -> Result<Value, Error> {
+        // The Android app uses `appendEncodedPath(urn.toString())` which
+        // passes the URN as-is. Colons in URNs are valid in URL path segments
+        // per RFC 3986.
+        let path = format!(
+            "voyagerRelationshipsDashInvitations/{}?action=accept",
+            invitation_urn
+        );
+
+        // The accept action requires the invitation URN and shared secret
+        // in the request body. The decompiled code shows the Dash endpoint
+        // expects a minimal body with the invitation identification.
+        let body = serde_json::json!({
+            "invitationUrn": invitation_urn,
+            "sharedSecret": shared_secret
+        });
+
+        self.post(&path, &body).await
+    }
 }
 
 /// Build a GraphQL query parameter string for the Voyager GraphQL endpoint.
