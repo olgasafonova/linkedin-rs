@@ -721,8 +721,17 @@ async fn cmd_feed_list(start: u32, count: u32, raw_json: bool) -> Result<(), Str
 /// unknown fields gracefully. The real structure is deeply nested, so
 /// this is best-effort until we've validated against live data.
 fn print_feed_item(index: usize, item: &serde_json::Value) {
+    // The real feed response wraps the UpdateV2 payload inside:
+    //   element.value["com.linkedin.voyager.feed.render.UpdateV2"]
+    // This is LinkedIn's Rest.li union encoding. Unwrap it first,
+    // falling back to the element itself for forward-compatibility.
+    let update = item
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(item);
+
     // Try to extract actor name.
-    let actor_name = item
+    let actor_name = update
         .get("actor")
         .and_then(|a| a.get("name"))
         .and_then(|n| n.get("text"))
@@ -730,7 +739,7 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         .unwrap_or("(unknown author)");
 
     // Try to extract commentary text.
-    let commentary = item
+    let commentary = update
         .get("commentary")
         .and_then(|c| c.get("text"))
         .and_then(|t| t.get("text"))
@@ -745,17 +754,17 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         commentary.to_string()
     };
 
-    // Entity URN for reference.
+    // Entity URN -- lives at the top-level element, not inside the UpdateV2.
     let urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
 
-    // Social counts if available.
-    let likes = item
+    // Social counts are inside the UpdateV2 payload.
+    let likes = update
         .get("socialDetail")
         .and_then(|s| s.get("totalSocialActivityCounts"))
         .and_then(|c| c.get("numLikes"))
         .and_then(|n| n.as_u64())
         .unwrap_or(0);
-    let comments = item
+    let comments = update
         .get("socialDetail")
         .and_then(|s| s.get("totalSocialActivityCounts"))
         .and_then(|c| c.get("numComments"))
