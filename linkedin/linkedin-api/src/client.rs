@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use crate::auth::Session;
 use crate::error::Error;
@@ -64,6 +65,11 @@ pub struct LinkedInClient {
     /// Built once at client creation, matching the main-app format from
     /// `XLiTrackHeader.initJson()`.
     x_li_track: String,
+
+    /// Cached `fsd_profile` URN for the authenticated user, lazily fetched
+    /// from the `/me` endpoint on first use. Avoids redundant `/me` calls
+    /// when multiple messaging methods need the user's profile URN.
+    profile_urn: OnceCell<String>,
 }
 
 impl LinkedInClient {
@@ -173,6 +179,7 @@ impl LinkedInClient {
             jsessionid: jsessionid.to_string(),
             device_id: device_id.to_string(),
             x_li_track,
+            profile_urn: OnceCell::new(),
         })
     }
 
@@ -221,6 +228,8 @@ impl LinkedInClient {
     ///
     /// The CSRF token header is added automatically.
     /// Returns an [`Error::Api`] if the server responds with a non-success status code.
+    /// Also checks for a top-level `errors` array in the JSON response and
+    /// returns [`Error::Api`] if present.
     pub async fn graphql_get(&self, query_params: &str) -> Result<Value, Error> {
         let url = format!("{}{}graphql?{}", BASE_URL, API_PREFIX, query_params);
         let resp = self
@@ -230,7 +239,23 @@ impl LinkedInClient {
             .header("x-li-graphql-pegasus-client", "true")
             .send()
             .await?;
-        check_response(resp).await
+        let json = check_response(resp).await?;
+
+        // Check for GraphQL-level errors (HTTP 200 but logical error).
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let messages: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect();
+                return Err(Error::Api {
+                    status: 200,
+                    body: format!("GraphQL errors: {}", messages.join("; ")),
+                });
+            }
+        }
+
+        Ok(json)
     }
 
     /// Send a GET request to an arbitrary path on the LinkedIn host.
@@ -297,9 +322,10 @@ impl LinkedInClient {
         // queryId from ProfileGraphQLClient.java static initializer:
         //   voyagerIdentityDashProfiles.5f50f83f76a1e270603613bdd0fb0252
         let variables = format!("(memberIdentity:{})", restli_id);
-        let params = format!(
-            "variables={}&queryId=voyagerIdentityDashProfiles.5f50f83f76a1e270603613bdd0fb0252&queryName=ProfilesByMemberIdentity",
-            variables
+        let params = graphql_params(
+            &variables,
+            "voyagerIdentityDashProfiles.5f50f83f76a1e270603613bdd0fb0252",
+            "ProfilesByMemberIdentity",
         );
         let raw = self.graphql_get(&params).await?;
 
@@ -330,6 +356,30 @@ impl LinkedInClient {
     /// fields like `miniProfile`, `plainId`, `publicContactInfo`, etc.
     pub async fn get_me(&self) -> Result<Value, Error> {
         self.get("me").await
+    }
+
+    /// Return the authenticated user's `fsd_profile` URN, fetching and caching
+    /// it from `/me` on first call.
+    ///
+    /// Subsequent calls return the cached value without making a network request.
+    /// The URN format is `urn:li:fsd_profile:{opaque_id}` and is extracted from
+    /// `miniProfile.dashEntityUrn` in the `/me` response.
+    pub async fn my_profile_urn(&self) -> Result<&str, Error> {
+        self.profile_urn
+            .get_or_try_init(|| async {
+                let me = self.get("me").await?;
+                me.get("miniProfile")
+                    .and_then(|mp| mp.get("dashEntityUrn"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| Error::Api {
+                        status: 0,
+                        body: "could not extract miniProfile.dashEntityUrn from /me response"
+                            .to_string(),
+                    })
+            })
+            .await
+            .map(|s| s.as_str())
     }
 
     /// Returns the raw reqwest client for advanced use (e.g., auth endpoints
@@ -374,7 +424,7 @@ impl LinkedInClient {
     /// for the `Conversation` model definition.
     pub async fn get_conversations(
         &self,
-        _count: u32,
+        count: u32,
         created_before: Option<u64>,
     ) -> Result<Value, Error> {
         // The REST endpoint messaging/conversations returns HTTP 500
@@ -391,48 +441,42 @@ impl LinkedInClient {
         // Optional:
         //   lastActivityBefore: epoch-millis cursor for pagination
 
-        // First, get the dash entity URN from the /me endpoint to construct the mailboxUrn.
-        // The mailboxUrn format is urn:li:fsd_profile:{opaque_id} (from dashEntityUrn).
-        let me = self.get("me").await?;
-        let mailbox_urn = me
-            .get("miniProfile")
-            .and_then(|mp| mp.get("dashEntityUrn"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Api {
-                status: 0,
-                body: "could not extract miniProfile.dashEntityUrn from /me response".to_string(),
-            })?
-            .to_string();
+        // Get the user's fsd_profile URN (cached after first /me call).
+        let mailbox_urn = self.my_profile_urn().await?;
 
-        // Use the Voyager GraphQL endpoint to fetch messaging conversations.
-        // The REST endpoint messaging/conversations returns HTTP 500
-        // (deprecated/removed server-side for the international build).
-        //
-        // The `messengerConversationsByCategory` query from
-        // MessengerGraphQLClient.java fetches conversations by category.
-        //
-        // In Rest.li encoding, string values containing special characters
-        // (colons, commas, parentheses) must be percent-encoded within the
-        // variables map. The `DataEncoder` in the Android app does this
-        // via `AndroidUriCodec`.
-        let encoded_urn: String =
-            url::form_urlencoded::byte_serialize(mailbox_urn.as_bytes()).collect();
+        // Rest.li AsciiHex-encode the URN (colons are Rest.li reserved).
+        let encoded_urn = restli_encode_string(mailbox_urn);
         let vars = if let Some(ts) = created_before {
             format!(
                 "(mailboxUrn:{},category:PRIMARY_INBOX,count:{},lastActivityBefore:{})",
-                encoded_urn, _count, ts
+                encoded_urn, count, ts
             )
         } else {
             format!(
                 "(mailboxUrn:{},category:PRIMARY_INBOX,count:{})",
-                encoded_urn, _count
+                encoded_urn, count
             )
         };
-        let params = format!(
-            "variables={}&queryId=voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6&queryName=MessengerConversationsByCategory",
-            vars
+        let params = graphql_params(
+            &vars,
+            "voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6",
+            "MessengerConversationsByCategory",
         );
-        self.graphql_get(&params).await
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope:
+        //   data.messengerConversationsByCategory
+        // which contains { elements, paging }.
+        raw.get("data")
+            .and_then(|d| d.get("messengerConversationsByCategory"))
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.messengerConversationsByCategory): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
     }
 
     /// Fetch the user's connections.
@@ -495,9 +539,10 @@ impl LinkedInClient {
             "(count:{count},origin:GLOBAL_SEARCH_HEADER,query:(flagshipSearchIntent:SEARCH_SRP,keywords:{restli_keywords},queryParameters:(resultType:List(PEOPLE))),start:{start})"
         );
 
-        let params = format!(
-            "variables={}&queryId=voyagerSearchDashClusters.fae19421cdd51a7cd735e0b7d7b32e0f&queryName=SearchClusterCollection",
-            variables
+        let params = graphql_params(
+            &variables,
+            "voyagerSearchDashClusters.fae19421cdd51a7cd735e0b7d7b32e0f",
+            "SearchClusterCollection",
         );
         let raw = self.graphql_get(&params).await?;
 
@@ -542,9 +587,10 @@ impl LinkedInClient {
         // Variables: start (Integer), count (Integer), filterVanityName (optional String).
         // We omit filterVanityName to get the default "all notifications" view.
         let variables = format!("(start:{},count:{})", start, count);
-        let params = format!(
-            "variables={}&queryId=voyagerIdentityDashNotificationCards.1a1ca07d1f7a6e1033fd88d5fd2da611&queryName=NotificationsCardsByFilterVanityName",
-            variables
+        let params = graphql_params(
+            &variables,
+            "voyagerIdentityDashNotificationCards.1a1ca07d1f7a6e1033fd88d5fd2da611",
+            "NotificationsCardsByFilterVanityName",
         );
         let raw = self.graphql_get(&params).await?;
 
@@ -593,22 +639,13 @@ impl LinkedInClient {
                 .strip_prefix("urn:li:messagingThread:")
                 .unwrap_or(conversation_urn);
 
-            // Get the user's fsd_profile URN from /me.
-            let me = self.get("me").await?;
-            let profile_urn = me
-                .get("miniProfile")
-                .and_then(|mp| mp.get("dashEntityUrn"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Api {
-                    status: 0,
-                    body: "could not extract miniProfile.dashEntityUrn from /me".to_string(),
-                })?;
+            // Get the user's fsd_profile URN (cached after first /me call).
+            let profile_urn = self.my_profile_urn().await?;
 
             format!("urn:li:msg_conversation:({},{})", profile_urn, thread_id)
         };
-        // Percent-encode the URN for Rest.li variables format.
-        let encoded_urn: String =
-            url::form_urlencoded::byte_serialize(full_urn.as_bytes()).collect();
+        // Rest.li AsciiHex-encode the URN for the variables record.
+        let encoded_urn = restli_encode_string(&full_urn);
 
         // Use the Messenger GraphQL query `messengerMessagesByConversation`
         // from MessengerGraphQLClient.java.
@@ -618,19 +655,50 @@ impl LinkedInClient {
         } else {
             format!("(conversationUrn:{})", encoded_urn)
         };
-        let params = format!(
-            "variables={}&queryId=voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a&queryName=MessengerMessagesByConversation",
-            variables
+        let params = graphql_params(
+            &variables,
+            "voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a",
+            "MessengerMessagesByConversation",
         );
-        self.graphql_get(&params).await
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope:
+        //   data.messengerMessagesByConversation
+        // which contains { elements, paging }.
+        raw.get("data")
+            .and_then(|d| d.get("messengerMessagesByConversation"))
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.messengerMessagesByConversation): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
     }
 }
 
-/// Encode a string using Rest.li's AsciiHex encoding, then URI-encode.
+/// Build a GraphQL query parameter string for the Voyager GraphQL endpoint.
+///
+/// Combines the `variables` (Rest.li parenthesized record), `query_id`, and
+/// `query_name` into the `variables=...&queryId=...&queryName=...` format
+/// expected by `/voyager/api/graphql`.
+fn graphql_params(variables: &str, query_id: &str, query_name: &str) -> String {
+    format!(
+        "variables={}&queryId={}&queryName={}",
+        variables, query_id, query_name
+    )
+}
+
+/// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
+/// parenthesized record variables within a URL query parameter.
 ///
 /// Rest.li reserves five characters: `( ) , ' :` plus the escape character `%`.
-/// Each reserved char is replaced by `%XX` (uppercase hex). The result is then
-/// percent-encoded for safe inclusion in a URI query parameter.
+/// Each reserved char is replaced by `%XX` (uppercase hex of the ASCII code).
+///
+/// After AsciiHex encoding, characters that are unsafe in URL query strings
+/// (spaces, etc.) are percent-encoded. The `%` signs introduced by AsciiHex
+/// are NOT double-encoded because they are already valid percent-encoding.
 ///
 /// Empty strings are encoded as `''` (two single quotes) per Rest.li convention.
 ///
@@ -640,23 +708,38 @@ fn restli_encode_string(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    // Step 1: AsciiHex-encode reserved chars.
-    let mut buf = String::with_capacity(s.len() * 2);
-    for ch in s.chars() {
-        match ch {
-            '(' | ')' | ',' | '\'' | ':' | '%' => {
+    let mut buf = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            // Rest.li reserved characters: AsciiHex-encode them.
+            b'(' | b')' | b',' | b'\'' | b':' | b'%' => {
                 buf.push('%');
-                // Pad single-digit hex codes with leading zero.
-                let hex = format!("{:02X}", ch as u32);
-                buf.push_str(&hex);
+                buf.push_str(&format!("{:02X}", byte));
             }
-            _ => buf.push(ch),
+            // Characters that are safe in URL query strings unencoded.
+            // RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
+            // Plus a few sub-delimiters safe in query values: ! * @ /
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'*'
+            | b'@'
+            | b'/' => {
+                buf.push(byte as char);
+            }
+            // Everything else (spaces, non-ASCII bytes, etc.): percent-encode.
+            _ => {
+                buf.push('%');
+                buf.push_str(&format!("{:02X}", byte));
+            }
         }
     }
-    // Step 2: URI-encode for query parameter safety.
-    // The Android app uses AndroidUriCodec which does standard percent-encoding.
-    let encoded: String = url::form_urlencoded::byte_serialize(buf.as_bytes()).collect();
-    encoded
+    buf
 }
 
 /// Generate a JSESSIONID in the format used by the LinkedIn Android app.
@@ -832,6 +915,55 @@ mod tests {
         assert!(!client.device_id().is_empty());
         assert!(!client.x_li_track().is_empty());
         assert_eq!(client.base_url(), "https://www.linkedin.com");
+    }
+
+    #[test]
+    fn restli_encode_empty_string() {
+        assert_eq!(restli_encode_string(""), "''");
+    }
+
+    #[test]
+    fn restli_encode_plain_string() {
+        // No special chars -- should pass through unchanged.
+        assert_eq!(restli_encode_string("john-doe-123"), "john-doe-123");
+    }
+
+    #[test]
+    fn restli_encode_reserved_chars() {
+        // Each Rest.li reserved character should be AsciiHex-encoded.
+        assert_eq!(restli_encode_string("("), "%28");
+        assert_eq!(restli_encode_string(")"), "%29");
+        assert_eq!(restli_encode_string(","), "%2C");
+        assert_eq!(restli_encode_string("'"), "%27");
+        assert_eq!(restli_encode_string(":"), "%3A");
+        assert_eq!(restli_encode_string("%"), "%25");
+    }
+
+    #[test]
+    fn restli_encode_urn() {
+        // URNs contain colons which are Rest.li reserved.
+        // Should NOT double-encode (no %253A).
+        let encoded = restli_encode_string("urn:li:fsd_profile:abc123");
+        assert_eq!(encoded, "urn%3Ali%3Afsd_profile%3Aabc123");
+        // Verify no double-encoding: should not contain %25.
+        assert!(
+            !encoded.contains("%253A"),
+            "must not double-encode: {encoded}"
+        );
+    }
+
+    #[test]
+    fn restli_encode_spaces() {
+        // Spaces should be percent-encoded for URL safety.
+        let encoded = restli_encode_string("hello world");
+        assert_eq!(encoded, "hello%20world");
+    }
+
+    #[test]
+    fn restli_encode_mixed() {
+        // Mixed content: keyword with apostrophe.
+        let encoded = restli_encode_string("O'Brien");
+        assert_eq!(encoded, "O%27Brien");
     }
 
     #[test]

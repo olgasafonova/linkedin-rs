@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{
-    ConnectionsResponse, FeedResponse, NotificationCardsResponse, SearchResponse,
+    ConnectionsResponse, FeedResponse, NotificationCardsResponse, Paging, SearchResponse,
 };
 
 #[derive(Parser)]
@@ -506,13 +506,7 @@ fn print_profile_summary(profile: &serde_json::Value) {
 
     // Summary / About.
     if let Some(summary) = profile.get("summary").and_then(|v| v.as_str()) {
-        let truncated = truncate(summary, 200);
-        let display = if truncated.len() < summary.len() {
-            format!("{}...", truncated)
-        } else {
-            summary.to_string()
-        };
-        println!("About: {}", display);
+        println!("About: {}", truncate_with_ellipsis(summary, 200));
     }
 
     // Entity URN.
@@ -690,14 +684,7 @@ async fn cmd_feed_list(start: u32, count: u32, raw_json: bool) -> Result<(), Str
 
     // Print paging info.
     if let Some(ref paging) = feed.paging {
-        let total_str = paging
-            .total
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Feed updates (offset {}, showing {}, total {})",
-            paging.start, paging.count, total_str
-        );
+        print_paging_header("Feed updates", paging);
     }
     println!("---");
 
@@ -747,12 +734,7 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         .unwrap_or("");
 
     // Truncate long commentary for the summary view.
-    let truncated_commentary = truncate(commentary, 120);
-    let commentary_display = if truncated_commentary.len() < commentary.len() {
-        format!("{}...", truncated_commentary)
-    } else {
-        commentary.to_string()
-    };
+    let commentary_display = truncate_with_ellipsis(commentary, 120);
 
     // Entity URN -- lives at the top-level element, not inside the UpdateV2.
     let urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
@@ -806,11 +788,10 @@ async fn cmd_messages_list(
         return Ok(());
     }
 
-    // GraphQL response: data.messengerConversationsByCategory.elements
+    // The API client already unwraps the GraphQL envelope to
+    // data.messengerConversationsByCategory, which contains { elements, paging }.
     let elements = value
-        .get("data")
-        .and_then(|d| d.get("messengerConversationsByCategory"))
-        .and_then(|c| c.get("elements"))
+        .get("elements")
         .and_then(|e| e.as_array())
         .cloned()
         .unwrap_or_default();
@@ -855,11 +836,10 @@ async fn cmd_messages_read(
         return Ok(());
     }
 
-    // GraphQL response: data.messengerMessagesByConversation.elements
+    // The API client already unwraps the GraphQL envelope to
+    // data.messengerMessagesByConversation, which contains { elements, paging }.
     let elements = value
-        .get("data")
-        .and_then(|d| d.get("messengerMessagesByConversation"))
-        .and_then(|c| c.get("elements"))
+        .get("elements")
         .and_then(|e| e.as_array())
         .cloned()
         .unwrap_or_default();
@@ -903,14 +883,7 @@ async fn cmd_connections_list(start: u32, count: u32, raw_json: bool) -> Result<
         .map_err(|e| format!("failed to parse connections response: {e}"))?;
 
     if let Some(ref paging) = resp.paging {
-        let total_str = paging
-            .total
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Connections (offset {}, showing {}, total {})",
-            paging.start, paging.count, total_str
-        );
+        print_paging_header("Connections", paging);
     }
     println!("---");
 
@@ -1008,14 +981,7 @@ async fn cmd_search_people(
         .map_err(|e| format!("failed to parse search response: {e}"))?;
 
     if let Some(ref paging) = resp.paging {
-        let total_str = paging
-            .total
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Search results for '{}' (offset {}, showing {}, total {})",
-            keywords, paging.start, paging.count, total_str
-        );
+        print_paging_header(&format!("Search results for '{}'", keywords), paging);
     }
     println!("---");
 
@@ -1136,14 +1102,7 @@ async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Resul
         .map_err(|e| format!("failed to parse notifications response: {e}"))?;
 
     if let Some(ref paging) = resp.paging {
-        let total_str = paging
-            .total
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "Notifications (offset {}, showing {}, total {})",
-            paging.start, paging.count, total_str
-        );
+        print_paging_header("Notifications", paging);
     }
     println!("---");
 
@@ -1205,12 +1164,7 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
         .unwrap_or("");
 
     // Truncate long headlines for summary view.
-    let truncated_headline = truncate(headline, 120);
-    let headline_display = if truncated_headline.len() < headline.len() {
-        format!("{}...", truncated_headline)
-    } else {
-        headline.to_string()
-    };
+    let headline_display = truncate_with_ellipsis(headline, 120);
 
     print!("[{}]{} {}", index, unread_marker, headline_display);
     if !kicker.is_empty() {
@@ -1264,9 +1218,6 @@ fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), String>
     Ok((client, path))
 }
 
-/// Truncate a string to at most `max_chars` characters, safely handling
-/// multi-byte UTF-8. Returns the original string if it is shorter than
-/// `max_chars`.
 /// Print a conversation from the GraphQL `messengerConversationsByCategory` response.
 fn print_graphql_conversation(index: usize, conv: &serde_json::Value) {
     let backend_urn = conv
@@ -1336,12 +1287,7 @@ fn print_graphql_conversation(index: usize, conv: &serde_json::Value) {
         })
         .unwrap_or_default();
 
-    let truncated_msg = truncate(&last_message, 80);
-    let last_msg_display = if truncated_msg.len() < last_message.len() {
-        format!("{}...", truncated_msg)
-    } else {
-        last_message
-    };
+    let last_msg_display = truncate_with_ellipsis(&last_message, 80);
 
     let title = conv.get("title").and_then(|n| n.as_str()).unwrap_or("");
     let display_name = if !title.is_empty() {
@@ -1417,11 +1363,38 @@ fn print_graphql_message(msg: &serde_json::Value) {
     }
 }
 
+/// Truncate a string to at most `max_chars` characters, safely handling
+/// multi-byte UTF-8. Returns the original string if it is shorter than
+/// `max_chars`.
 fn truncate(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((idx, _)) => &s[..idx],
         None => s,
     }
+}
+
+/// Truncate a string and append `...` if it was truncated.
+/// Returns the original string unchanged if it fits within `max_chars`.
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let truncated = truncate(s, max_chars);
+    if truncated.len() < s.len() {
+        format!("{}...", truncated)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Print a paging header line in the format:
+/// `{label} (offset {start}, showing {count}, total {total})`
+fn print_paging_header(label: &str, paging: &Paging) {
+    let total_str = paging
+        .total
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    println!(
+        "{} (offset {}, showing {}, total {})",
+        label, paging.start, paging.count, total_str
+    );
 }
 
 // NOTE: The old REST-based print_conversation, extract_participant_names,

@@ -17,6 +17,7 @@ thiserror = "2"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 iana-time-zone = "0.1"
+tokio = { version = "1", features = ["sync"] }
 dirs = "6"
 
 [dev-dependencies]
