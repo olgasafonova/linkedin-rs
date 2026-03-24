@@ -197,6 +197,18 @@ enum MessagesAction {
         #[arg(long)]
         json: bool,
     },
+    /// Send a message to a connection
+    Send {
+        /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
+        recipient: String,
+
+        /// Message text to send
+        message: String,
+
+        /// Output raw JSON response instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -255,6 +267,16 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_messages_read(&conversation_id, before, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            MessagesAction::Send {
+                recipient,
+                message,
+                json,
+            } => {
+                if let Err(e) = cmd_messages_send(&recipient, &message, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -855,6 +877,49 @@ async fn cmd_messages_read(
     for event in &elements {
         print_graphql_message(event);
         println!();
+    }
+
+    Ok(())
+}
+
+/// Handle `messages send <recipient> <message> [--json]`.
+///
+/// Resolves the recipient's public identifier to an fsd_profile URN, then
+/// sends a message via the REST messaging/conversations?action=create endpoint.
+async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Resolve public identifier to fsd_profile URN.
+    // The recipient can be either a public_id (vanity URL slug) or a direct
+    // fsd_profile URN like "urn:li:fsd_profile:ACoAABivN...".
+    let profile_urn = if recipient.starts_with("urn:li:fsd_profile:")
+        || recipient.starts_with("urn:li:member:")
+        || recipient.starts_with("urn:li:fs_miniProfile:")
+    {
+        eprintln!("Using provided URN directly.");
+        recipient.to_string()
+    } else {
+        eprintln!("Resolving profile URN for '{}'...", recipient);
+        client
+            .resolve_profile_urn(recipient)
+            .await
+            .map_err(|e| format!("failed to resolve profile URN: {e}"))?
+    };
+    eprintln!("Recipient URN: {}", profile_urn);
+
+    // Send the message.
+    eprintln!("Sending message...");
+    let value = client
+        .send_message(&profile_urn, message)
+        .await
+        .map_err(|e| format!("failed to send message: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Message sent to {} ({})", recipient, profile_urn);
     }
 
     Ok(())

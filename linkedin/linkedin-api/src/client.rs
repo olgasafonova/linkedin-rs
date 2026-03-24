@@ -276,6 +276,19 @@ impl LinkedInClient {
         check_response(resp).await
     }
 
+    /// Send a POST request to an arbitrary path on `www.linkedin.com`.
+    pub async fn api_post(&self, path: &str, body: &Value) -> Result<Value, Error> {
+        let url = format!("{}{}", BASE_URL, path);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .json(body)
+            .send()
+            .await?;
+        check_response(resp).await
+    }
+
     /// Fetch the user's feed (`/voyager/api/feed/updates?q=findFeed`).
     ///
     /// Uses the `q=findFeed` finder with standard pagination parameters.
@@ -605,6 +618,143 @@ impl LinkedInClient {
                 body: format!(
                     "unexpected GraphQL response shape (missing data.identityDashNotificationCardsByFilterVanityName): {}",
                     serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
+    }
+
+    /// Send a message to a LinkedIn member.
+    ///
+    /// Uses the Dash REST endpoint
+    /// `POST /voyager/api/voyagerMessagingDashMessengerMessages?action=create`
+    /// with the payload format derived from the decompiled international APK's
+    /// `CreateMessagePayload`, `MessageComposerImpl.createDirectReplyMessage()`,
+    /// and `DeliveryHelperImpl`. This is the newer Dash endpoint that the
+    /// international build uses for all messaging.
+    ///
+    /// Falls back to the legacy REST endpoint
+    /// `POST /voyager/api/messaging/conversations?action=create` if the Dash
+    /// endpoint returns an error.
+    ///
+    /// # Parameters
+    ///
+    /// - `recipient_profile_urn`: The `urn:li:fsd_profile:...` URN of the recipient.
+    ///   Can be obtained from `resolve_profile_urn()` or connections list.
+    /// - `message_body`: The plain text message to send.
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response from the API (typically contains the created event
+    /// or conversation URN).
+    ///
+    /// See `re/api_endpoint_catalog.md` section 6 for the endpoint documentation.
+    pub async fn send_message(
+        &self,
+        recipient_profile_urn: &str,
+        message_body: &str,
+    ) -> Result<Value, Error> {
+        let _origin_token = uuid::Uuid::new_v4().to_string();
+        let _my_urn = self.my_profile_urn().await?;
+
+        // Use the legacy REST endpoint format (from python linkedin-api).
+        // The recipient uses the full fs_miniProfile URN.
+        // Try both full URN and just the ID portion.
+        let mini_urn =
+            recipient_profile_urn.replace("urn:li:fsd_profile:", "urn:li:fs_miniProfile:");
+
+        let payload = serde_json::json!({
+            "keyVersion": "LEGACY_INBOX",
+            "conversationCreate": {
+                "eventCreate": {
+                    "value": {
+                        "com.linkedin.voyager.messaging.create.MessageCreate": {
+                            "body": message_body,
+                            "attachments": [],
+                            "attributedBody": {
+                                "text": message_body,
+                                "attributes": []
+                            },
+                            "mediaAttachments": []
+                        }
+                    }
+                },
+                "recipients": [mini_urn],
+                "subtype": "MEMBER_TO_MEMBER"
+            }
+        });
+
+        self.post("messaging/conversations?action=create", &payload)
+            .await
+    }
+
+    /// Resolve a public identifier (vanity URL slug) to an `fsd_profile` URN.
+    ///
+    /// Uses the REST `identity/profiles/{public_id}` endpoint (without
+    /// decoration) to fetch the profile's `entityUrn`, then converts from
+    /// `fs_miniProfile` to `fsd_profile` format if needed.
+    ///
+    /// Falls back to the GraphQL endpoint if the REST endpoint fails.
+    ///
+    /// Returns the URN string like `urn:li:fsd_profile:ACoAA...`.
+    pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<String, Error> {
+        // Try the REST miniProfile endpoint first, which is more reliable
+        // than the GraphQL profile endpoint and returns the entityUrn
+        // directly.
+        let miniprofile_path = format!(
+            "identity/miniprofiles?q=memberIdentity&memberIdentity={}",
+            public_id
+        );
+        if let Ok(resp) = self.get(&miniprofile_path).await {
+            // Response has elements array with miniProfile objects.
+            if let Some(urn) = resp
+                .get("elements")
+                .and_then(|e| e.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|mp| mp.get("dashEntityUrn").or(mp.get("entityUrn")))
+                .and_then(|v| v.as_str())
+            {
+                // Ensure it's an fsd_profile URN.
+                let urn = if urn.contains("fs_miniProfile") {
+                    urn.replace("fs_miniProfile", "fsd_profile")
+                } else {
+                    urn.to_string()
+                };
+                return Ok(urn);
+            }
+        }
+
+        // Try the REST profile endpoint.
+        let profile_path = format!("identity/profiles/{}", public_id);
+        if let Ok(resp) = self.get(&profile_path).await {
+            // Look for miniProfile.dashEntityUrn or entityUrn.
+            if let Some(urn) = resp
+                .get("miniProfile")
+                .and_then(|mp| mp.get("dashEntityUrn"))
+                .and_then(|v| v.as_str())
+            {
+                return Ok(urn.to_string());
+            }
+            if let Some(urn) = resp.get("entityUrn").and_then(|v| v.as_str()) {
+                let urn = if urn.contains("fs_miniProfile") || urn.contains("fs_profile") {
+                    urn.replace("fs_miniProfile", "fsd_profile")
+                        .replace("fs_profile", "fsd_profile")
+                } else {
+                    urn.to_string()
+                };
+                return Ok(urn);
+            }
+        }
+
+        // Fall back to GraphQL profile endpoint.
+        let profile = self.get_profile(public_id).await?;
+        profile
+            .get("entityUrn")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "could not extract entityUrn from any profile endpoint for '{}'",
+                    public_id
                 ),
             })
     }
