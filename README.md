@@ -206,41 +206,6 @@ It provides:
 
 Key dependencies: reqwest (with cookies + JSON), serde, chrono, thiserror, tokio.
 
-## Reverse Engineering Docs
-
-All reverse engineering artifacts live in `re/`. These document what was learned from decompiling the Android APK and observing live API traffic.
-
-| Document | Description |
-|----------|-------------|
-| `prd.md` | Project scope, milestones, and security rules |
-| `architecture_overview.md` | Android app architecture and module layout |
-| `auth_flow.md` | Authentication flow: OAuth2, CSRF, cookie-based sessions |
-| `api_endpoint_catalog.md` | Discovered API endpoints across all domains |
-| `restli_protocol.md` | Rest.li protocol details: headers, methods, encoding |
-| `pegasus_models.md` | LinkedIn's Pegasus data models and type system |
-| `search_protocol.md` | Search API protocol (GraphQL Dash queries) |
-| `tls_configuration.md` | TLS fingerprint analysis and BoringSSL comparison |
-| `device_fingerprinting.md` | Device fingerprinting and anti-automation signals |
-| `rate_limiting.md` | Rate limiting behavior and thresholds |
-| `realtime_system.md` | Real-time messaging system (long-poll / SSE) |
-| `media_upload.md` | Media upload flow and endpoints |
-| `serialization_edge_cases.md` | Rest.li serialization quirks and edge cases |
-| `lix_feature_flags.md` | LinkedIn's LIX feature flag system |
-| `model_corrections.md` | Corrections to decompiled models after live validation |
-| `manifest_analysis.md` | AndroidManifest.xml analysis |
-| `file_analysis.md` | APK file structure analysis |
-| `js_bundle_analysis.md` | Embedded JavaScript bundle analysis |
-| `apk_variant_comparison.md` | Comparison of APK variants (intl vs standard) |
-| `intl_vs_zephyr_diff.md` | Differences between LinkedIn Intl and Zephyr builds |
-| `reactions.md` | Reaction API protocol and types |
-| `create_post.md` | Post creation API details |
-| `comments.md` | Comment API protocol |
-| `connection_request.md` | Connection request / invitation API |
-| `invitations.md` | Invitation listing and acceptance API |
-| `profile_visit.md` | Profile visit tracking API |
-| `profile_viewers.md` | "Who viewed your profile" API |
-| `send_message.md` | Message sending API details |
-
 ## Architecture
 
 ### Auth model
