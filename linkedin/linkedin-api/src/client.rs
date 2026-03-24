@@ -652,38 +652,47 @@ impl LinkedInClient {
         recipient_profile_urn: &str,
         message_body: &str,
     ) -> Result<Value, Error> {
-        let _origin_token = uuid::Uuid::new_v4().to_string();
-        let _my_urn = self.my_profile_urn().await?;
+        let origin_token = uuid::Uuid::new_v4().to_string();
+        let my_urn = self.my_profile_urn().await?;
 
-        // Use the legacy REST endpoint format (from python linkedin-api).
-        // The recipient uses the full fs_miniProfile URN.
-        // Try both full URN and just the ID portion.
-        let mini_urn =
-            recipient_profile_urn.replace("urn:li:fsd_profile:", "urn:li:fs_miniProfile:");
-
+        // Captured from live browser traffic via Chrome DevTools MCP.
+        // Endpoint: POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
+        // Note: action is "createMessage" NOT "create".
+        // Content-Type from browser is text/plain;charset=UTF-8 but JSON body.
+        let tracking_id = uuid::Uuid::new_v4().to_string();
         let payload = serde_json::json!({
-            "keyVersion": "LEGACY_INBOX",
-            "conversationCreate": {
-                "eventCreate": {
-                    "value": {
-                        "com.linkedin.voyager.messaging.create.MessageCreate": {
-                            "body": message_body,
-                            "attachments": [],
-                            "attributedBody": {
-                                "text": message_body,
-                                "attributes": []
-                            },
-                            "mediaAttachments": []
-                        }
-                    }
+            "message": {
+                "body": {
+                    "attributes": [],
+                    "text": message_body
                 },
-                "recipients": [mini_urn],
-                "subtype": "MEMBER_TO_MEMBER"
-            }
+                "originToken": origin_token,
+                "renderContentUnions": []
+            },
+            "mailboxUrn": my_urn,
+            "trackingId": tracking_id,
+            "dedupeByClientGeneratedToken": false,
+            "hostRecipientUrns": [recipient_profile_urn]
         });
 
-        self.post("messaging/conversations?action=create", &payload)
-            .await
+        // Captured from live browser traffic: the web client sends specific headers
+        // that differ from the Android app defaults we use elsewhere.
+        let url = format!(
+            "{}{}voyagerMessagingDashMessengerMessages?action=createMessage",
+            BASE_URL, API_PREFIX
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .header("Content-Type", "text/plain;charset=UTF-8")
+            .header("Accept", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+            .header("X-LI-Track", r#"{"clientVersion":"1.13.42962","mpVersion":"1.13.42962","osName":"web","timezoneOffset":1,"timezone":"Europe/Copenhagen","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":1920,"displayHeight":1080}"#)
+            .body(payload.to_string())
+            .send()
+            .await?;
+        check_response(resp).await
     }
 
     /// Resolve a public identifier (vanity URL slug) to an `fsd_profile` URN.
