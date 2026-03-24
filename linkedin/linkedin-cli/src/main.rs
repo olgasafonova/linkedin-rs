@@ -954,8 +954,8 @@ fn print_connection(index: usize, conn: &serde_json::Value) {
 
 /// Handle `search people <keywords> [--count N] [--start N] [--json]`.
 ///
-/// Loads the session, calls GET /voyager/api/search/hits with guided people
-/// search query, and prints the results.
+/// Loads the session, calls the Voyager GraphQL `searchDashClustersByAll`
+/// endpoint and prints the results.
 async fn cmd_search_people(
     keywords: &str,
     start: u32,
@@ -976,6 +976,8 @@ async fn cmd_search_people(
         return Ok(());
     }
 
+    // The response (after GraphQL unwrapping) has: elements (clusters),
+    // paging, metadata. Parse paging for the header line.
     let resp: SearchResponse = serde_json::from_value(value.clone())
         .map_err(|e| format!("failed to parse search response: {e}"))?;
 
@@ -991,83 +993,88 @@ async fn cmd_search_people(
     }
     println!("---");
 
-    if resp.elements.is_empty() {
-        println!("(no results)");
-        return Ok(());
+    // Flatten clusters -> items -> entityResult for display.
+    // Each cluster element contains an `items` array with search results.
+    let mut result_idx = start as usize;
+    let mut any_results = false;
+    for cluster in &resp.elements {
+        let items = cluster
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for item_wrapper in items {
+            let entity = item_wrapper.get("item").and_then(|i| i.get("entityResult"));
+            if let Some(entity) = entity {
+                result_idx += 1;
+                any_results = true;
+                print_search_entity(result_idx, entity);
+                println!();
+            }
+        }
     }
 
-    for (i, element) in resp.elements.iter().enumerate() {
-        let idx = start as usize + i + 1;
-        print_search_hit(idx, element);
-        println!();
+    if !any_results {
+        println!("(no results)");
     }
 
     Ok(())
 }
 
-/// Print a brief human-readable summary of a single search hit.
+/// Print a brief human-readable summary of a single search entity result.
 ///
-/// Search hits have a polymorphic `hitInfo` field (Rest.li union). For people
-/// results, we look for the `SearchProfile` variant which contains a
-/// `miniProfile` with name and headline, plus `location` and `industry` fields.
+/// The GraphQL `searchDashClustersByAll` response returns `entityResult`
+/// objects with structured text fields rather than the legacy
+/// `SearchProfile.miniProfile` format.
 ///
-/// The exact union key varies -- it may be a fully qualified class name like
-/// `com.linkedin.voyager.search.SearchProfile` or a short form. We try both
-/// patterns and fall back to extracting fields from the element root.
-fn print_search_hit(index: usize, hit: &serde_json::Value) {
-    // Try to find the SearchProfile inside hitInfo (union type).
-    let profile = hit
-        .get("hitInfo")
-        .and_then(|hi| {
-            // Try fully-qualified union key first.
-            hi.get("com.linkedin.voyager.search.SearchProfile")
-                .or_else(|| hi.get("searchProfile"))
-                // If hitInfo is directly the profile data (flat structure).
-                .or(Some(hi))
-        })
-        .unwrap_or(hit);
-
-    // Extract name from miniProfile within the search profile.
-    let mini = profile.get("miniProfile");
-
-    let name = mini
-        .and_then(|m| {
-            let first = m.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
-            let last = m.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
-            if first.is_empty() && last.is_empty() {
-                None
-            } else {
-                Some(format!("{} {}", first, last).trim().to_string())
-            }
-        })
-        .unwrap_or_else(|| "(unknown)".to_string());
-
-    // Headline: miniProfile.occupation or profile-level headline.
-    let headline = mini
-        .and_then(|m| m.get("occupation").and_then(|v| v.as_str()))
-        .or_else(|| profile.get("headline").and_then(|v| v.as_str()))
-        .unwrap_or("");
-
-    // Location: profile-level location field.
-    let location = profile
-        .get("location")
+/// Fields used:
+/// - `title.text`: person's name
+/// - `primarySubtitle.text`: headline / occupation
+/// - `secondarySubtitle.text`: location
+/// - `navigationUrl`: profile link
+/// - `badgeText.text`: connection degree badge (e.g., "2nd")
+fn print_search_entity(index: usize, entity: &serde_json::Value) {
+    let name = entity
+        .get("title")
+        .and_then(|t| t.get("text"))
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            profile
-                .get("subline")
-                .and_then(|s| s.get("text"))
-                .and_then(|t| t.as_str())
-        })
+        .unwrap_or("(unknown)");
+
+    let headline = entity
+        .get("primarySubtitle")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Public identifier for reference.
-    let pub_id = mini
-        .and_then(|m| m.get("publicIdentifier").and_then(|v| v.as_str()))
+    let location = entity
+        .get("secondarySubtitle")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let badge = entity
+        .get("badgeText")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Extract public profile slug from navigationUrl if available.
+    let profile_slug = entity
+        .get("navigationUrl")
+        .and_then(|v| v.as_str())
+        .and_then(|url| {
+            // URL format: https://www.linkedin.com/in/<slug>?...
+            url.strip_prefix("https://www.linkedin.com/in/")
+                .map(|rest| rest.split('?').next().unwrap_or(rest))
+        })
         .unwrap_or("");
 
     print!("[{}] {}", index, name);
-    if !pub_id.is_empty() {
-        print!(" ({})", pub_id);
+    if !badge.is_empty() {
+        print!(" {}", badge);
+    }
+    if !profile_slug.is_empty() {
+        print!(" ({})", profile_slug);
     }
     println!();
 

@@ -431,17 +431,20 @@ impl LinkedInClient {
 
     /// Search for people by keywords.
     ///
-    /// Calls `GET /voyager/api/search/hits` using the guided finder with
-    /// `guides=List(v->people)`. This is the primary people search endpoint
-    /// documented in `re/api_endpoint_catalog.md` and `re/search_protocol.md`.
+    /// Uses the Voyager GraphQL endpoint with the `searchDashClustersByAll`
+    /// query (queryId: `voyagerSearchDashClusters.fae19421cdd51a7cd735e0b7d7b32e0f`).
     ///
-    /// The response is a Rest.li collection of `SearchHit` items wrapped in
-    /// `SearchCluster` structures. We return the raw JSON since the response
-    /// shape is polymorphic (union types in `hitInfo`).
+    /// The legacy REST endpoint `search/hits?q=guided&guides=List(v->people)`
+    /// returns HTTP 404 on the international build -- search has migrated to
+    /// GraphQL/Dash. Discovered via decompilation of `SearchGraphQLClient.java`
+    /// and `SearchFrameworkUtils.java` in the international APK.
+    ///
+    /// The variables are Rest.li-encoded (parenthesized record syntax) matching
+    /// the `DataEncoder` output from the Android app.
     ///
     /// # Parameters
     ///
-    /// - `keywords`: Search terms (will be URL-encoded by reqwest).
+    /// - `keywords`: Search terms.
     /// - `start`: 0-based pagination offset.
     /// - `count`: Number of results per page.
     pub async fn search_people(
@@ -450,18 +453,39 @@ impl LinkedInClient {
         start: u32,
         count: u32,
     ) -> Result<Value, Error> {
-        // Encode keywords for safe inclusion in the query string.
-        // We use url::form_urlencoded (available via the `url` crate)
-        // which produces application/x-www-form-urlencoded encoding.
-        let encoded_keywords: String =
-            url::form_urlencoded::byte_serialize(keywords.as_bytes()).collect();
-        let path = format!(
-            "search/hits?q=guided&guides=List(v->people)&keywords={}&start={}&count={}&origin=GLOBAL_SEARCH_HEADER",
-            encoded_keywords,
-            start,
-            count,
+        // Rest.li AsciiHex-encode the keywords: special chars ( ) , ' : and %
+        // are escaped as %XX. Then URI-encode the result.
+        let restli_keywords = restli_encode_string(keywords);
+
+        // Build the variables in Rest.li record encoding.
+        // The SearchQueryForInput record has:
+        //   flagshipSearchIntent: SEARCH_SRP (required enum)
+        //   keywords: <encoded string>
+        //   queryParameters: map with resultType -> List(PEOPLE)
+        //
+        // The outer variables map has: query, count, origin, start
+        let variables = format!(
+            "(count:{count},origin:GLOBAL_SEARCH_HEADER,query:(flagshipSearchIntent:SEARCH_SRP,keywords:{restli_keywords},queryParameters:(resultType:List(PEOPLE))),start:{start})"
         );
-        self.get(&path).await
+
+        let params = format!(
+            "variables={}&queryId=voyagerSearchDashClusters.fae19421cdd51a7cd735e0b7d7b32e0f&queryName=SearchClusterCollection",
+            variables
+        );
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope: data.searchDashClustersByAll contains
+        // the collection with `elements`, `paging`, and `metadata`.
+        raw.get("data")
+            .and_then(|d| d.get("searchDashClustersByAll"))
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.searchDashClustersByAll): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
     }
 
     /// Fetch the user's notification cards.
@@ -543,6 +567,39 @@ impl LinkedInClient {
         );
         self.graphql_get(&params).await
     }
+}
+
+/// Encode a string using Rest.li's AsciiHex encoding, then URI-encode.
+///
+/// Rest.li reserves five characters: `( ) , ' :` plus the escape character `%`.
+/// Each reserved char is replaced by `%XX` (uppercase hex). The result is then
+/// percent-encoded for safe inclusion in a URI query parameter.
+///
+/// Empty strings are encoded as `''` (two single quotes) per Rest.li convention.
+///
+/// Source: `DataEncoder.processString()` and `AsciiHexEncoding` in the
+/// decompiled LinkedIn Android app (`com.linkedin.data.lite.restli`).
+fn restli_encode_string(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    // Step 1: AsciiHex-encode reserved chars.
+    let mut buf = String::with_capacity(s.len() * 2);
+    for ch in s.chars() {
+        match ch {
+            '(' | ')' | ',' | '\'' | ':' | '%' => {
+                buf.push('%');
+                // Pad single-digit hex codes with leading zero.
+                let hex = format!("{:02X}", ch as u32);
+                buf.push_str(&hex);
+            }
+            _ => buf.push(ch),
+        }
+    }
+    // Step 2: URI-encode for query parameter safety.
+    // The Android app uses AndroidUriCodec which does standard percent-encoding.
+    let encoded: String = url::form_urlencoded::byte_serialize(buf.as_bytes()).collect();
+    encoded
 }
 
 /// Generate a JSESSIONID in the format used by the LinkedIn Android app.
