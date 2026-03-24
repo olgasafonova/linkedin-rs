@@ -79,7 +79,34 @@ impl LinkedInClient {
     pub fn new() -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
         let jsessionid = generate_jsessionid();
-        let x_li_track = build_x_li_track(&device_id);
+        Self::build(&device_id, &jsessionid, None)
+    }
+
+    /// Create a client with a specific device ID and JSESSIONID (for testing or persistence).
+    ///
+    /// Use this when you want to restore a previous session's device identity
+    /// rather than generating a new one.
+    pub fn with_identity(device_id: String, jsessionid: String) -> Result<Self, Error> {
+        Self::build(&device_id, &jsessionid, None)
+    }
+
+    /// Create a client from a persisted [`Session`].
+    ///
+    /// Uses the session's JSESSIONID and injects the `li_at` cookie into the
+    /// cookie jar on the `.linkedin.com` domain. A new device ID is generated
+    /// (the session doesn't persist device identity -- that's a separate concern).
+    pub fn with_session(session: &Session) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        Self::build(&device_id, &session.jsessionid, Some(&session.li_at))
+    }
+
+    /// Shared client construction logic.
+    ///
+    /// Builds the reqwest client with cookie jar, default headers matching
+    /// the LinkedIn Android app, and seeds the JSESSIONID cookie (plus
+    /// optionally the `li_at` session cookie).
+    fn build(device_id: &str, jsessionid: &str, li_at: Option<&str>) -> Result<Self, Error> {
+        let x_li_track = build_x_li_track(device_id);
 
         // Build default headers applied to every request.
         let mut default_headers = HeaderMap::new();
@@ -89,27 +116,17 @@ impl LinkedInClient {
         );
         default_headers.insert("X-LI-Lang", HeaderValue::from_static("en_US"));
         default_headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
-        // Accept JSON to avoid needing protobuf deserialization.
-        // The real app uses protobuf, but the server supports JSON.
         default_headers.insert(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("application/json"),
         );
-        // User-Agent: the main app relies on Cronet's UA (Chrome-like).
-        // The auth library uses "ANDROID OS" for its direct HTTP calls.
-        // We use "ANDROID OS" as a safe baseline; Cronet-level UA spoofing
-        // would require a different TLS backend anyway.
         default_headers.insert(
             reqwest::header::USER_AGENT,
             HeaderValue::from_static("ANDROID OS"),
         );
-
-        // X-UDID and X-LI-Track are set per-request via the header injection
-        // below, but since they're constant for the client lifetime we could
-        // also set them as defaults. We set them here for simplicity.
         default_headers.insert(
             "X-UDID",
-            HeaderValue::from_str(&device_id)
+            HeaderValue::from_str(device_id)
                 .map_err(|e| Error::Auth(format!("invalid device_id header value: {e}")))?,
         );
         default_headers.insert(
@@ -121,12 +138,12 @@ impl LinkedInClient {
         // Cookie jar is enabled so reqwest automatically manages cookies
         // across requests (JSESSIONID, li_at, etc.).
         let jar = Arc::new(reqwest::cookie::Jar::default());
+        let base_url: url::Url = BASE_URL
+            .parse()
+            .map_err(|e| Error::Auth(format!("invalid base URL: {e}")))?;
 
         // Seed the JSESSIONID cookie. The real app generates this client-side
         // via CsrfCookieHelper.generateJsessionId() before the first request.
-        let base_url: url::Url = BASE_URL
-            .parse()
-            .map_err(|e| Error::Auth(format!("invalid base URL: {e}")))?;
         jar.add_cookie_str(
             &format!(
                 "JSESSIONID=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
@@ -135,63 +152,16 @@ impl LinkedInClient {
             &base_url,
         );
 
-        let http = reqwest::Client::builder()
-            .cookie_provider(jar)
-            .default_headers(default_headers)
-            .build()?;
-
-        Ok(Self {
-            http,
-            jsessionid,
-            device_id,
-            x_li_track,
-        })
-    }
-
-    /// Create a client with a specific device ID and JSESSIONID (for testing or persistence).
-    ///
-    /// Use this when you want to restore a previous session's device identity
-    /// rather than generating a new one.
-    pub fn with_identity(device_id: String, jsessionid: String) -> Result<Self, Error> {
-        let x_li_track = build_x_li_track(&device_id);
-
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            "X-RestLi-Protocol-Version",
-            HeaderValue::from_static("2.0.0"),
-        );
-        default_headers.insert("X-LI-Lang", HeaderValue::from_static("en_US"));
-        default_headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
-        default_headers.insert(
-            reqwest::header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
-        default_headers.insert(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static("ANDROID OS"),
-        );
-        default_headers.insert(
-            "X-UDID",
-            HeaderValue::from_str(&device_id)
-                .map_err(|e| Error::Auth(format!("invalid device_id header value: {e}")))?,
-        );
-        default_headers.insert(
-            "X-LI-Track",
-            HeaderValue::from_str(&x_li_track)
-                .map_err(|e| Error::Auth(format!("invalid X-LI-Track header value: {e}")))?,
-        );
-
-        let jar = Arc::new(reqwest::cookie::Jar::default());
-        let base_url: url::Url = BASE_URL
-            .parse()
-            .map_err(|e| Error::Auth(format!("invalid base URL: {e}")))?;
-        jar.add_cookie_str(
-            &format!(
-                "JSESSIONID=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
-                jsessionid
-            ),
-            &base_url,
-        );
+        // Set li_at cookie (session authentication) if provided.
+        if let Some(li_at_value) = li_at {
+            jar.add_cookie_str(
+                &format!(
+                    "li_at={}; Domain=.linkedin.com; Path=/; Secure",
+                    li_at_value
+                ),
+                &base_url,
+            );
+        }
 
         let http = reqwest::Client::builder()
             .cookie_provider(jar)
@@ -200,79 +170,8 @@ impl LinkedInClient {
 
         Ok(Self {
             http,
-            jsessionid,
-            device_id,
-            x_li_track,
-        })
-    }
-
-    /// Create a client from a persisted [`Session`].
-    ///
-    /// Uses the session's JSESSIONID and injects the `li_at` cookie into the
-    /// cookie jar on the `.linkedin.com` domain. A new device ID is generated
-    /// (the session doesn't persist device identity -- that's a separate concern).
-    pub fn with_session(session: &Session) -> Result<Self, Error> {
-        let device_id = uuid::Uuid::new_v4().to_string();
-        let x_li_track = build_x_li_track(&device_id);
-
-        let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            "X-RestLi-Protocol-Version",
-            HeaderValue::from_static("2.0.0"),
-        );
-        default_headers.insert("X-LI-Lang", HeaderValue::from_static("en_US"));
-        default_headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
-        default_headers.insert(
-            reqwest::header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
-        default_headers.insert(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static("ANDROID OS"),
-        );
-        default_headers.insert(
-            "X-UDID",
-            HeaderValue::from_str(&device_id)
-                .map_err(|e| Error::Auth(format!("invalid device_id header value: {e}")))?,
-        );
-        default_headers.insert(
-            "X-LI-Track",
-            HeaderValue::from_str(&x_li_track)
-                .map_err(|e| Error::Auth(format!("invalid X-LI-Track header value: {e}")))?,
-        );
-
-        let jar = Arc::new(reqwest::cookie::Jar::default());
-        let base_url: url::Url = BASE_URL
-            .parse()
-            .map_err(|e| Error::Auth(format!("invalid base URL: {e}")))?;
-
-        // Set JSESSIONID cookie (CSRF token).
-        jar.add_cookie_str(
-            &format!(
-                "JSESSIONID=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
-                session.jsessionid
-            ),
-            &base_url,
-        );
-
-        // Set li_at cookie (session authentication).
-        jar.add_cookie_str(
-            &format!(
-                "li_at={}; Domain=.linkedin.com; Path=/; Secure",
-                session.li_at
-            ),
-            &base_url,
-        );
-
-        let http = reqwest::Client::builder()
-            .cookie_provider(jar)
-            .default_headers(default_headers)
-            .build()?;
-
-        Ok(Self {
-            http,
-            jsessionid: session.jsessionid.clone(),
-            device_id,
+            jsessionid: jsessionid.to_string(),
+            device_id: device_id.to_string(),
             x_li_track,
         })
     }
@@ -366,8 +265,10 @@ impl LinkedInClient {
     /// See `re/api_endpoint_catalog.md` section 3 and
     /// `re/architecture_overview.md` section 3.6 (Decoration).
     pub async fn get_profile(&self, public_id: &str) -> Result<Value, Error> {
+        let encoded_id =
+            url::form_urlencoded::byte_serialize(public_id.as_bytes()).collect::<String>();
         let path = format!(
-            "identity/profiles/{public_id}?decorationId=com.linkedin.voyager.deco.identity.FullProfile"
+            "identity/profiles/{encoded_id}?decorationId=com.linkedin.voyager.deco.identity.FullProfile"
         );
         self.get(&path).await
     }
@@ -521,17 +422,13 @@ impl LinkedInClient {
         start: u32,
         count: u32,
     ) -> Result<Value, Error> {
+        let encoded_urn =
+            url::form_urlencoded::byte_serialize(conversation_urn.as_bytes()).collect::<String>();
         let path = format!(
             "messaging/conversations/{}/events?start={}&count={}",
-            conversation_urn, start, count
+            encoded_urn, start, count
         );
         self.get(&path).await
-    }
-}
-
-impl Default for LinkedInClient {
-    fn default() -> Self {
-        Self::new().expect("failed to create default LinkedInClient")
     }
 }
 

@@ -328,11 +328,8 @@ async fn cmd_auth_login(li_at_flag: Option<String>) -> Result<(), String> {
     session.save(&path).map_err(|e| format!("{e}"))?;
 
     println!("Session saved to {}", path.display());
-    println!("JSESSIONID: {}...", &session.jsessionid[..10]);
-    println!(
-        "li_at: {}...",
-        &session.li_at[..session.li_at.len().min(10)]
-    );
+    println!("JSESSIONID: {}...", truncate(&session.jsessionid, 10));
+    println!("li_at: {}...", truncate(&session.li_at, 10));
     Ok(())
 }
 
@@ -354,14 +351,8 @@ async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
 
     println!("Session file: {}", path.display());
     println!("Created at: {}", session.created_at);
-    println!(
-        "JSESSIONID: {}...",
-        &session.jsessionid[..session.jsessionid.len().min(10)]
-    );
-    println!(
-        "li_at: {}...",
-        &session.li_at[..session.li_at.len().min(10)]
-    );
+    println!("JSESSIONID: {}...", truncate(&session.jsessionid, 10));
+    println!("li_at: {}...", truncate(&session.li_at, 10));
 
     if !session.is_valid() {
         println!("Status: invalid (empty li_at cookie)");
@@ -424,23 +415,7 @@ fn cmd_auth_logout() -> Result<(), String> {
 /// prints the result. With `--json`, outputs raw pretty-printed JSON.
 /// Without `--json`, outputs a human-readable summary.
 async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
-
-    if !path.exists() {
-        return Err(format!(
-            "no session found at {} -- run `auth login` first",
-            path.display()
-        ));
-    }
-
-    let session = Session::load(&path).map_err(|e| format!("{e}"))?;
-
-    if !session.is_valid() {
-        return Err("session is invalid (empty li_at cookie)".to_string());
-    }
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let me = client
         .get_me()
@@ -463,10 +438,7 @@ async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
 /// Loads the session, creates a client, calls the identity/profiles endpoint
 /// with decoration for full field projection, and prints the result.
 async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let profile = client
         .get_profile(public_id)
@@ -523,8 +495,9 @@ fn print_profile_summary(profile: &serde_json::Value) {
 
     // Summary / About.
     if let Some(summary) = profile.get("summary").and_then(|v| v.as_str()) {
-        let display = if summary.len() > 200 {
-            format!("{}...", &summary[..200])
+        let truncated = truncate(summary, 200);
+        let display = if truncated.len() < summary.len() {
+            format!("{}...", truncated)
         } else {
             summary.to_string()
         };
@@ -682,23 +655,7 @@ fn print_me_summary(me: &serde_json::Value) {
 /// Loads the session, calls GET /voyager/api/feed/updates?q=findFeed with
 /// pagination params, and prints the results.
 async fn cmd_feed_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
-
-    if !path.exists() {
-        return Err(format!(
-            "no session found at {} -- run `auth login` first",
-            path.display()
-        ));
-    }
-
-    let session = Session::load(&path).map_err(|e| format!("{e}"))?;
-
-    if !session.is_valid() {
-        return Err("session is invalid (empty li_at cookie)".to_string());
-    }
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .get_feed(start, count)
@@ -766,8 +723,9 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         .unwrap_or("");
 
     // Truncate long commentary for the summary view.
-    let commentary_display = if commentary.len() > 120 {
-        format!("{}...", &commentary[..120])
+    let truncated_commentary = truncate(commentary, 120);
+    let commentary_display = if truncated_commentary.len() < commentary.len() {
+        format!("{}...", truncated_commentary)
     } else {
         commentary.to_string()
     };
@@ -806,10 +764,7 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
 /// Loads the session, calls GET /voyager/api/messaging/conversations with
 /// pagination params, and prints the results.
 async fn cmd_messages_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .get_conversations(start, count)
@@ -862,10 +817,7 @@ async fn cmd_messages_read(
     count: u32,
     raw_json: bool,
 ) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .get_conversation_events(conversation_id, start, count)
@@ -918,10 +870,7 @@ async fn cmd_messages_read(
 /// Loads the session, calls GET /voyager/api/relationships/connections with
 /// pagination params sorted by RECENTLY_ADDED, and prints the results.
 async fn cmd_connections_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .get_connections(start, count)
@@ -1024,10 +973,7 @@ async fn cmd_search_people(
     count: u32,
     raw_json: bool,
 ) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .search_people(keywords, start, count)
@@ -1149,10 +1095,7 @@ fn print_search_hit(index: usize, hit: &serde_json::Value) {
 /// Loads the session, calls GET /voyager/api/identity/notificationCards with
 /// pagination params, and prints the results.
 async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
-    let (session, _path) = load_session()?;
-
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _path) = load_session_client()?;
 
     let value = client
         .get_notifications(start, count)
@@ -1239,8 +1182,9 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
         .unwrap_or("");
 
     // Truncate long headlines for summary view.
-    let headline_display = if headline.len() > 120 {
-        format!("{}...", &headline[..120])
+    let truncated_headline = truncate(headline, 120);
+    let headline_display = if truncated_headline.len() < headline.len() {
+        format!("{}...", truncated_headline)
     } else {
         headline.to_string()
     };
@@ -1289,6 +1233,24 @@ fn load_session() -> Result<(Session, std::path::PathBuf), String> {
     Ok((session, path))
 }
 
+/// Load the stored session and create an authenticated client.
+fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), String> {
+    let (session, path) = load_session()?;
+    let client =
+        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    Ok((client, path))
+}
+
+/// Truncate a string to at most `max_chars` characters, safely handling
+/// multi-byte UTF-8. Returns the original string if it is shorter than
+/// `max_chars`.
+fn truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Print a brief human-readable summary of a single conversation.
 fn print_conversation(index: usize, conv: &serde_json::Value) {
     let urn = conv.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
@@ -1315,8 +1277,9 @@ fn print_conversation(index: usize, conv: &serde_json::Value) {
         .and_then(extract_message_body)
         .unwrap_or_default();
 
-    let last_msg_display = if last_message.len() > 80 {
-        format!("{}...", &last_message[..80])
+    let truncated_msg = truncate(&last_message, 80);
+    let last_msg_display = if truncated_msg.len() < last_message.len() {
+        format!("{}...", truncated_msg)
     } else {
         last_message
     };
