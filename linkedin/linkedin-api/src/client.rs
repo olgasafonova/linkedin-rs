@@ -1189,6 +1189,86 @@ impl LinkedInClient {
                 ),
             })
     }
+
+    /// Send a connection request (invitation) to another LinkedIn member.
+    ///
+    /// Uses the Voyager `normInvitations` REST endpoint discovered in the
+    /// decompiled China APK's `InvitationNetworkUtil.sendInvite()` method.
+    /// The route is `Routes.NORM_INVITATIONS` which maps to
+    /// `voyagerGrowthNormInvitations` (see `MyNetworkRoutesUtil.makeSendGrowthInvitationRoute()`).
+    ///
+    /// The international APK uses the Dash variant at
+    /// `voyagerRelationshipsDashInvitations?action=create`, but the legacy
+    /// `normInvitations` endpoint is confirmed to still work on production.
+    ///
+    /// The request body is a `NormInvitation` model (see
+    /// `MyNetworkRequestUtil.buildInvitation()` in the decompiled code):
+    /// ```json
+    /// {
+    ///   "invitee": {
+    ///     "com.linkedin.voyager.growth.invitation.InviteeProfile": {
+    ///       "profileId": "<member_id>"
+    ///     }
+    ///   },
+    ///   "trackingId": "<base64-encoded-16-random-bytes>",
+    ///   "message": "optional custom message"
+    /// }
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `profile_urn`: The target member's profile URN
+    ///   (e.g. `urn:li:fsd_profile:ACoAAA...`). The member ID is extracted
+    ///   from the URN automatically.
+    /// - `message`: Optional custom message to include with the invitation.
+    ///   LinkedIn limits this to ~300 characters; we do not enforce that here
+    ///   (the server will reject messages that are too long).
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response from the API. On success LinkedIn returns the
+    /// created invitation entity.
+    ///
+    /// See `re/connection_request.md` for the full endpoint analysis.
+    pub async fn send_connection_request(
+        &self,
+        profile_urn: &str,
+        message: Option<&str>,
+    ) -> Result<Value, Error> {
+        // Extract the member ID from the URN. The NormInvitation model uses
+        // a bare profileId (the part after the last colon in the URN), not
+        // the full URN.
+        let member_id = profile_urn.rsplit(':').next().unwrap_or(profile_urn);
+
+        // Generate a tracking ID: 16 random bytes, base64-encoded.
+        // This matches TrackingUtils.generateBase64EncodedTrackingId() in the
+        // decompiled code.
+        use base64::Engine;
+        let tracking_bytes: [u8; 16] = rand::random();
+        let tracking_id = base64::engine::general_purpose::STANDARD.encode(tracking_bytes);
+
+        // Build the NormInvitation payload matching the model from
+        // com.linkedin.android.pegasus.gen.voyager.growth.invitation.NormInvitation.
+        // The invitee is a Rest.li union, requiring the fully-qualified type key.
+        let mut payload = serde_json::json!({
+            "trackingId": tracking_id,
+            "invitee": {
+                "com.linkedin.voyager.growth.invitation.InviteeProfile": {
+                    "profileId": member_id
+                }
+            }
+        });
+
+        // Add optional custom message.
+        if let Some(msg) = message {
+            payload.as_object_mut().unwrap().insert(
+                "message".to_string(),
+                serde_json::Value::String(msg.to_string()),
+            );
+        }
+
+        self.post("voyagerGrowthNormInvitations", &payload).await
+    }
 }
 
 /// Build a GraphQL query parameter string for the Voyager GraphQL endpoint.

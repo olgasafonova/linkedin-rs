@@ -188,6 +188,19 @@ enum ConnectionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Send a connection request (invitation) to another member
+    Invite {
+        /// LinkedIn public identifier (vanity URL slug) or fsd_profile URN
+        public_id_or_urn: String,
+
+        /// Optional custom message to include with the invitation
+        #[arg(long)]
+        message: Option<String>,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -397,6 +410,18 @@ async fn main() {
         Commands::Connections { action } => match action {
             ConnectionsAction::List { count, start, json } => {
                 if let Err(e) = cmd_connections_list(start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            ConnectionsAction::Invite {
+                public_id_or_urn,
+                message,
+                json,
+            } => {
+                if let Err(e) =
+                    cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await
+                {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1473,6 +1498,50 @@ async fn cmd_connections_list(start: u32, count: u32, raw_json: bool) -> Result<
         let idx = start as usize + i + 1;
         print_connection(idx, element);
         println!();
+    }
+
+    Ok(())
+}
+
+/// Handle `connections invite <public_id_or_urn> [--message "text"] [--json]`.
+///
+/// Resolves the target to a profile URN if a public identifier is given,
+/// then sends a connection request via the normInvitations endpoint.
+async fn cmd_connections_invite(
+    public_id_or_urn: &str,
+    message: Option<&str>,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Resolve to a profile URN if needed.
+    let profile_urn = if public_id_or_urn.starts_with("urn:li:") {
+        public_id_or_urn.to_string()
+    } else {
+        eprintln!("Resolving profile URN for '{}'...", public_id_or_urn);
+        client
+            .resolve_profile_urn(public_id_or_urn)
+            .await
+            .map_err(|e| format!("failed to resolve profile: {e}"))?
+    };
+
+    let value = client
+        .send_connection_request(&profile_urn, message)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!(
+            "Connection request sent to {} ({})",
+            public_id_or_urn, profile_urn
+        );
+        if message.is_some() {
+            println!("  (with custom message)");
+        }
     }
 
     Ok(())
