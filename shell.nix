@@ -1,4 +1,9 @@
-{ pkgs ? import <nixpkgs> {} }:
+{
+  pkgs ? (import (builtins.fetchTarball {
+           url = "https://github.com/nixos/nixpkgs/tarball/25.11";
+           sha256 = "1zn1lsafn62sz6azx6j735fh4vwwghj8cc9x91g5sx2nrg23ap9k";
+         }) {})
+}:
 let
   apkeep = pkgs.rustPlatform.buildRustPackage rec {
     pname = "apkeep";
