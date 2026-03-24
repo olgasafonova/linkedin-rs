@@ -271,26 +271,53 @@ impl LinkedInClient {
 
     /// Fetch a user's full profile by public identifier (vanity URL slug).
     ///
-    /// Calls `GET /voyager/api/identity/profiles/{public_id}` with the
-    /// `decorationId` query parameter set to
-    /// `com.linkedin.voyager.deco.identity.FullProfile` for full field
-    /// projection (positions, educations, summary, etc.).
+    /// Uses the Voyager GraphQL endpoint with the `identityDashProfilesByMemberIdentity`
+    /// finder query from `ProfileGraphQLClient.java` in the decompiled international APK.
+    ///
+    /// The legacy REST endpoint `identity/profiles/{id}?decorationId=...` returns
+    /// HTTP 400 -- the decoration recipes have been removed server-side and profile
+    /// fetching has migrated to the Dash/GraphQL surface.
     ///
     /// The `public_id` is the URL slug portion of a LinkedIn profile URL,
     /// e.g. `john-doe-123` from `https://www.linkedin.com/in/john-doe-123`.
     ///
-    /// Returns the raw JSON response. Use models in [`crate::models`] for
-    /// typed access to `MiniProfile`, `Profile`, `Position`, `Education`.
+    /// Returns the raw JSON response containing the profile data under
+    /// `data.identityDashProfilesByMemberIdentity`.
     ///
     /// See `re/api_endpoint_catalog.md` section 3 and
-    /// `re/architecture_overview.md` section 3.6 (Decoration).
+    /// `re/intl_vs_zephyr_diff.md` for the Dash endpoint migration.
     pub async fn get_profile(&self, public_id: &str) -> Result<Value, Error> {
-        let encoded_id =
-            url::form_urlencoded::byte_serialize(public_id.as_bytes()).collect::<String>();
-        let path = format!(
-            "identity/profiles/{encoded_id}?decorationId=com.linkedin.voyager.deco.identity.FullProfile"
+        // Rest.li-encode the public identifier for safe inclusion in the
+        // variables parenthesized record syntax.
+        let restli_id = restli_encode_string(public_id);
+
+        // The `identityDashProfilesByMemberIdentity` finder takes a
+        // `memberIdentity` variable (the vanity URL slug / public identifier).
+        //
+        // queryId from ProfileGraphQLClient.java static initializer:
+        //   voyagerIdentityDashProfiles.5f50f83f76a1e270603613bdd0fb0252
+        let variables = format!("(memberIdentity:{})", restli_id);
+        let params = format!(
+            "variables={}&queryId=voyagerIdentityDashProfiles.5f50f83f76a1e270603613bdd0fb0252&queryName=ProfilesByMemberIdentity",
+            variables
         );
-        self.get(&path).await
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope:
+        //   data.identityDashProfilesByMemberIdentity.elements[0]
+        raw.get("data")
+            .and_then(|d| d.get("identityDashProfilesByMemberIdentity"))
+            .and_then(|c| c.get("elements"))
+            .and_then(|e| e.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.identityDashProfilesByMemberIdentity.elements): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
     }
 
     /// Fetch the authenticated user's own profile (`/voyager/api/me`).

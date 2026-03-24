@@ -454,12 +454,13 @@ async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String>
     Ok(())
 }
 
-/// Print a human-readable summary of an identity/profiles response.
+/// Print a human-readable summary of a Dash profile response.
 ///
-/// Extracts name, headline, location, current position, and education.
-/// The response may be a full `Profile` object or may have nested
-/// structures depending on the decoration recipe. We handle both
-/// gracefully by probing known field paths.
+/// The response comes from the `identityDashProfilesByMemberIdentity` GraphQL
+/// query, unwrapped to the first element. Field names differ from the legacy
+/// REST endpoint (e.g., `profilePositionGroups` instead of `positions`,
+/// `dateRange` with `start`/`end` instead of `timePeriod` with
+/// `startDate`/`endDate`).
 fn print_profile_summary(profile: &serde_json::Value) {
     // Name.
     let first = profile
@@ -474,20 +475,32 @@ fn print_profile_summary(profile: &serde_json::Value) {
         println!("Name: {} {}", first, last);
     }
 
+    // Public identifier.
+    if let Some(pub_id) = profile.get("publicIdentifier").and_then(|v| v.as_str()) {
+        println!("Public ID: {}", pub_id);
+    }
+
     // Headline.
     if let Some(headline) = profile.get("headline").and_then(|v| v.as_str()) {
         println!("Headline: {}", headline);
     }
 
-    // Location.
-    if let Some(loc) = profile.get("locationName").and_then(|v| v.as_str()) {
+    // Location -- Dash uses geoLocation.geo.defaultLocalizedName.
+    let geo_name = profile
+        .get("geoLocation")
+        .and_then(|g| g.get("geo"))
+        .and_then(|g| g.get("defaultLocalizedName"))
+        .and_then(|v| v.as_str());
+    if let Some(loc) = geo_name {
         println!("Location: {}", loc);
-    } else if let Some(geo) = profile.get("geoLocationName").and_then(|v| v.as_str()) {
-        println!("Location: {}", geo);
     }
 
-    // Industry.
-    if let Some(industry) = profile.get("industryName").and_then(|v| v.as_str()) {
+    // Industry -- Dash uses industry.name.
+    let industry_name = profile
+        .get("industry")
+        .and_then(|i| i.get("name"))
+        .and_then(|v| v.as_str());
+    if let Some(industry) = industry_name {
         println!("Industry: {}", industry);
     }
 
@@ -507,45 +520,44 @@ fn print_profile_summary(profile: &serde_json::Value) {
         println!("URN: {}", urn);
     }
 
-    // MiniProfile fields (if embedded).
-    if let Some(mini) = profile.get("miniProfile") {
-        if let Some(pub_id) = mini.get("publicIdentifier").and_then(|v| v.as_str()) {
-            println!("Public ID: {}", pub_id);
-        }
-    }
-
-    // Current position -- look for positions in various shapes.
-    // The response may include `positions` as an inline collection
-    // (with `elements`) or as a direct array.
-    let positions = profile.get("positions").and_then(|p| {
-        p.get("elements")
-            .and_then(|e| e.as_array())
-            .or_else(|| p.as_array())
-    });
-    if let Some(pos_list) = positions {
-        if !pos_list.is_empty() {
-            println!("\nPositions:");
-            for pos in pos_list {
-                let title = pos.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let company = pos
-                    .get("companyName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let period = format_time_period(pos.get("timePeriod"));
-                if !title.is_empty() || !company.is_empty() {
-                    println!("  - {} at {}{}", title, company, period);
+    // Positions -- Dash uses profilePositionGroups.elements[].profilePositionInPositionGroup.elements[].
+    if let Some(groups) = profile
+        .get("profilePositionGroups")
+        .and_then(|p| p.get("elements"))
+        .and_then(|e| e.as_array())
+    {
+        let mut printed_header = false;
+        for group in groups {
+            let positions = group
+                .get("profilePositionInPositionGroup")
+                .and_then(|p| p.get("elements"))
+                .and_then(|e| e.as_array());
+            if let Some(pos_list) = positions {
+                for pos in pos_list {
+                    if !printed_header {
+                        println!("\nPositions:");
+                        printed_header = true;
+                    }
+                    let title = pos.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let company = pos
+                        .get("companyName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let period = format_date_range(pos.get("dateRange"));
+                    if !title.is_empty() || !company.is_empty() {
+                        println!("  - {} at {}{}", title, company, period);
+                    }
                 }
             }
         }
     }
 
-    // Education.
-    let educations = profile.get("educations").and_then(|e| {
-        e.get("elements")
-            .and_then(|el| el.as_array())
-            .or_else(|| e.as_array())
-    });
-    if let Some(edu_list) = educations {
+    // Education -- Dash uses profileEducations.elements[].
+    if let Some(edu_list) = profile
+        .get("profileEducations")
+        .and_then(|e| e.get("elements"))
+        .and_then(|e| e.as_array())
+    {
         if !edu_list.is_empty() {
             println!("\nEducation:");
             for edu in edu_list {
@@ -555,7 +567,7 @@ fn print_profile_summary(profile: &serde_json::Value) {
                     .get("fieldOfStudy")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let period = format_time_period(edu.get("timePeriod"));
+                let period = format_date_range(edu.get("dateRange"));
                 let degree_field = match (degree.is_empty(), field.is_empty()) {
                     (true, true) => String::new(),
                     (false, true) => format!(", {}", degree),
@@ -568,34 +580,39 @@ fn print_profile_summary(profile: &serde_json::Value) {
             }
         }
     }
-
-    // Print top-level keys for discoverability.
-    if let Some(obj) = profile.as_object() {
-        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-        if !keys.is_empty() {
-            println!("\nResponse keys: {}", keys.join(", "));
-        }
-    }
 }
 
-/// Format a `timePeriod` object into a human-readable string like " (2020 - 2023)".
+/// Format a `dateRange` object into a human-readable string like " (2020 - 2023)".
 ///
-/// The `timePeriod` has shape `{ "startDate": { "year": N, "month": N }, "endDate": ... }`.
+/// The Dash API uses `dateRange` with shape `{ "start": { "year": N, "month": N }, "end": ... }`.
+/// Also handles the legacy `timePeriod` shape with `startDate`/`endDate`.
 /// Returns an empty string if the input is `None` or lacks date fields.
-fn format_time_period(time_period: Option<&serde_json::Value>) -> String {
-    let tp = match time_period {
+fn format_date_range(date_range: Option<&serde_json::Value>) -> String {
+    let dr = match date_range {
         Some(v) => v,
         None => return String::new(),
     };
 
-    let start_year = tp
-        .get("startDate")
+    // Dash format: start/end
+    let start_year = dr
+        .get("start")
         .and_then(|d| d.get("year"))
-        .and_then(|y| y.as_u64());
-    let end_year = tp
-        .get("endDate")
+        .and_then(|y| y.as_u64())
+        // Legacy format: startDate/endDate
+        .or_else(|| {
+            dr.get("startDate")
+                .and_then(|d| d.get("year"))
+                .and_then(|y| y.as_u64())
+        });
+    let end_year = dr
+        .get("end")
         .and_then(|d| d.get("year"))
-        .and_then(|y| y.as_u64());
+        .and_then(|y| y.as_u64())
+        .or_else(|| {
+            dr.get("endDate")
+                .and_then(|d| d.get("year"))
+                .and_then(|y| y.as_u64())
+        });
 
     match (start_year, end_year) {
         (Some(s), Some(e)) => format!(" ({} - {})", s, e),
