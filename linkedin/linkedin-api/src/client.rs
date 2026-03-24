@@ -400,6 +400,50 @@ impl LinkedInClient {
             })
     }
 
+    /// Visit a profile, registering the view so the target sees it in
+    /// "Who Viewed My Profile".
+    ///
+    /// When the LinkedIn web app navigates to a profile, it fires a
+    /// `voyagerIdentityDashProfiles` GraphQL query with a specific query ID
+    /// that uses `vanityName` (the public identifier / URL slug) as the
+    /// variable.  The server registers the profile view as a side effect of
+    /// this query -- there is no separate POST endpoint.
+    ///
+    /// The query ID `a3de77c32c473719f1c58fae6bff43a5` corresponds to the
+    /// "profile-top-card-supplementary" decoration used by the web client
+    /// (captured via Chrome DevTools MCP on 2026-03-24).
+    ///
+    /// See `re/profile_visit.md` for the full analysis.
+    pub async fn visit_profile(&self, public_id: &str) -> Result<Value, Error> {
+        let restli_id = restli_encode_string(public_id);
+
+        // Web client uses `vanityName` variable (not `memberIdentity`).
+        // queryId: voyagerIdentityDashProfiles.a3de77c32c473719f1c58fae6bff43a5
+        // (profile-top-card-supplementary decoration, triggers view registration)
+        let variables = format!("(vanityName:{})", restli_id);
+        let params = graphql_params(
+            &variables,
+            "voyagerIdentityDashProfiles.a3de77c32c473719f1c58fae6bff43a5",
+            "ProfilesByMemberIdentity",
+        );
+        let raw = self.graphql_get(&params).await?;
+
+        // Unwrap the GraphQL envelope, same structure as get_profile.
+        raw.get("data")
+            .and_then(|d| d.get("identityDashProfilesByMemberIdentity"))
+            .and_then(|c| c.get("elements"))
+            .and_then(|e| e.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: format!(
+                    "unexpected GraphQL response shape (missing data.identityDashProfilesByMemberIdentity.elements): {}",
+                    serde_json::to_string(&raw).unwrap_or_default()
+                ),
+            })
+    }
+
     /// Fetch the authenticated user's own profile (`/voyager/api/me`).
     ///
     /// This is the simplest authenticated endpoint and serves as a session

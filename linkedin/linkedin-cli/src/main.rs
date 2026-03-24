@@ -109,6 +109,15 @@ enum ProfileAction {
         #[arg(long)]
         json: bool,
     },
+    /// Visit a profile (registers you in "who viewed my profile")
+    Visit {
+        /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
+        public_id: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// Show who viewed your profile
     Viewers {
         /// Output raw JSON instead of human-readable format
@@ -251,6 +260,12 @@ async fn main() {
             }
             ProfileAction::View { public_id, json } => {
                 if let Err(e) = cmd_profile_view(&public_id, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            ProfileAction::Visit { public_id, json } => {
+                if let Err(e) = cmd_profile_visit(&public_id, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -483,6 +498,48 @@ async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String>
         println!("{}", pretty);
     } else {
         print_profile_summary(&profile);
+    }
+
+    Ok(())
+}
+
+/// Handle `profile visit <public_id> [--json]`.
+///
+/// Visits a profile so the target sees you in "who viewed my profile".
+/// Uses the web client's GraphQL query ID which registers the view as a
+/// side effect. See `re/profile_visit.md` for the mechanism.
+async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Visiting profile '{}'...", public_id);
+    let profile = client
+        .visit_profile(public_id)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty = serde_json::to_string_pretty(&profile)
+            .map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        // Extract basic info to confirm which profile was visited.
+        let first = profile
+            .get("firstName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let last = profile
+            .get("lastName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let headline = profile
+            .get("headline")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        println!("Visited: {} {}", first, last);
+        if !headline.is_empty() {
+            println!("  {}", headline);
+        }
+        eprintln!("Profile view registered (target will see you in 'Who Viewed My Profile').");
     }
 
     Ok(())
