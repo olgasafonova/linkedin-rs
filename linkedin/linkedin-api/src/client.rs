@@ -449,6 +449,41 @@ impl LinkedInClient {
         self.get(&path).await
     }
 
+    /// Search for people by keywords.
+    ///
+    /// Calls `GET /voyager/api/search/hits` using the guided finder with
+    /// `guides=List(v->people)`. This is the primary people search endpoint
+    /// documented in `re/api_endpoint_catalog.md` and `re/search_protocol.md`.
+    ///
+    /// The response is a Rest.li collection of `SearchHit` items wrapped in
+    /// `SearchCluster` structures. We return the raw JSON since the response
+    /// shape is polymorphic (union types in `hitInfo`).
+    ///
+    /// # Parameters
+    ///
+    /// - `keywords`: Search terms (will be URL-encoded by reqwest).
+    /// - `start`: 0-based pagination offset.
+    /// - `count`: Number of results per page.
+    pub async fn search_people(
+        &self,
+        keywords: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        // Encode keywords for safe inclusion in the query string.
+        // We use url::form_urlencoded (available via the `url` crate)
+        // which produces application/x-www-form-urlencoded encoding.
+        let encoded_keywords: String =
+            url::form_urlencoded::byte_serialize(keywords.as_bytes()).collect();
+        let path = format!(
+            "search/hits?q=guided&guides=List(v->people)&keywords={}&start={}&count={}&origin=GLOBAL_SEARCH_HEADER",
+            encoded_keywords,
+            start,
+            count,
+        );
+        self.get(&path).await
+    }
+
     /// Fetch events (messages) within a specific conversation.
     ///
     /// Calls `GET /voyager/api/messaging/conversations/{id}/events` with pagination.

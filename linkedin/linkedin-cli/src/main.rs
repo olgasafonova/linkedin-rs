@@ -4,7 +4,9 @@ use std::process;
 use clap::{Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
-use linkedin_api::models::{ConnectionsResponse, ConversationsResponse, FeedResponse};
+use linkedin_api::models::{
+    ConnectionsResponse, ConversationsResponse, FeedResponse, SearchResponse,
+};
 
 #[derive(Parser)]
 #[command(name = "linkedin-cli")]
@@ -40,6 +42,11 @@ enum Commands {
     Connections {
         #[command(subcommand)]
         action: ConnectionsAction,
+    },
+    /// Search LinkedIn
+    Search {
+        #[command(subcommand)]
+        action: SearchAction,
     },
 }
 
@@ -104,6 +111,27 @@ enum ConnectionsAction {
     /// List connections
     List {
         /// Number of connections to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SearchAction {
+    /// Search for people by keywords
+    People {
+        /// Search keywords
+        keywords: String,
+
+        /// Number of results to fetch (default: 10)
         #[arg(long, default_value = "10")]
         count: u32,
 
@@ -221,6 +249,19 @@ async fn main() {
         Commands::Connections { action } => match action {
             ConnectionsAction::List { count, start, json } => {
                 if let Err(e) = cmd_connections_list(start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+        },
+        Commands::Search { action } => match action {
+            SearchAction::People {
+                keywords,
+                count,
+                start,
+                json,
+            } => {
+                if let Err(e) = cmd_search_people(&keywords, start, count, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -938,6 +979,136 @@ fn print_connection(index: usize, conn: &serde_json::Value) {
     }
     if !connected_since.is_empty() {
         println!("    connected since: {}", connected_since);
+    }
+}
+
+/// Handle `search people <keywords> [--count N] [--start N] [--json]`.
+///
+/// Loads the session, calls GET /voyager/api/search/hits with guided people
+/// search query, and prints the results.
+async fn cmd_search_people(
+    keywords: &str,
+    start: u32,
+    count: u32,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (session, _path) = load_session()?;
+
+    let client =
+        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+
+    let value = client
+        .search_people(keywords, start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    let resp: SearchResponse = serde_json::from_value(value.clone())
+        .map_err(|e| format!("failed to parse search response: {e}"))?;
+
+    if let Some(ref paging) = resp.paging {
+        let total_str = paging
+            .total
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "Search results for '{}' (offset {}, showing {}, total {})",
+            keywords, paging.start, paging.count, total_str
+        );
+    }
+    println!("---");
+
+    if resp.elements.is_empty() {
+        println!("(no results)");
+        return Ok(());
+    }
+
+    for (i, element) in resp.elements.iter().enumerate() {
+        let idx = start as usize + i + 1;
+        print_search_hit(idx, element);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Print a brief human-readable summary of a single search hit.
+///
+/// Search hits have a polymorphic `hitInfo` field (Rest.li union). For people
+/// results, we look for the `SearchProfile` variant which contains a
+/// `miniProfile` with name and headline, plus `location` and `industry` fields.
+///
+/// The exact union key varies -- it may be a fully qualified class name like
+/// `com.linkedin.voyager.search.SearchProfile` or a short form. We try both
+/// patterns and fall back to extracting fields from the element root.
+fn print_search_hit(index: usize, hit: &serde_json::Value) {
+    // Try to find the SearchProfile inside hitInfo (union type).
+    let profile = hit
+        .get("hitInfo")
+        .and_then(|hi| {
+            // Try fully-qualified union key first.
+            hi.get("com.linkedin.voyager.search.SearchProfile")
+                .or_else(|| hi.get("searchProfile"))
+                // If hitInfo is directly the profile data (flat structure).
+                .or(Some(hi))
+        })
+        .unwrap_or(hit);
+
+    // Extract name from miniProfile within the search profile.
+    let mini = profile.get("miniProfile");
+
+    let name = mini
+        .and_then(|m| {
+            let first = m.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
+            let last = m.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
+            if first.is_empty() && last.is_empty() {
+                None
+            } else {
+                Some(format!("{} {}", first, last).trim().to_string())
+            }
+        })
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    // Headline: miniProfile.occupation or profile-level headline.
+    let headline = mini
+        .and_then(|m| m.get("occupation").and_then(|v| v.as_str()))
+        .or_else(|| profile.get("headline").and_then(|v| v.as_str()))
+        .unwrap_or("");
+
+    // Location: profile-level location field.
+    let location = profile
+        .get("location")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            profile
+                .get("subline")
+                .and_then(|s| s.get("text"))
+                .and_then(|t| t.as_str())
+        })
+        .unwrap_or("");
+
+    // Public identifier for reference.
+    let pub_id = mini
+        .and_then(|m| m.get("publicIdentifier").and_then(|v| v.as_str()))
+        .unwrap_or("");
+
+    print!("[{}] {}", index, name);
+    if !pub_id.is_empty() {
+        print!(" ({})", pub_id);
+    }
+    println!();
+
+    if !headline.is_empty() {
+        println!("    {}", headline);
+    }
+    if !location.is_empty() {
+        println!("    location: {}", location);
     }
 }
 
