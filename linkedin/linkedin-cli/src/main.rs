@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{
-    ConnectionsResponse, ConversationsResponse, FeedResponse, SearchResponse,
+    ConnectionsResponse, ConversationsResponse, FeedResponse, NotificationCardsResponse,
+    SearchResponse,
 };
 
 #[derive(Parser)]
@@ -47,6 +48,11 @@ enum Commands {
     Search {
         #[command(subcommand)]
         action: SearchAction,
+    },
+    /// Notifications
+    Notifications {
+        #[command(subcommand)]
+        action: NotificationsAction,
     },
 }
 
@@ -132,6 +138,24 @@ enum SearchAction {
         keywords: String,
 
         /// Number of results to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationsAction {
+    /// List notification cards
+    List {
+        /// Number of notifications to fetch (default: 10)
         #[arg(long, default_value = "10")]
         count: u32,
 
@@ -262,6 +286,14 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_search_people(&keywords, start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+        },
+        Commands::Notifications { action } => match action {
+            NotificationsAction::List { count, start, json } => {
+                if let Err(e) = cmd_notifications_list(start, count, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1109,6 +1141,131 @@ fn print_search_hit(index: usize, hit: &serde_json::Value) {
     }
     if !location.is_empty() {
         println!("    location: {}", location);
+    }
+}
+
+/// Handle `notifications list [--count N] [--start N] [--json]`.
+///
+/// Loads the session, calls GET /voyager/api/identity/notificationCards with
+/// pagination params, and prints the results.
+async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+    let (session, _path) = load_session()?;
+
+    let client =
+        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+
+    let value = client
+        .get_notifications(start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    let resp: NotificationCardsResponse = serde_json::from_value(value.clone())
+        .map_err(|e| format!("failed to parse notifications response: {e}"))?;
+
+    if let Some(ref paging) = resp.paging {
+        let total_str = paging
+            .total
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "Notifications (offset {}, showing {}, total {})",
+            paging.start, paging.count, total_str
+        );
+    }
+    println!("---");
+
+    if resp.elements.is_empty() {
+        println!("(no notifications)");
+        return Ok(());
+    }
+
+    for (i, element) in resp.elements.iter().enumerate() {
+        let idx = start as usize + i + 1;
+        print_notification_card(idx, element);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Print a brief human-readable summary of a single notification card.
+///
+/// Notification cards use TextViewModel wrappers for text fields; we extract
+/// the inner `text` string from `headline`, `subHeadline`, and `kicker`.
+fn print_notification_card(index: usize, card: &serde_json::Value) {
+    let read = card.get("read").and_then(|r| r.as_bool()).unwrap_or(true);
+    let unread_marker = if read { " " } else { "*" };
+
+    // headline.text -- primary notification text.
+    let headline = card
+        .get("headline")
+        .and_then(|h| h.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("(no headline)");
+
+    // subHeadline.text -- secondary detail.
+    let sub_headline = card
+        .get("subHeadline")
+        .and_then(|s| s.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("");
+
+    // kicker.text -- time indicator (e.g. "2h ago").
+    let kicker = card
+        .get("kicker")
+        .and_then(|k| k.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("");
+
+    // publishedAt -- epoch millis timestamp.
+    let published_at = card
+        .get("publishedAt")
+        .and_then(|p| p.as_i64())
+        .and_then(|millis| {
+            let secs = millis / 1000;
+            chrono::DateTime::from_timestamp(secs, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        })
+        .unwrap_or_default();
+
+    // contentType -- discriminator like PROFILE_VIEW, REACTION, etc.
+    let content_type = card
+        .get("contentType")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    // Truncate long headlines for summary view.
+    let headline_display = if headline.len() > 120 {
+        format!("{}...", &headline[..120])
+    } else {
+        headline.to_string()
+    };
+
+    print!("[{}]{} {}", index, unread_marker, headline_display);
+    if !kicker.is_empty() {
+        print!("  ({})", kicker);
+    }
+    println!();
+
+    if !sub_headline.is_empty() {
+        println!("    {}", sub_headline);
+    }
+    if !content_type.is_empty() {
+        print!("    type: {}", content_type);
+    }
+    if !published_at.is_empty() {
+        if !content_type.is_empty() {
+            print!("  |  {}", published_at);
+        } else {
+            print!("    {}", published_at);
+        }
+    }
+    if !content_type.is_empty() || !published_at.is_empty() {
+        println!();
     }
 }
 

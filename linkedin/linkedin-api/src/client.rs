@@ -484,6 +484,24 @@ impl LinkedInClient {
         self.get(&path).await
     }
 
+    /// Fetch the user's notification cards.
+    ///
+    /// Calls `GET /voyager/api/identity/notificationCards` with pagination.
+    /// Returns the raw JSON response containing `elements` (array of
+    /// `NotificationCard` items) and `paging`.
+    ///
+    /// # Parameters
+    ///
+    /// - `start`: 0-based offset for pagination.
+    /// - `count`: Number of notification cards to request per page.
+    ///
+    /// See `re/api_endpoint_catalog.md` section 11 and `re/pegasus_models.md`
+    /// section 3.8 for the `Card` (NotificationCard) model definition.
+    pub async fn get_notifications(&self, start: u32, count: u32) -> Result<Value, Error> {
+        let path = format!("identity/notificationCards?start={}&count={}", start, count);
+        self.get(&path).await
+    }
+
     /// Fetch events (messages) within a specific conversation.
     ///
     /// Calls `GET /voyager/api/messaging/conversations/{id}/events` with pagination.

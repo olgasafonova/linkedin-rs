@@ -637,6 +637,125 @@ pub struct Connection {
     pub extra: Option<std::collections::HashMap<String, Value>>,
 }
 
+/// Top-level response from the `identity/notificationCards` endpoint.
+///
+/// Wraps a standard Rest.li collection of `NotificationCard` items.
+/// See `re/api_endpoint_catalog.md` section 11 and `re/pegasus_models.md`
+/// section 3.8 for the `Card` (NotificationCard) model definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationCardsResponse {
+    /// Array of notification card items.
+    #[serde(default)]
+    pub elements: Vec<Value>,
+
+    /// Pagination metadata for this page of results.
+    #[serde(default)]
+    pub paging: Option<Paging>,
+
+    /// Collection-level metadata (type varies by endpoint).
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+/// A notification card.
+///
+/// Reference: `re/pegasus_models.md` -- `Card (voyager.identity.notifications)`.
+/// Fields kept as `Option` since we haven't validated against live API yet.
+/// The `headline` and `subHeadline` fields use LinkedIn's `TextViewModel`
+/// wrapper, which typically has a `text` field containing the display string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationCard {
+    /// Entity URN identifying this notification card.
+    #[serde(default)]
+    pub entity_urn: Option<String>,
+
+    /// Primary headline (TextViewModel with a `text` field).
+    #[serde(default)]
+    pub headline: Option<Value>,
+
+    /// Secondary headline (TextViewModel with a `text` field).
+    #[serde(default)]
+    pub sub_headline: Option<Value>,
+
+    /// Timestamp label (TextViewModel, e.g. "2h ago").
+    #[serde(default)]
+    pub kicker: Option<Value>,
+
+    /// Header image (ImageViewModel).
+    #[serde(default)]
+    pub header_image: Option<Value>,
+
+    /// Badge icon (ImageViewModel).
+    #[serde(default)]
+    pub badge_icon: Option<Value>,
+
+    /// Content type discriminator (e.g. "PROFILE_VIEW", "REACTION", etc.).
+    #[serde(default)]
+    pub content_type: Option<String>,
+
+    /// Primary content text lines (List<TextViewModel>).
+    #[serde(default)]
+    pub content_primary_text: Option<Vec<Value>>,
+
+    /// Secondary content text lines (List<TextViewModel>).
+    #[serde(default)]
+    pub content_secondary_text: Option<Vec<Value>>,
+
+    /// Content images (List<ImageViewModel>).
+    #[serde(default)]
+    pub content_images: Option<Vec<Value>>,
+
+    /// Total count of content images.
+    #[serde(default)]
+    pub content_images_total_count: Option<i32>,
+
+    /// Actions available on this card (List<CardAction>).
+    #[serde(default)]
+    pub actions: Option<Vec<Value>>,
+
+    /// Primary card action (CardAction).
+    #[serde(default)]
+    pub card_action: Option<Value>,
+
+    /// Content action (CardAction).
+    #[serde(default)]
+    pub content_action: Option<Value>,
+
+    /// Insight action (CardAction).
+    #[serde(default)]
+    pub insight_action: Option<Value>,
+
+    /// Insight text (TextViewModel).
+    #[serde(default)]
+    pub insight: Option<Value>,
+
+    /// Insight type discriminator.
+    #[serde(default)]
+    pub insight_type: Option<String>,
+
+    /// Timestamp when the notification was published (epoch millis).
+    #[serde(default)]
+    pub published_at: Option<i64>,
+
+    /// Whether this notification has been read.
+    #[serde(default)]
+    pub read: Option<bool>,
+
+    /// Tracking object for analytics.
+    #[serde(default)]
+    pub tracking_object: Option<Value>,
+
+    /// Social activity counts (likes, comments, etc.).
+    #[serde(default)]
+    pub social_activity_counts: Option<Value>,
+
+    /// Catch-all for fields not explicitly modelled.
+    #[serde(flatten)]
+    pub extra: Option<std::collections::HashMap<String, Value>>,
+}
+
 /// Top-level response from the `search/hits` endpoint.
 ///
 /// Wraps a standard Rest.li collection of search hit items.
@@ -956,6 +1075,56 @@ mod tests {
     fn connections_response_handles_missing_fields() {
         let json = r#"{}"#;
         let resp: ConnectionsResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.elements.is_empty());
+        assert!(resp.paging.is_none());
+    }
+
+    #[test]
+    fn notification_card_deserializes_minimal() {
+        let json = r#"{}"#;
+        let card: NotificationCard = serde_json::from_str(json).unwrap();
+        assert!(card.entity_urn.is_none());
+        assert!(card.headline.is_none());
+        assert!(card.published_at.is_none());
+        assert!(card.read.is_none());
+    }
+
+    #[test]
+    fn notification_card_deserializes_with_fields() {
+        let json = r#"{
+            "entityUrn": "urn:li:fs_notificationCard:abc123",
+            "headline": {"text": "Someone viewed your profile"},
+            "subHeadline": {"text": "John Doe and 2 others"},
+            "kicker": {"text": "2h ago"},
+            "contentType": "PROFILE_VIEW",
+            "publishedAt": 1711234567890,
+            "read": false
+        }"#;
+        let card: NotificationCard = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            card.entity_urn.as_deref(),
+            Some("urn:li:fs_notificationCard:abc123")
+        );
+        assert!(card.headline.is_some());
+        assert!(card.sub_headline.is_some());
+        assert!(card.kicker.is_some());
+        assert_eq!(card.content_type.as_deref(), Some("PROFILE_VIEW"));
+        assert_eq!(card.published_at, Some(1711234567890));
+        assert_eq!(card.read, Some(false));
+    }
+
+    #[test]
+    fn notification_cards_response_deserializes_empty() {
+        let json = r#"{"elements": [], "paging": {"start": 0, "count": 10}}"#;
+        let resp: NotificationCardsResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.elements.is_empty());
+        assert_eq!(resp.paging.as_ref().unwrap().start, 0);
+    }
+
+    #[test]
+    fn notification_cards_response_handles_missing_fields() {
+        let json = r#"{}"#;
+        let resp: NotificationCardsResponse = serde_json::from_str(json).unwrap();
         assert!(resp.elements.is_empty());
         assert!(resp.paging.is_none());
     }
