@@ -814,14 +814,14 @@ impl LinkedInClient {
 
         // Captured from live browser traffic via Chrome DevTools MCP.
         // Endpoint: POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
-        // Key discovery: trackingId must be 16 random bytes, base64-encoded.
-        // The original decompiled code casts raw bytes to chars, but arbitrary
-        // bytes (0x00, 0x22/quote, 0x5C/backslash) can produce malformed JSON
-        // or control characters. Base64 encoding is safe and matches
-        // send_connection_request's approach (TrackingUtils.generateBase64EncodedTrackingId).
-        use base64::Engine;
+        // Key discovery: trackingId must be 16 random bytes mapped to chars
+        // via `byte as char`. NOT base64-encoded — the messaging endpoint
+        // specifically requires raw byte-to-char mapping, unlike
+        // send_connection_request which uses base64.
+        // See re/send_message.md: "Without this field, or with a UUID/string
+        // value, the server returns {"status": 400} with no further details."
         let tracking_bytes: [u8; 16] = rand::random();
-        let tracking_id = base64::engine::general_purpose::STANDARD.encode(tracking_bytes);
+        let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
 
         let payload = serde_json::json!({
             "message": {
