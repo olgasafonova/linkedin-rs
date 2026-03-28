@@ -42,7 +42,7 @@ The CLI exposes 30+ subcommands across 8 domains:
 |---------|-------------|
 | `messages list` | List conversations |
 | `messages read <id>` | Read messages with threading context |
-| `messages send <recipient> <text>` | Send a new message |
+| `messages send <recipient> <text>` | Send a message (accepts name, slug, or URN) |
 | `messages reply <conversation_id> <text>` | Reply to an existing thread (requires `--yes`) |
 
 ### Connections
@@ -65,11 +65,18 @@ The CLI exposes 30+ subcommands across 8 domains:
 | `search people <keywords>` | Search for people |
 | `search jobs <keywords>` | Search for jobs |
 | `search posts <keywords>` | Search posts with activity URNs and links |
+| `search react <index>` | React to a post from last search results |
+| `search view <index>` | View a profile from last people search results |
 
 ### Notifications
 | Command | Description |
 |---------|-------------|
 | `notifications list` | List notification cards |
+
+### Quick Access
+| Command | Description |
+|---------|-------------|
+| `inbox` | Unread messages, pending invitations, recent notifications |
 
 ### Utilities
 | Command | Description |
