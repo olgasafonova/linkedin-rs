@@ -11,6 +11,7 @@
 //! `re/restli_protocol.md`, `re/auth_flow.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
@@ -18,6 +19,15 @@ use tokio::sync::OnceCell;
 
 use crate::auth::Session;
 use crate::error::Error;
+
+/// Maximum number of automatic retries for retriable errors (429, 5xx).
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (milliseconds).
+const BASE_BACKOFF_MS: u64 = 1000;
+
+/// Maximum backoff delay cap (milliseconds).
+const MAX_BACKOFF_MS: u64 = 30_000;
 
 /// Base URL for all LinkedIn API requests. There is no separate API subdomain;
 /// all API calls go to `www.linkedin.com` with path-based routing.
@@ -224,22 +234,34 @@ impl LinkedInClient {
         })
     }
 
-    /// Send a GET request to a Voyager API endpoint.
+    /// Send a GET request to a Voyager API endpoint with automatic retry.
     ///
     /// The `path` is relative to `/voyager/api/` -- do not include the prefix.
     /// For example, `client.get("me")` requests `https://www.linkedin.com/voyager/api/me`.
     ///
     /// The CSRF token header is added automatically.
-    /// Returns an [`Error::Api`] if the server responds with a non-success status code.
+    /// Retries on 429 (rate limited) and 5xx (server error) with exponential
+    /// backoff, respecting `Retry-After` headers when present.
+    /// Returns an [`Error::Api`] if all retries are exhausted.
     pub async fn get(&self, path: &str) -> Result<Value, Error> {
         let url = format!("{}{}{}", BASE_URL, API_PREFIX, path);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Csrf-Token", &self.jsessionid)
-            .send()
-            .await?;
-        check_response(resp).await
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .http
+                .get(&url)
+                .header("Csrf-Token", &self.jsessionid)
+                .send()
+                .await?;
+            match check_response_retryable(resp, attempt).await {
+                RetryResult::Ok(val) => return Ok(val),
+                RetryResult::Err(e) => return Err(e),
+                RetryResult::Retry(delay) => {
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     /// Send a POST request to a Voyager API endpoint with a JSON body.
@@ -248,17 +270,28 @@ impl LinkedInClient {
     /// The `body` is serialized as JSON in the request body.
     ///
     /// The CSRF token header is added automatically.
-    /// Returns an [`Error::Api`] if the server responds with a non-success status code.
+    /// Retries on 429 and 5xx with exponential backoff.
+    /// Returns an [`Error::Api`] if all retries are exhausted.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, Error> {
         let url = format!("{}{}{}", BASE_URL, API_PREFIX, path);
-        let resp = self
-            .http
-            .post(&url)
-            .header("Csrf-Token", &self.jsessionid)
-            .json(body)
-            .send()
-            .await?;
-        check_response(resp).await
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .http
+                .post(&url)
+                .header("Csrf-Token", &self.jsessionid)
+                .json(body)
+                .send()
+                .await?;
+            match check_response_retryable(resp, attempt).await {
+                RetryResult::Ok(val) => return Ok(val),
+                RetryResult::Err(e) => return Err(e),
+                RetryResult::Retry(delay) => {
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     /// Send a GET request to the Voyager GraphQL endpoint.
@@ -697,6 +730,66 @@ impl LinkedInClient {
         unwrap_graphql(&raw, "searchDashClustersByAll")
     }
 
+    /// Fetch comments on a post by its socialDetail URN.
+    ///
+    /// Uses the `socialDashCommentsBySocialDetail` GraphQL finder query.
+    /// The `social_detail_urn` has the format `urn:li:fs_socialDetail:urn:li:activity:XXXXX`.
+    ///
+    /// See `re/comments.md` for the reverse-engineered endpoint details.
+    pub async fn get_comments(
+        &self,
+        social_detail_urn: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        let encoded_urn = restli_encode_string(social_detail_urn);
+        let variables = format!(
+            "(count:{count},socialDetailUrn:{encoded_urn},sortOrder:RELEVANCE,start:{start})"
+        );
+
+        let params = graphql_params(
+            &variables,
+            "voyagerSocialDashComments.59bca422f480a4cc0ce56ccd81181488",
+            "SocialDashCommentsBySocialDetail",
+        );
+        let raw = self.graphql_get(&params).await?;
+
+        unwrap_graphql(&raw, "socialDashCommentsBySocialDetail")
+    }
+
+    /// Search for content/posts by keywords using the Voyager GraphQL
+    /// `searchDashClustersByAll` finder.
+    ///
+    /// Uses the same endpoint as `search_people` but with
+    /// `resultType:List(CONTENT)` to search posts instead of people.
+    ///
+    /// # Parameters
+    ///
+    /// - `keywords`: Search terms.
+    /// - `start`: 0-based pagination offset.
+    /// - `count`: Number of results per page.
+    pub async fn search_content(
+        &self,
+        keywords: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        let restli_keywords = restli_encode_string(keywords);
+
+        let variables = format!(
+            "(count:{count},origin:GLOBAL_SEARCH_HEADER,query:(flagshipSearchIntent:SEARCH_SRP,keywords:{restli_keywords},queryParameters:(resultType:List(CONTENT))),start:{start})"
+        );
+
+        let params = graphql_params(
+            &variables,
+            "voyagerSearchDashClusters.fae19421cdd51a7cd735e0b7d7b32e0f",
+            "SearchClusterCollection",
+        );
+        let raw = self.graphql_get(&params).await?;
+
+        unwrap_graphql(&raw, "searchDashClustersByAll")
+    }
+
     /// Search for jobs by keywords using the Voyager GraphQL
     /// `jobsDashJobCardsByJobSearch` finder.
     ///
@@ -836,6 +929,135 @@ impl LinkedInClient {
             "trackingId": tracking_id,
             "dedupeByClientGeneratedToken": false,
             "hostRecipientUrns": [recipient_profile_urn]
+        });
+
+        self.post(
+            "voyagerMessagingDashMessengerMessages?action=createMessage",
+            &payload,
+        )
+        .await
+    }
+
+    /// Reply to an existing messaging conversation thread.
+    ///
+    /// Uses the same Dash endpoint as `send_message`
+    /// (`POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage`)
+    /// but with a `conversationUrn` field instead of `hostRecipientUrns`.
+    ///
+    /// The conversation URN format for the Dash endpoint is:
+    /// `urn:li:msg_conversation:(urn:li:fsd_profile:XXXX,<thread_id>)`
+    ///
+    /// # Parameters
+    ///
+    /// - `conversation_id`: The conversation/thread ID (e.g., `2-abc123`).
+    ///   Will be wrapped into a full `msg_conversation` URN automatically.
+    /// - `message_body`: The plain text message to send.
+    /// Reply to an existing messaging conversation by sending to the same
+    /// participants.
+    ///
+    /// Uses the same `createMessage` endpoint as `send_message`, but first
+    /// fetches the conversation to extract participant URNs. LinkedIn routes
+    /// the message to the existing thread when the same set of recipients
+    /// is used.
+    ///
+    /// # Parameters
+    ///
+    /// - `conversation_id`: The conversation/thread ID (e.g., `2-abc123`).
+    /// - `message_body`: The plain text message to send.
+    pub async fn reply_to_conversation(
+        &self,
+        conversation_id: &str,
+        message_body: &str,
+    ) -> Result<Value, Error> {
+        // Fetch the conversation to get participant URNs.
+        let conv_data = self.get_conversations(20, None).await?;
+        let my_urn = self.my_profile_urn().await?;
+
+        let thread_id = conversation_id
+            .strip_prefix("urn:li:messagingThread:")
+            .unwrap_or(conversation_id);
+
+        // Find this conversation in the list and extract participant URNs.
+        let elements = conv_data
+            .get("elements")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| Error::Api {
+                status: 0,
+                body: "no conversations found".to_string(),
+            })?;
+
+        let mut recipient_urns: Vec<String> = Vec::new();
+
+        for conv in elements {
+            let backend_urn = conv
+                .get("backendUrn")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            let conv_thread_id = backend_urn
+                .strip_prefix("urn:li:messagingThread:")
+                .unwrap_or(backend_urn);
+
+            if conv_thread_id == thread_id {
+                // Extract participant URNs.
+                if let Some(participants) = conv
+                    .get("conversationParticipants")
+                    .and_then(|p| p.as_array())
+                {
+                    for p in participants {
+                        // Each participant has participantType.member with entityUrn or hostIdentityUrn.
+                        let urn = p
+                            .get("hostIdentityUrn")
+                            .and_then(|u| u.as_str())
+                            .or_else(|| {
+                                p.get("participantType")
+                                    .and_then(|pt| pt.get("member"))
+                                    .and_then(|m| {
+                                        m.get("entityUrn")
+                                            .or_else(|| m.get("hostIdentityUrn"))
+                                            .and_then(|u| u.as_str())
+                                    })
+                            });
+                        if let Some(u) = urn {
+                            // Skip self.
+                            if u != my_urn {
+                                recipient_urns.push(u.to_string());
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if recipient_urns.is_empty() {
+            return Err(Error::Api {
+                status: 0,
+                body: format!(
+                    "could not find conversation '{}' or extract participant URNs",
+                    conversation_id
+                ),
+            });
+        }
+
+        // Send using the same endpoint as send_message, with the extracted
+        // recipient URNs. LinkedIn routes to the existing thread.
+        let origin_token = uuid::Uuid::new_v4().to_string();
+        let tracking_bytes: [u8; 16] = rand::random();
+        let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
+
+        let payload = serde_json::json!({
+            "message": {
+                "body": {
+                    "attributes": [],
+                    "text": message_body
+                },
+                "originToken": origin_token,
+                "renderContentUnions": []
+            },
+            "mailboxUrn": my_urn,
+            "trackingId": tracking_id,
+            "dedupeByClientGeneratedToken": false,
+            "hostRecipientUrns": recipient_urns
         });
 
         self.post(
@@ -1438,6 +1660,119 @@ impl LinkedInClient {
 
         self.post(&path, &body).await
     }
+
+    /// Fetch content analytics for the authenticated user's posts.
+    ///
+    /// Uses the `identity/socialUpdateAnalytics` Voyager REST endpoint
+    /// discovered in the API catalog section 18 (`ME_CONTENT_ANALYTICS_HIGHLIGHTS`).
+    ///
+    /// Returns analytics data including impressions, views, and engagement
+    /// metrics for the user's recent posts.
+    pub async fn get_post_analytics(&self) -> Result<Value, Error> {
+        self.get("identity/socialUpdateAnalytics").await
+    }
+
+    /// Fetch the content analytics summary header.
+    ///
+    /// Uses `identity/socialUpdateAnalyticsHeader` from the API catalog.
+    /// Returns high-level analytics summary (total views, etc.).
+    pub async fn get_post_analytics_header(&self) -> Result<Value, Error> {
+        self.get("identity/socialUpdateAnalyticsHeader").await
+    }
+
+    /// Fetch followers of a company page.
+    ///
+    /// Tries multiple endpoint patterns since LinkedIn's follower list
+    /// endpoints vary by API version and admin status. The caller must be
+    /// an admin of the company page for most of these to work.
+    ///
+    /// The `company_id` is the numeric ID from the company's entityUrn
+    /// (e.g., `110432675` from `urn:li:fs_normalized_company:110432675`).
+    pub async fn get_company_followers(
+        &self,
+        company_id: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        // Try the admin follower analytics endpoint first.
+        let paths = [
+            format!(
+                "organization/organizationFollowerStatistics?q=organizationUrn&organizationUrn=urn%3Ali%3Aorganization%3A{}&start={}&count={}",
+                company_id, start, count
+            ),
+            format!(
+                "voyagerOrganizationCompanies/urn:li:fs_normalized_company:{}/followers?start={}&count={}",
+                company_id, start, count
+            ),
+            format!(
+                "organization/companies/{}/followers?start={}&count={}",
+                company_id, start, count
+            ),
+        ];
+
+        let mut last_err = Error::Api {
+            status: 0,
+            body: "no follower endpoints succeeded".to_string(),
+        };
+
+        for path in &paths {
+            match self.get(path).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// Fetch company/organization info by universal name (URL slug).
+    ///
+    /// Uses the `organization/companies` Voyager REST endpoint with the
+    /// `q=universalName` finder. The universal name is the slug portion of
+    /// a LinkedIn company URL: `https://www.linkedin.com/company/<slug>`.
+    ///
+    /// Falls back to `voyagerOrganizationCompanies` if the first endpoint fails.
+    ///
+    /// See `re/api_endpoint_catalog.md` section 12 for available endpoints.
+    pub async fn get_company(&self, universal_name: &str) -> Result<Value, Error> {
+        // Try the decorated company endpoint first.
+        let path = format!(
+            "organization/companies?q=universalName&universalName={}",
+            restli_encode_string(universal_name)
+        );
+        match self.get(&path).await {
+            Ok(resp) => {
+                // Response may have elements array or be the company directly.
+                if let Some(first) = resp
+                    .get("elements")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| arr.first())
+                {
+                    return Ok(first.clone());
+                }
+                Ok(resp)
+            }
+            Err(_) => {
+                // Fall back to the basic entity endpoint.
+                let path2 = format!(
+                    "voyagerEntitiesCompanies?q=universalName&universalName={}",
+                    restli_encode_string(universal_name)
+                );
+                let resp = self.get(&path2).await?;
+                if let Some(first) = resp
+                    .get("elements")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| arr.first())
+                {
+                    return Ok(first.clone());
+                }
+                Ok(resp)
+            }
+        }
+    }
 }
 
 /// Valid reaction type strings accepted by the LinkedIn API.
@@ -1642,11 +1977,111 @@ fn build_x_li_track(device_id: &str) -> String {
     track.to_string()
 }
 
+/// Result of checking an HTTP response with retry support.
+enum RetryResult {
+    /// Success: parsed JSON value.
+    Ok(Value),
+    /// Non-retriable error.
+    Err(Error),
+    /// Retriable error: wait this duration before retrying.
+    Retry(Duration),
+}
+
+/// Check an HTTP response for error status codes with retry awareness.
+///
+/// On success (2xx), parses the response body as JSON.
+/// On 429 or 5xx, if retries remain, returns `RetryResult::Retry` with
+/// an appropriate backoff delay (respecting `Retry-After` headers).
+/// On 401, returns a non-retriable auth error.
+/// On other errors or when retries are exhausted, returns `RetryResult::Err`.
+async fn check_response_retryable(resp: reqwest::Response, attempt: u32) -> RetryResult {
+    let status = resp.status();
+    if status.is_success() {
+        return match resp.json::<Value>().await {
+            Ok(json) => RetryResult::Ok(json),
+            Err(e) => RetryResult::Err(Error::Http(e)),
+        };
+    }
+
+    let status_code = status.as_u16();
+
+    // Parse Retry-After header before consuming the body.
+    let retry_after = parse_retry_after(&resp);
+
+    let body = resp.text().await.unwrap_or_default();
+
+    // 401 is never retriable.
+    if status_code == 401 {
+        return RetryResult::Err(Error::Auth(format!(
+            "session expired or invalid (HTTP 401): {body}"
+        )));
+    }
+
+    // 429 and 5xx are retriable if we haven't exhausted attempts.
+    let is_retriable = status_code == 429 || (500..=599).contains(&status_code);
+    if is_retriable && attempt < MAX_RETRIES {
+        let delay = if let Some(ra) = retry_after {
+            // Respect the server's Retry-After suggestion.
+            ra
+        } else {
+            // Exponential backoff: base * 2^attempt, capped.
+            let ms = BASE_BACKOFF_MS * 2u64.pow(attempt);
+            Duration::from_millis(ms.min(MAX_BACKOFF_MS))
+        };
+        eprintln!(
+            "HTTP {} -- retrying in {:.1}s (attempt {}/{})",
+            status_code,
+            delay.as_secs_f64(),
+            attempt + 1,
+            MAX_RETRIES
+        );
+        return RetryResult::Retry(delay);
+    }
+
+    RetryResult::Err(Error::Api {
+        status: status_code,
+        body,
+    })
+}
+
+/// Parse the `Retry-After` header from an HTTP response.
+///
+/// Supports two formats per RFC 7231:
+/// - Numeric seconds: `Retry-After: 120` (delay in seconds)
+/// - HTTP-date: `Retry-After: Thu, 01 Dec 2025 16:00:00 GMT`
+///
+/// Returns `None` if the header is absent or unparseable.
+fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let header = resp.headers().get("retry-after")?.to_str().ok()?;
+
+    // Try numeric seconds first.
+    if let Ok(secs) = header.parse::<f64>() {
+        if secs > 0.0 {
+            return Some(Duration::from_secs_f64(secs));
+        }
+        return None;
+    }
+
+    // Try HTTP-date format.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(header) {
+        let now = chrono::Utc::now();
+        let delta = dt.signed_duration_since(now);
+        if delta.num_seconds() > 0 {
+            return Some(Duration::from_secs(delta.num_seconds() as u64));
+        }
+    }
+
+    None
+}
+
 /// Check an HTTP response for error status codes and parse the body as JSON.
 ///
 /// On success (2xx), parses the response body as JSON and returns it.
 /// On 401, returns [`Error::Auth`] with the response body for context.
 /// On other non-success status codes, returns [`Error::Api`].
+///
+/// Note: This is the non-retry version, used by endpoints that manage their
+/// own retry logic (e.g., `graphql_post`).
 async fn check_response(resp: reqwest::Response) -> Result<Value, Error> {
     let status = resp.status();
     if status.is_success() {
