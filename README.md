@@ -7,7 +7,7 @@ linkedin-cli inbox                                    # morning check
 linkedin-cli feed list --author "Satya" --count 20    # filtered feed
 linkedin-cli feed read 3                              # full post + media
 linkedin-cli feed react 3 --type CELEBRATION           # react by index
-linkedin-cli messages send "Paul Bang" "coffee next week?"  # send by name
+linkedin-cli messages send "Jane Doe" "coffee next week?"   # send by name
 linkedin-cli search posts "AI engineering"             # search + links
 linkedin-cli search react 2                            # like result #2
 ```
