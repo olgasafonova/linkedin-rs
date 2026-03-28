@@ -1,255 +1,231 @@
 # LinkedIn Reversed
 
-Rust CLI and API library for LinkedIn, reverse-engineered from the Android app (`com.linkedin.android`). Provides programmatic access to LinkedIn's core features: profiles, messaging, feed, connections, search, and notifications.
+Rust CLI and API library for LinkedIn, reverse-engineered from the Android app (`com.linkedin.android`). Programmatic access to profiles, messaging, feed, connections, search, companies, and notifications.
 
-This project is for personal and educational use only.
+For personal and educational use only.
+
+> **Forked from [eisbaw/linkedin-rs](https://github.com/eisbaw/linkedin-rs)** by Mark Ruvald Pedersen, who built the original client, auth flow, Rest.li protocol handling, and core CLI structure. This fork adds the features listed under [What's New](#whats-new).
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 22 subcommands across 7 domains:
+The CLI exposes 30+ subcommands across 8 domains:
 
+### Auth
 | Command | Description |
 |---------|-------------|
-| `auth login` | Authenticate with a `li_at` cookie (from browser or env var) |
-| `auth status` | Check session validity (live API call or local-only) |
+| `auth login --li-at <value>` | Authenticate with a `li_at` cookie |
+| `auth status` | Check session validity (live or `--local`) |
 | `auth logout` | Clear stored session |
-| `profile me` | Fetch your own profile |
-| `profile view <id>` | View a profile by public identifier (vanity URL slug) |
-| `profile visit <id>` | Visit a profile (registers in "who viewed my profile") |
-| `profile viewers` | Show who viewed your profile |
-| `feed list` | List feed updates (paginated) |
-| `feed react <urn>` | React to a post (LIKE, PRAISE, EMPATHY, etc.) |
-| `feed unreact <urn>` | Remove a reaction from a post |
-| `feed comment <urn> <text>` | Comment on a feed post |
-| `feed post <text>` | Create a new text post (public or connections-only) |
-| `connections list` | List your connections (paginated) |
-| `connections invite <id>` | Send a connection request with optional message |
-| `connections invitations` | List pending received invitations |
-| `connections accept <id>` | Accept a pending invitation |
-| `search people <keywords>` | Search for people by keywords |
-| `search jobs <keywords>` | Search for jobs by keywords |
-| `messages list` | List conversations (cursor-based pagination) |
-| `messages read <id>` | Read messages in a conversation |
-| `messages send <recipient> <text>` | Send a message to a connection |
-| `notifications list` | List notification cards (paginated) |
 
-All list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
+### Profile
+| Command | Description |
+|---------|-------------|
+| `profile me` | Your own profile |
+| `profile view <id>` | View a profile by vanity URL slug |
+| `profile visit <id>` | Register a profile view |
+| `profile viewers` | Who viewed your profile |
+
+### Feed
+| Command | Description |
+|---------|-------------|
+| `feed list` | List feed updates with `--author` and `--keyword` filters |
+| `feed read <index>` | Full post details: reshares, articles, media URLs |
+| `feed comments <index>` | Comments on a post |
+| `feed react <urn>` | React (LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION) |
+| `feed unreact <urn>` | Remove a reaction |
+| `feed comment <urn> <text>` | Comment on a post (requires `--yes`) |
+| `feed post <text>` | Create a text post (requires `--yes`) |
+| `feed stats` | Post analytics: views, impressions, engagement |
+
+### Messages
+| Command | Description |
+|---------|-------------|
+| `messages list` | List conversations |
+| `messages read <id>` | Read messages with threading context |
+| `messages send <recipient> <text>` | Send a new message |
+| `messages reply <conversation_id> <text>` | Reply to an existing thread (requires `--yes`) |
+
+### Connections
+| Command | Description |
+|---------|-------------|
+| `connections list` | List connections with `--keyword` filter |
+| `connections invite <id>` | Send a connection request |
+| `connections invitations` | Pending received invitations |
+| `connections accept <id>` | Accept an invitation |
+
+### Company
+| Command | Description |
+|---------|-------------|
+| `company view <slug>` | Company info: name, tagline, industry, size, HQ, followers |
+| `company followers <slug>` | Follower count and first-degree connections that follow |
+
+### Search
+| Command | Description |
+|---------|-------------|
+| `search people <keywords>` | Search for people |
+| `search jobs <keywords>` | Search for jobs |
+| `search posts <keywords>` | Search posts with activity URNs and links |
+
+### Notifications
+| Command | Description |
+|---------|-------------|
+| `notifications list` | List notification cards |
+
+All list commands support `--count`, `--start` (or `--before`), and `--json`. Write commands require `--yes`.
+
+## What's New
+
+Features added in this fork:
+
+**Feed enrichment** -- `feed read` shows reshared posts (original author + text), article links (title + URL), media type labels, and actual media URLs (images, videos, documents, carousels). `feed list` shows media type badges inline.
+
+**Filtering** -- `feed list --author "name" --keyword "term"` and `connections list --keyword "engineer"` for case-insensitive client-side filtering.
+
+**Search with links** -- `search posts` results include activity URNs and clickable LinkedIn URLs.
+
+**Company pages** -- `company view` and `company followers` commands.
+
+**Message threading** -- `messages read` shows reply context. `messages reply` sends to existing conversation threads.
+
+**Post analytics** -- `feed stats` fetches views, impressions, and engagement via `identity/socialUpdateAnalytics`.
+
+**Rate limiting** -- Automatic retry with exponential backoff (1s, 2s, 4s) on HTTP 429 and 5xx errors. Respects `Retry-After` headers. Max 3 retries on all API calls.
 
 ## Installation
 
-### Prerequisites
-
-This project uses Nix for reproducible builds. All dependencies (Rust toolchain, Android tools, analysis tools) are declared in `shell.nix`.
+### With Nix
 
 ```bash
-# Enter the development shell
 nix-shell
-
-# Build the workspace
 just build
+just e2e    # build + test + lint + format
+```
 
-# Run all checks (build + test + lint + format)
-just e2e
+### Without Nix
+
+Requires Rust 1.75+.
+
+```bash
+cd linkedin
+cargo build --release
+cargo install --path linkedin-cli
 ```
 
 ### Just Recipes
 
 | Recipe | Description |
 |--------|-------------|
-| `just build` | Build the Rust workspace |
+| `just build` | Build the workspace |
 | `just test` | Run all tests |
 | `just lint` | Run clippy (warnings are errors) |
 | `just fmt` | Format all code |
-| `just fmt-check` | Check formatting without modifying |
-| `just e2e` | Full gate: build, test, lint, format check |
-| `just run <args>` | Run the CLI with arguments |
+| `just e2e` | Full gate: build, test, lint, format |
+| `just run <args>` | Run the CLI |
 
 ## Authentication
 
-LinkedIn API access requires a `li_at` session cookie. This is a cookie-based auth approach -- no OAuth app registration needed.
+Requires a `li_at` session cookie from your browser. No OAuth app registration needed.
 
-### Getting the li_at cookie
+### Getting the cookie
 
 1. Log into linkedin.com in Chrome
-2. Open DevTools: F12 (or Cmd+Option+I on macOS)
-3. Go to **Application** tab > **Cookies** > `https://www.linkedin.com`
-4. Find the `li_at` cookie and copy its value
+2. DevTools (F12) > **Application** > **Cookies** > `https://www.linkedin.com`
+3. Copy the `li_at` cookie value
 
-### Logging in
+### Login
 
 ```bash
-# Pass directly
 linkedin-cli auth login --li-at "AQEDAQx..."
 
-# Or via environment variable
+# Or via env var
 export LINKEDIN_LI_AT="AQEDAQx..."
 linkedin-cli auth login
 
-# Verify the session works
+# Verify
 linkedin-cli auth status
 ```
 
-The session is stored locally at `~/.config/linkedin-cli/session.json`.
+Session stored at `~/.config/linkedin-cli/session.json`.
 
-## Usage
-
-### Profile
+## Usage Examples
 
 ```bash
-# Your own profile
-linkedin-cli profile me
+# Browse your feed, filter by author
+linkedin-cli feed list --count 20 --author "Satya"
 
-# View someone's profile
-linkedin-cli profile view john-doe-123
+# Read a post with full details (media, reshares, articles)
+linkedin-cli feed read 3
 
-# Visit a profile (shows up in "who viewed")
-linkedin-cli profile visit john-doe-123
+# Search posts and get links
+linkedin-cli search posts "AI engineering" --count 10
 
-# Who viewed your profile
-linkedin-cli profile viewers
-```
+# Company info
+linkedin-cli company view microsoft
 
-### Feed
+# Reply to a conversation thread
+linkedin-cli messages reply 2-abc123 "Sounds great, let's do Thursday" --yes
 
-```bash
-# List recent feed items
-linkedin-cli feed list --count 20
+# Post analytics
+linkedin-cli feed stats
 
-# Like a post
-linkedin-cli feed react urn:li:activity:7312345678901234567
-
-# Celebrate a post
-linkedin-cli feed react urn:li:activity:7312345678901234567 --type CELEBRATION
-
-# Remove a reaction
-linkedin-cli feed unreact urn:li:activity:7312345678901234567
-
-# Comment on a post
-linkedin-cli feed comment urn:li:activity:7312345678901234567 "Great post!" --yes
-
-# Create a post
-linkedin-cli feed post "Hello LinkedIn!" --yes
-linkedin-cli feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
-```
-
-### Messages
-
-```bash
-# List conversations
-linkedin-cli messages list --count 20
-
-# Read a conversation
-linkedin-cli messages read 2-abc123
-
-# Send a message
-linkedin-cli messages send john-doe-123 "Hey, wanted to connect about..."
-```
-
-### Connections
-
-```bash
-# List connections
-linkedin-cli connections list --count 50
-
-# Send a connection request
-linkedin-cli connections invite john-doe-123
-linkedin-cli connections invite john-doe-123 --message "Met you at the conference"
-
-# List pending invitations
-linkedin-cli connections invitations
-
-# Accept an invitation (get ID and secret from invitations --json)
-linkedin-cli connections accept 7312345678901234567 --secret abc123
-```
-
-### Search
-
-```bash
-# Search for people
-linkedin-cli search people "rust developer" --count 20
-
-# Search for jobs
-linkedin-cli search jobs "senior backend engineer"
-```
-
-### Notifications
-
-```bash
-# List notifications
-linkedin-cli notifications list --count 20
-```
-
-### JSON output
-
-All commands support `--json` for machine-readable output:
-
-```bash
-linkedin-cli profile me --json | jq '.firstName'
-linkedin-cli feed list --json --count 5 | jq '.elements[].text'
+# JSON output for scripting
+linkedin-cli profile me --json | jq '.miniProfile.firstName'
+linkedin-cli connections list --json --count 100 | jq '.elements[].miniProfile.publicIdentifier'
 ```
 
 ## API Library
 
-The `linkedin-api` crate can be used as a standalone Rust library:
+The `linkedin-api` crate works as a standalone library:
 
 ```toml
 [dependencies]
 linkedin-api = { path = "linkedin/linkedin-api" }
 ```
 
-It provides:
-
-- `LinkedInClient` -- HTTP client with cookie jar, auth header decoration, and CSRF handling
-- `Session` -- session management (load, save, validate)
-- Typed request/response models for all supported endpoints
-- Rest.li protocol handling (headers, pagination, union unwrapping)
-
-Key dependencies: reqwest (with cookies + JSON), serde, chrono, thiserror, tokio.
+Core types:
+- `LinkedInClient` -- HTTP client with cookie jar, CSRF, device fingerprinting, and automatic retry
+- `Session` -- session persistence (load, save, validate)
+- Typed models for feed, connections, search, notifications, messaging
+- Rest.li 2.0 + GraphQL protocol handling
 
 ## Architecture
 
-### Auth model
+**Auth**: Cookie-based (`li_at` + auto-generated `JSESSIONID` for CSRF). No OAuth app needed.
 
-Authentication uses cookie-based sessions rather than OAuth2 app tokens:
+**Transport**: Two API styles in active use:
+- **Rest.li 2.0** -- LinkedIn's custom REST framework with `X-RestLi-Protocol-Version: 2.0.0`, parenthesized record encoding, and `elements`/`paging` response wrappers.
+- **GraphQL (Dash)** -- Newer endpoints using hardcoded `queryId` values from the decompiled APK.
 
-1. User provides a `li_at` cookie extracted from a browser session
-2. The client also requires a CSRF token (`JSESSIONID` cookie) which is echoed as the `csrf-token` header
-3. Sessions are persisted locally and reused across CLI invocations
+**Retry**: Exponential backoff on 429/5xx with `Retry-After` header support. GET and POST requests retry automatically up to 3 times.
 
-### API transport
-
-LinkedIn uses two API styles, both in active use:
-
-- **Rest.li 2.0** -- LinkedIn's custom REST framework. Requires `X-RestLi-Protocol-Version: 2.0.0` and `X-RestLi-Method` headers. Responses wrap data in `elements` arrays with `paging` metadata.
-- **GraphQL (Voyager/Dash)** -- Newer endpoints use GraphQL queries with hardcoded query IDs (`queryId` parameter). The app is progressively migrating from Rest.li to Dash.
-
-### Required headers
-
-Every request includes a set of headers that mimic the Android app: `User-Agent`, `X-Li-Lang`, `X-Li-Track`, `Accept-Language`, and the CSRF token header.
+**Headers**: Every request includes Android app headers (`User-Agent`, `X-Li-Track`, `X-UDID`, `X-Li-Lang`, CSRF token) matching a Google Pixel 8 on Android 14.
 
 ## Limitations
 
-- **TLS fingerprint mismatch**: The library uses rustls, not Chrome/BoringSSL. LinkedIn may detect this difference. Switching to `boring-tls` (BoringSSL bindings for reqwest) would improve fingerprint fidelity. See `re/tls_configuration.md`.
-- **Query ID brittleness**: GraphQL (Dash) endpoints use hardcoded `queryId` values extracted from the APK. These may change with app updates, requiring re-extraction.
-- **Write operations**: Posting, commenting, messaging, and connection requests hit LinkedIn's live systems. These may trigger additional validation, CAPTCHA challenges, or rate limiting that read-only operations do not.
-- **Rate limiting**: LinkedIn actively detects automated access. Excessive requests can lead to CAPTCHA challenges or account restrictions. No built-in rate limiter is provided -- callers should throttle themselves.
-- **No real-time messaging**: The current implementation uses request/response only. LinkedIn's real-time messaging system (long-poll / SSE) is documented but not implemented.
+- **TLS fingerprint**: Uses rustls, not BoringSSL. LinkedIn may detect the difference. See `re/tls_configuration.md`.
+- **Query ID brittleness**: GraphQL `queryId` values are extracted from the APK and may break with app updates.
+- **Write operations**: Posts, comments, messages hit LinkedIn's live systems. May trigger CAPTCHA or rate limiting.
+- **No real-time messaging**: Request/response only. LinkedIn's long-poll/SSE system is documented in `re/` but not implemented.
 
 ## Security
 
-- **Tokens and credentials** are stored in `secrets/` which is gitignored. Never commit cookies, session files, or captured API responses.
-- **PII scan** before any push to remote. Captured responses often contain names, emails, profile URLs, and other personal data.
-- **Session files** at `~/.config/linkedin-cli/session.json` contain your `li_at` cookie. Protect this file as you would a password.
-- **Never commit** APK files, decompiled output, or raw API responses.
+- Tokens and credentials go in `secrets/` (gitignored). Never commit cookies or captured responses.
+- PII scan before any push. API responses contain names, emails, and profile URLs.
+- Session file (`~/.config/linkedin-cli/session.json`) contains your `li_at` cookie. Protect it like a password.
 
 ## Project Structure
 
 ```
 linkedin/
-  linkedin-api/     Rust library crate (client, auth, models, services)
-  linkedin-cli/     Rust binary crate (clap CLI)
-re/                 Reverse engineering documentation
-secrets/            Tokens, captured responses, PII (gitignored)
-shell.nix           Nix development environment
+  linkedin-api/     Rust library (client, auth, models)
+  linkedin-cli/     Rust binary (clap CLI)
+re/                 Reverse engineering docs
+secrets/            Tokens, responses, PII (gitignored)
+shell.nix           Nix dev environment
+flake.nix           Nix flake
 Justfile            Build recipes
 ```
+
+## Credits
+
+Built on [eisbaw/linkedin-rs](https://github.com/eisbaw/linkedin-rs) by [Mark Ruvald Pedersen](https://github.com/eisbaw). The original project established the client architecture, authentication flow, Rest.li/GraphQL protocol implementation, device fingerprinting, and the core CLI command structure.

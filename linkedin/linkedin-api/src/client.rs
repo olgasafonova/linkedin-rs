@@ -947,11 +947,6 @@ impl LinkedInClient {
     /// The conversation URN format for the Dash endpoint is:
     /// `urn:li:msg_conversation:(urn:li:fsd_profile:XXXX,<thread_id>)`
     ///
-    /// # Parameters
-    ///
-    /// - `conversation_id`: The conversation/thread ID (e.g., `2-abc123`).
-    ///   Will be wrapped into a full `msg_conversation` URN automatically.
-    /// - `message_body`: The plain text message to send.
     /// Reply to an existing messaging conversation by sending to the same
     /// participants.
     ///
@@ -959,6 +954,11 @@ impl LinkedInClient {
     /// fetches the conversation to extract participant URNs. LinkedIn routes
     /// the message to the existing thread when the same set of recipients
     /// is used.
+    ///
+    /// # Parameters
+    ///
+    /// - `conversation_id`: The conversation/thread ID (e.g., `2-abc123`).
+    /// - `message_body`: The plain text message to send.
     ///
     /// # Parameters
     ///

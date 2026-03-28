@@ -2412,7 +2412,7 @@ async fn cmd_company_followers(
                     .map_err(|e| format!("JSON format error: {e}"))?;
                 println!("{}", pretty);
             }
-            return Ok(());
+            Ok(())
         }
         Err(_) => {
             // Fall back to first-degree connections that follow.
@@ -4095,14 +4095,14 @@ fn print_search_content(index: usize, sfu: &serde_json::Value) {
             update
                 .get("entityUrn")
                 .and_then(|u| u.as_str())
-                .and_then(|u| extract_activity_urn(u))
+                .and_then(extract_activity_urn)
         })
         .or_else(|| {
             update
                 .get("socialDetail")
                 .and_then(|sd| sd.get("entityUrn"))
                 .and_then(|u| u.as_str())
-                .and_then(|u| extract_activity_urn(u))
+                .and_then(extract_activity_urn)
         })
         .unwrap_or_default();
 
