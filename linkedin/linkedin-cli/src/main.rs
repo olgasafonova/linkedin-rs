@@ -3883,8 +3883,9 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
         .and_then(|s| s.get("text").and_then(|t| t.as_str()))
         .unwrap_or("");
 
-    // kicker.text -- time indicator (e.g. "2h ago").
-    let kicker = card
+    // kicker.text -- time indicator (e.g. "2h ago"). Currently unused since
+    // publishedAt provides a more precise timestamp.
+    let _kicker = card
         .get("kicker")
         .and_then(|k| k.get("text").and_then(|t| t.as_str()))
         .unwrap_or("");
@@ -3906,30 +3907,68 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
+    // contentPrimaryText -- the actual post body for reaction/mention notifications.
+    let content_text = card
+        .get("contentPrimaryText")
+        .and_then(|arr| arr.as_array())
+        .and_then(|a| a.first())
+        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("");
+
+    // socialActivityCounts -- engagement numbers.
+    let social = card.get("socialActivityCounts");
+    let num_likes = social
+        .and_then(|s| s.get("numLikes").and_then(|n| n.as_u64()))
+        .unwrap_or(0);
+    let num_comments = social
+        .and_then(|s| s.get("numComments").and_then(|n| n.as_u64()))
+        .unwrap_or(0);
+
+    // Post URL from cardAction.actionTarget.
+    let post_url = card
+        .get("cardAction")
+        .and_then(|a| a.get("actionTarget").and_then(|t| t.as_str()))
+        .unwrap_or("");
+
     // Truncate long headlines for summary view.
     let headline_display = truncate_with_ellipsis(headline, 120);
 
     print!("[{}]{} {}", index, unread_marker, headline_display);
-    if !kicker.is_empty() {
-        print!("  ({})", kicker);
-    }
     println!();
+
+    // Show post preview for content notifications.
+    if !content_text.is_empty() {
+        // Show first line of the post as a preview.
+        let first_line = content_text.lines().next().unwrap_or("");
+        let preview = truncate_with_ellipsis(first_line, 100);
+        println!("    \"{}\"", preview);
+    }
 
     if !sub_headline.is_empty() {
         println!("    {}", sub_headline);
     }
+
+    // Engagement stats + timestamp on one line.
+    let mut meta_parts = Vec::new();
+    if num_likes > 0 || num_comments > 0 {
+        meta_parts.push(format!("likes: {}  comments: {}", num_likes, num_comments));
+    }
     if !content_type.is_empty() {
-        print!("    type: {}", content_type);
+        meta_parts.push(format!("type: {}", content_type));
     }
     if !published_at.is_empty() {
-        if !content_type.is_empty() {
-            print!("  |  {}", published_at);
-        } else {
-            print!("    {}", published_at);
-        }
+        meta_parts.push(published_at);
     }
-    if !content_type.is_empty() || !published_at.is_empty() {
-        println!();
+    if !meta_parts.is_empty() {
+        println!("    {}", meta_parts.join("  |  "));
+    }
+
+    // Post link.
+    if !post_url.is_empty() && post_url.contains("/feed/") {
+        println!(
+            "    https://www.linkedin.com{}",
+            post_url.replace("%3A", ":").replace("%2F", "/")
+        );
     }
 }
 

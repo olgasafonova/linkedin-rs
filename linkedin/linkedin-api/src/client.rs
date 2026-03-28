@@ -484,9 +484,7 @@ impl LinkedInClient {
         // LinkedIn's Voyager API doesn't expose a simple single-post REST
         // endpoint. Scan the recent feed for a matching activity URN.
         // TODO: RE the actual web client endpoint (chrome-recon task).
-        let activity_id = urn
-            .strip_prefix("urn:li:activity:")
-            .unwrap_or(&urn);
+        let activity_id = urn.strip_prefix("urn:li:activity:").unwrap_or(&urn);
         let feed = self.get("feed/updates?q=findFeed&start=0&count=50").await?;
         if let Some(elements) = feed.get("elements").and_then(|e| e.as_array()) {
             for element in elements {
