@@ -29,6 +29,8 @@ linkedin-cli auth login --li-at "AQEDAQx..."
 linkedin-cli inbox
 ```
 
+**About the cookie:** This CLI piggybacks on your browser session via the `li_at` cookie. It's not a stable API key; LinkedIn can expire or invalidate it at any time (password change, security event, or just because). When it stops working, grab a fresh cookie from your browser. The CLI warns you when your session is getting old.
+
 Requires Rust 1.75+. Install with `cargo install --path linkedin/linkedin-cli`.
 
 ## What You Can Do
