@@ -1,6 +1,7 @@
 use std::fs;
 use std::process;
 
+use chrono::Datelike;
 use clap::{CommandFactory, Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
@@ -108,6 +109,10 @@ enum Commands {
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
+
+        /// Show all messages including likely recruiter spam
+        #[arg(long)]
+        all: bool,
     },
     /// Generate shell completions
     Completions {
@@ -283,6 +288,12 @@ enum ProfileAction {
     },
     /// Show who viewed your profile
     Viewers {
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Audit your profile for staleness and missing sections
+    Audit {
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
@@ -571,6 +582,7 @@ async fn main() {
                 exit_on_err(cmd_profile_visit(&public_id, json).await)
             }
             ProfileAction::Viewers { json } => exit_on_err(cmd_profile_viewers(json).await),
+            ProfileAction::Audit { json } => exit_on_err(cmd_profile_audit(json).await),
         },
         Commands::Messages { action } => match action {
             MessagesAction::List {
@@ -640,9 +652,9 @@ async fn main() {
                 all,
                 keyword,
                 json,
-            } => exit_on_err(
-                cmd_connections_list(start, count, all, keyword.as_deref(), json).await,
-            ),
+            } => {
+                exit_on_err(cmd_connections_list(start, count, all, keyword.as_deref(), json).await)
+            }
             ConnectionsAction::Invite {
                 public_id_or_urn,
                 message,
@@ -683,14 +695,10 @@ async fn main() {
                 reaction_type,
                 json,
             } => exit_on_err(cmd_search_react(index, &reaction_type, json).await),
-            SearchAction::View { index, json } => {
-                exit_on_err(cmd_search_view(index, json).await)
-            }
+            SearchAction::View { index, json } => exit_on_err(cmd_search_view(index, json).await),
         },
         Commands::Company { action } => match action {
-            CompanyAction::View { slug, json } => {
-                exit_on_err(cmd_company_view(&slug, json).await)
-            }
+            CompanyAction::View { slug, json } => exit_on_err(cmd_company_view(&slug, json).await),
             CompanyAction::Followers {
                 slug,
                 count,
@@ -703,7 +711,7 @@ async fn main() {
                 exit_on_err(cmd_notifications_list(start, count, json).await)
             }
         },
-        Commands::Inbox { json } => exit_on_err(cmd_inbox(json).await),
+        Commands::Inbox { json, all } => exit_on_err(cmd_inbox(json, all).await),
         Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -715,11 +723,148 @@ async fn main() {
     }
 }
 
-/// Handle `inbox [--json]`.
+/// Spam-detection patterns for recruiter messages and invitations.
+///
+/// Returns `true` if the text looks like recruiter spam. Patterns are
+/// case-insensitive substring matches against common recruiter template
+/// phrases and headline keywords.
+fn looks_like_spam(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    // Recruiter headline patterns (invitation subtitles / sender occupations).
+    const HEADLINE_PATTERNS: &[&str] = &[
+        "recruiter",
+        "talent acquisition",
+        "staffing",
+        "headhunter",
+        "hiring manager",
+        "sourcer",
+        "recruitment",
+        "people partner",
+    ];
+
+    // Message body template phrases.
+    const BODY_PATTERNS: &[&str] = &[
+        "exciting opportunity",
+        "perfect fit",
+        "open role",
+        "open position",
+        "i came across your profile",
+        "i found your profile",
+        "your background caught",
+        "impressive profile",
+        "impressive background",
+        "great match",
+        "thriving team",
+        "i'd love to connect",
+        "competitive salary",
+        "competitive compensation",
+        "base salary",
+        "reach out to discuss",
+        "we are currently hiring",
+        "we're currently hiring",
+        "looking for a",
+        "we are looking",
+        "we're looking",
+        "wonderful opportunity",
+        "are you open to",
+    ];
+
+    for pat in HEADLINE_PATTERNS.iter().chain(BODY_PATTERNS.iter()) {
+        if lower.contains(pat) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a conversation element looks like recruiter spam.
+///
+/// Checks participant names/headlines and the last message body.
+fn is_spam_conversation(conv: &serde_json::Value) -> bool {
+    // Check title field.
+    if let Some(title) = conv.get("title").and_then(|v| v.as_str()) {
+        if looks_like_spam(title) {
+            return true;
+        }
+    }
+
+    // Check participant headlines/occupations.
+    if let Some(participants) = conv
+        .get("conversationParticipants")
+        .and_then(|p| p.as_array())
+    {
+        for p in participants {
+            if let Some(member) = p.get("participantType").and_then(|pt| pt.get("member")) {
+                if let Some(headline) = member.get("headline").and_then(|h| {
+                    h.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| h.as_str())
+                }) {
+                    if looks_like_spam(headline) {
+                        return true;
+                    }
+                }
+                if let Some(occ) = member.get("occupation").and_then(|v| v.as_str()) {
+                    if looks_like_spam(occ) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check last message body.
+    let last_msg_text = conv
+        .get("messages")
+        .and_then(|m| m.get("elements"))
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|msg| {
+            msg.get("body").and_then(|b| {
+                if b.is_string() {
+                    b.as_str().map(|s| s.to_string())
+                } else {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                }
+            })
+        })
+        .unwrap_or_default();
+
+    looks_like_spam(&last_msg_text)
+}
+
+/// Check if an invitation element looks like recruiter spam.
+fn is_spam_invitation(inv: &serde_json::Value) -> bool {
+    if let Some(headline) = inv
+        .get("subtitle")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        if looks_like_spam(headline) {
+            return true;
+        }
+    }
+    if let Some(msg) = inv
+        .get("invitation")
+        .and_then(|i| i.get("message"))
+        .and_then(|v| v.as_str())
+    {
+        if looks_like_spam(msg) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Handle `inbox [--json] [--all]`.
 ///
 /// Shows a daily summary: unread messages, pending invitations, and
-/// recent unread notifications in one view.
-async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
+/// recent unread notifications in one view. Filters likely recruiter
+/// spam by default; use `--all` to see everything.
+async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     // Fetch all three in sequence (rate limiter handles throttling).
@@ -759,19 +904,26 @@ async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
         .iter()
         .filter(|c| {
             c.get("read").and_then(|r| r.as_bool()) == Some(false)
-                || c.get("unreadCount")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0)
-                    > 0
+                || c.get("unreadCount").and_then(|n| n.as_u64()).unwrap_or(0) > 0
         })
         .collect();
 
-    println!("Unread Messages ({})", unread.len());
+    let spam_msg_count = if show_all {
+        0
+    } else {
+        unread.iter().filter(|c| is_spam_conversation(c)).count()
+    };
+    let displayed_unread: Vec<&serde_json::Value> = unread
+        .into_iter()
+        .filter(|c| show_all || !is_spam_conversation(c))
+        .collect();
+
+    println!("Unread Messages ({})", displayed_unread.len());
     println!("---");
-    if unread.is_empty() {
+    if displayed_unread.is_empty() {
         println!("  (all caught up)");
     } else {
-        for (i, conv) in unread.iter().enumerate() {
+        for (i, conv) in displayed_unread.iter().enumerate() {
             let title = conv.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let names = extract_conversation_names(conv);
             let display = if !title.is_empty() {
@@ -800,7 +952,9 @@ async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
                         if b.is_string() {
                             b.as_str().map(|s| s.to_string())
                         } else {
-                            b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            b.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
                         }
                     })
                 })
@@ -818,6 +972,12 @@ async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
             println!("      read: messages read {}", conv_id);
         }
     }
+    if spam_msg_count > 0 {
+        println!(
+            "  ({} recruiter message(s) hidden, use --all to show)",
+            spam_msg_count
+        );
+    }
     println!();
 
     // --- Pending invitations ---
@@ -827,12 +987,25 @@ async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
 
-    println!("Pending Invitations ({})", inv_elements.len());
+    let spam_inv_count = if show_all {
+        0
+    } else {
+        inv_elements
+            .iter()
+            .filter(|i| is_spam_invitation(i))
+            .count()
+    };
+    let displayed_invs: Vec<&serde_json::Value> = inv_elements
+        .iter()
+        .filter(|i| show_all || !is_spam_invitation(i))
+        .collect();
+
+    println!("Pending Invitations ({})", displayed_invs.len());
     println!("---");
-    if inv_elements.is_empty() {
+    if displayed_invs.is_empty() {
         println!("  (none)");
     } else {
-        for (i, inv) in inv_elements.iter().enumerate() {
+        for (i, inv) in displayed_invs.iter().enumerate() {
             let name = inv
                 .get("title")
                 .and_then(|t| t.get("text"))
@@ -875,6 +1048,12 @@ async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
                 );
             }
         }
+    }
+    if spam_inv_count > 0 {
+        println!(
+            "  ({} recruiter invitation(s) hidden, use --all to show)",
+            spam_inv_count
+        );
     }
     println!();
 
@@ -933,11 +1112,19 @@ fn extract_conversation_names(conv: &serde_json::Value) -> Vec<String> {
                 .and_then(|member| {
                     let first = member
                         .get("firstName")
-                        .and_then(|f| f.get("text").and_then(|v| v.as_str()).or_else(|| f.as_str()))
+                        .and_then(|f| {
+                            f.get("text")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| f.as_str())
+                        })
                         .unwrap_or("");
                     let last = member
                         .get("lastName")
-                        .and_then(|l| l.get("text").and_then(|v| v.as_str()).or_else(|| l.as_str()))
+                        .and_then(|l| {
+                            l.get("text")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| l.as_str())
+                        })
                         .unwrap_or("");
                     if first.is_empty() && last.is_empty() {
                         None
@@ -1169,6 +1356,240 @@ async fn cmd_profile_viewers(raw_json: bool) -> Result<(), String> {
     }
 
     print_profile_viewers(&value);
+    Ok(())
+}
+
+/// Handle `profile audit [--json]`.
+///
+/// Fetches the authenticated user's full profile and checks for common
+/// staleness signals: missing headline, empty about section, stale
+/// positions (no current role or current role older than 2 years without
+/// updates), missing education, low connection count.
+async fn cmd_profile_audit(raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Get the user's public ID from /me, then fetch full profile.
+    let me = client
+        .get_me()
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    let public_id = me
+        .get("miniProfile")
+        .and_then(|m| m.get("publicIdentifier"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "could not determine your public profile ID".to_string())?;
+
+    let profile = client
+        .get_profile(public_id)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+    let current_year = chrono::Utc::now().year() as u64;
+
+    // Check: headline
+    let headline = profile
+        .get("headline")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if headline.is_empty() {
+        findings.push(serde_json::json!({
+            "field": "headline",
+            "severity": "high",
+            "message": "No headline set. This is the first thing people see."
+        }));
+    }
+
+    // Check: about / summary
+    let summary = profile
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if summary.is_empty() {
+        findings.push(serde_json::json!({
+            "field": "summary",
+            "severity": "medium",
+            "message": "Empty About section. Add a brief professional summary."
+        }));
+    } else if summary.len() < 50 {
+        findings.push(serde_json::json!({
+            "field": "summary",
+            "severity": "low",
+            "message": format!("About section is very short ({} chars). Consider expanding.", summary.len())
+        }));
+    }
+
+    // Check: positions
+    let position_groups = profile
+        .get("profilePositionGroups")
+        .and_then(|p| p.get("elements"))
+        .and_then(|e| e.as_array());
+
+    let mut has_current_role = false;
+    let mut newest_end_year: Option<u64> = None;
+
+    if let Some(groups) = position_groups {
+        for group in groups {
+            if let Some(pos_list) = group
+                .get("profilePositionInPositionGroup")
+                .and_then(|p| p.get("elements"))
+                .and_then(|e| e.as_array())
+            {
+                for pos in pos_list {
+                    let date_range = pos.get("dateRange");
+                    let end_year = date_range
+                        .and_then(|dr| dr.get("end"))
+                        .and_then(|d| d.get("year"))
+                        .and_then(|y| y.as_u64());
+                    let start_year = date_range
+                        .and_then(|dr| dr.get("start"))
+                        .and_then(|d| d.get("year"))
+                        .and_then(|y| y.as_u64());
+
+                    if end_year.is_none() {
+                        has_current_role = true;
+                        // Check if current role started more than 5 years ago without any
+                        // indication of being updated.
+                        if let Some(sy) = start_year {
+                            if current_year.saturating_sub(sy) > 5 {
+                                let title = pos
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("(untitled)");
+                                findings.push(serde_json::json!({
+                                    "field": "positions",
+                                    "severity": "low",
+                                    "message": format!("Current role '{}' started {} years ago. Confirm it's still accurate.", title, current_year - sy)
+                                }));
+                            }
+                        }
+                    }
+
+                    if let Some(ey) = end_year {
+                        newest_end_year =
+                            Some(newest_end_year.map_or(ey, |prev: u64| prev.max(ey)));
+                    }
+                }
+            }
+        }
+
+        if groups.is_empty() {
+            findings.push(serde_json::json!({
+                "field": "positions",
+                "severity": "high",
+                "message": "No positions listed. Add your work experience."
+            }));
+        } else if !has_current_role {
+            let stale_msg = if let Some(ey) = newest_end_year {
+                format!("No current position. Most recent role ended in {}.", ey)
+            } else {
+                "No current position. Your profile may look inactive.".to_string()
+            };
+            findings.push(serde_json::json!({
+                "field": "positions",
+                "severity": "high",
+                "message": stale_msg
+            }));
+        }
+    } else {
+        findings.push(serde_json::json!({
+            "field": "positions",
+            "severity": "high",
+            "message": "No positions listed. Add your work experience."
+        }));
+    }
+
+    // Check: education
+    let edu_list = profile
+        .get("profileEducations")
+        .and_then(|e| e.get("elements"))
+        .and_then(|e| e.as_array());
+    if edu_list.is_none_or(|l| l.is_empty()) {
+        findings.push(serde_json::json!({
+            "field": "education",
+            "severity": "low",
+            "message": "No education listed."
+        }));
+    }
+
+    // Check: connection count
+    let connections = profile
+        .get("networkInfo")
+        .and_then(|n| n.get("connectionsCount").and_then(|v| v.as_u64()))
+        .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()));
+    if let Some(count) = connections {
+        if count < 50 {
+            findings.push(serde_json::json!({
+                "field": "connections",
+                "severity": "low",
+                "message": format!("Only {} connections. Growing your network improves visibility.", count)
+            }));
+        }
+    }
+
+    // Check: location
+    let has_location = profile
+        .get("geoLocation")
+        .and_then(|g| g.get("geo"))
+        .and_then(|g| g.get("defaultLocalizedName"))
+        .and_then(|v| v.as_str())
+        .is_some();
+    if !has_location {
+        findings.push(serde_json::json!({
+            "field": "location",
+            "severity": "low",
+            "message": "No location set. Recruiters and connections filter by location."
+        }));
+    }
+
+    if raw_json {
+        let output = serde_json::json!({
+            "publicId": public_id,
+            "findings": findings,
+            "score": if findings.is_empty() { "complete" } else { "needs_attention" }
+        });
+        let pretty =
+            serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    // Human-readable output.
+    println!("Profile Audit: {}", public_id);
+    println!("===");
+
+    if findings.is_empty() {
+        println!("  All clear. No staleness signals detected.");
+    } else {
+        let high_count = findings.iter().filter(|f| f["severity"] == "high").count();
+        let medium_count = findings
+            .iter()
+            .filter(|f| f["severity"] == "medium")
+            .count();
+        let low_count = findings.iter().filter(|f| f["severity"] == "low").count();
+
+        for finding in &findings {
+            let severity = finding["severity"].as_str().unwrap_or("?");
+            let msg = finding["message"].as_str().unwrap_or("");
+            let marker = match severity {
+                "high" => "!!",
+                "medium" => " !",
+                _ => "  ",
+            };
+            println!("  {} {}", marker, msg);
+        }
+
+        println!();
+        println!(
+            "  {} issue(s): {} high, {} medium, {} low",
+            findings.len(),
+            high_count,
+            medium_count,
+            low_count
+        );
+    }
+
     Ok(())
 }
 
@@ -1438,11 +1859,7 @@ fn print_profile_summary(profile: &serde_json::Value) {
                 .get("memberRelationship")
                 .and_then(|m| m.get("connectionsCount").and_then(|v| v.as_u64()))
         })
-        .or_else(|| {
-            profile
-                .get("connectionsCount")
-                .and_then(|v| v.as_u64())
-        });
+        .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()));
     let followers = profile
         .get("networkInfo")
         .and_then(|n| n.get("followersCount").and_then(|v| v.as_u64()))
@@ -1919,15 +2336,9 @@ async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
                         .get("value")
                         .and_then(|v| v.get("text").and_then(|t| t.as_str()))
                         .or_else(|| el.get("value").and_then(|v| v.as_str()))
-                        .or_else(|| {
-                            el.get("numericValue")
-                                .and_then(|n| n.as_u64())
-                                .map(|_| "")
-                        })
+                        .or_else(|| el.get("numericValue").and_then(|n| n.as_u64()).map(|_| ""))
                         .unwrap_or("");
-                    let numeric = el
-                        .get("numericValue")
-                        .and_then(|v| v.as_u64());
+                    let numeric = el.get("numericValue").and_then(|v| v.as_u64());
                     if !title.is_empty() {
                         if let Some(n) = numeric {
                             println!("  {}: {}", title, n);
@@ -1960,9 +2371,7 @@ async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
                         .get("totalShareStatistics")
                         .and_then(|s| s.get("uniqueImpressionsCount"))
                         .and_then(|v| v.as_u64())
-                        .or_else(|| {
-                            el.get("impressionCount").and_then(|v| v.as_u64())
-                        })
+                        .or_else(|| el.get("impressionCount").and_then(|v| v.as_u64()))
                         .unwrap_or(0);
                     let likes = el
                         .get("totalShareStatistics")
@@ -2003,7 +2412,10 @@ async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
             }
         }
         Err(e) => {
-            eprintln!("Post analytics unavailable (may require Premium/Creator): {}", e);
+            eprintln!(
+                "Post analytics unavailable (may require Premium/Creator): {}",
+                e
+            );
         }
     }
 
@@ -2217,10 +2629,7 @@ async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Re
 /// Fetches connections and finds the best match for the given name
 /// (case-insensitive substring match on first+last name). If multiple
 /// matches are found, lists them and asks the user to be more specific.
-async fn resolve_recipient_by_name(
-    client: &LinkedInClient,
-    name: &str,
-) -> Result<String, String> {
+async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> Result<String, String> {
     let name_lower = name.to_lowercase();
 
     // Search through connections (fetch up to 200 to get a good match).
@@ -2246,14 +2655,8 @@ async fn resolve_recipient_by_name(
                 None => continue,
             };
 
-            let first = mini
-                .get("firstName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let last = mini
-                .get("lastName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
+            let last = mini.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
             let full_name = format!("{} {}", first, last);
             let slug = mini
                 .get("publicIdentifier")
@@ -2266,7 +2669,11 @@ async fn resolve_recipient_by_name(
                 .unwrap_or("");
 
             if full_name.to_lowercase().contains(&name_lower) {
-                matches.push((full_name.trim().to_string(), slug.to_string(), urn.to_string()));
+                matches.push((
+                    full_name.trim().to_string(),
+                    slug.to_string(),
+                    urn.to_string(),
+                ));
             }
         }
 
@@ -2350,11 +2757,19 @@ async fn cmd_messages_reply(
                 .and_then(|m| {
                     let first = m
                         .get("firstName")
-                        .and_then(|f| f.get("text").and_then(|v| v.as_str()).or_else(|| f.as_str()))
+                        .and_then(|f| {
+                            f.get("text")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| f.as_str())
+                        })
                         .unwrap_or("");
                     let last = m
                         .get("lastName")
-                        .and_then(|l| l.get("text").and_then(|v| v.as_str()).or_else(|| l.as_str()))
+                        .and_then(|l| {
+                            l.get("text")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| l.as_str())
+                        })
                         .unwrap_or("");
                     if first.is_empty() && last.is_empty() {
                         None
@@ -2376,7 +2791,9 @@ async fn cmd_messages_reply(
                     if b.is_string() {
                         b.as_str().map(|s| s.to_string())
                     } else {
-                        b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     }
                 })
                 .unwrap_or_default();
@@ -2758,17 +3175,19 @@ async fn cmd_company_followers(
         .await
         .map_err(|e| format!("failed to fetch company: {e}"))?;
 
-    let company_name = company
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(slug);
+    let company_name = company.get("name").and_then(|v| v.as_str()).unwrap_or(slug);
 
     // Extract numeric company ID from entityUrn.
     let company_id = company
         .get("entityUrn")
         .and_then(|v| v.as_str())
         .and_then(|urn| urn.rsplit(':').next())
-        .or_else(|| company.get("companyId").and_then(|v| v.as_u64()).map(|_| ""))
+        .or_else(|| {
+            company
+                .get("companyId")
+                .and_then(|v| v.as_u64())
+                .map(|_| "")
+        })
         .ok_or_else(|| "could not extract company ID from response".to_string())?;
 
     // Try the admin follower endpoints.
@@ -2875,10 +3294,7 @@ async fn cmd_company_followers(
                 if urns.is_empty() {
                     println!("(no first-degree connections follow this page)");
                 } else {
-                    println!(
-                        "{} of your connections follow this page:",
-                        urns.len()
-                    );
+                    println!("{} of your connections follow this page:", urns.len());
                     for (i, urn) in urns.iter().enumerate() {
                         let urn_str = urn.as_str().unwrap_or("");
                         let id = urn_str
@@ -2902,11 +3318,7 @@ fn print_company_summary(company: &serde_json::Value) {
     let name = company
         .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            company
-                .get("localizedName")
-                .and_then(|v| v.as_str())
-        })
+        .or_else(|| company.get("localizedName").and_then(|v| v.as_str()))
         .unwrap_or("(unknown)");
     println!("Company: {}", name);
 
@@ -2968,14 +3380,20 @@ fn print_company_summary(company: &serde_json::Value) {
     }
 
     // Follower count
-    if let Some(followers) = company.get("followingInfo").and_then(|f| {
-        f.get("followerCount").and_then(|v| v.as_u64())
-    }) {
+    if let Some(followers) = company
+        .get("followingInfo")
+        .and_then(|f| f.get("followerCount").and_then(|v| v.as_u64()))
+    {
         println!("Followers: {}", followers);
     }
 
     // Headquarters
-    if let Some(hq) = company.get("headquarter").or_else(|| company.get("confirmedLocations").and_then(|v| v.as_array()).and_then(|arr| arr.first())) {
+    if let Some(hq) = company.get("headquarter").or_else(|| {
+        company
+            .get("confirmedLocations")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+    }) {
         let city = hq.get("city").and_then(|v| v.as_str()).unwrap_or("");
         let country = hq
             .get("country")
@@ -3679,27 +4097,34 @@ fn print_graphql_message(msg: &serde_json::Value) {
 
     // Sender -- try to get the name first, fall back to URN.
     let sender = msg.get("sender");
-    let sender_name = sender
-        .and_then(|s| {
-            // Try member.firstName + lastName via participantType path.
-            s.get("participantType")
-                .and_then(|pt| pt.get("member"))
-                .and_then(|m| {
-                    let first = m
-                        .get("firstName")
-                        .and_then(|f| f.get("text").and_then(|v| v.as_str()).or_else(|| f.as_str()))
-                        .unwrap_or("");
-                    let last = m
-                        .get("lastName")
-                        .and_then(|l| l.get("text").and_then(|v| v.as_str()).or_else(|| l.as_str()))
-                        .unwrap_or("");
-                    if first.is_empty() && last.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} {}", first, last).trim().to_string())
-                    }
-                })
-        });
+    let sender_name = sender.and_then(|s| {
+        // Try member.firstName + lastName via participantType path.
+        s.get("participantType")
+            .and_then(|pt| pt.get("member"))
+            .and_then(|m| {
+                let first = m
+                    .get("firstName")
+                    .and_then(|f| {
+                        f.get("text")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| f.as_str())
+                    })
+                    .unwrap_or("");
+                let last = m
+                    .get("lastName")
+                    .and_then(|l| {
+                        l.get("text")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| l.as_str())
+                    })
+                    .unwrap_or("");
+                if first.is_empty() && last.is_empty() {
+                    None
+                } else {
+                    Some(format!("{} {}", first, last).trim().to_string())
+                }
+            })
+    });
 
     let sender_display = sender_name.unwrap_or_else(|| {
         sender
@@ -3733,22 +4158,15 @@ fn print_graphql_message(msg: &serde_json::Value) {
         .map(|arr| {
             arr.iter()
                 .filter_map(|rc| {
-                    rc.get("externalMedia")
-                        .and_then(|em| {
-                            let title = em
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let url = em
-                                .get("url")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !url.is_empty() {
-                                Some(format!("  [link] {} {}", title, url))
-                            } else {
-                                None
-                            }
-                        })
+                    rc.get("externalMedia").and_then(|em| {
+                        let title = em.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        let url = em.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        if !url.is_empty() {
+                            Some(format!("  [link] {} {}", title, url))
+                        } else {
+                            None
+                        }
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -3823,8 +4241,7 @@ fn feed_cache_path() -> Result<std::path::PathBuf, String> {
 fn save_feed_cache(value: &serde_json::Value) -> Result<(), String> {
     let path = feed_cache_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create cache dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
     }
     let json =
         serde_json::to_string(value).map_err(|e| format!("failed to serialize feed cache: {e}"))?;
@@ -3855,8 +4272,7 @@ fn search_cache_path(kind: &str) -> Result<std::path::PathBuf, String> {
 fn save_search_cache(kind: &str, value: &serde_json::Value) -> Result<(), String> {
     let path = search_cache_path(kind)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create cache dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
     }
     let json = serde_json::to_string(value)
         .map_err(|e| format!("failed to serialize search cache: {e}"))?;
@@ -3874,8 +4290,8 @@ fn load_search_cache(kind: &str) -> Result<serde_json::Value, String> {
 /// Extract the Nth post's activity URN from cached search results.
 fn resolve_search_post_urn(index: usize) -> Result<String, String> {
     let cache = load_search_cache("posts")?;
-    let resp: SearchResponse = serde_json::from_value(cache)
-        .map_err(|e| format!("failed to parse cached search: {e}"))?;
+    let resp: SearchResponse =
+        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
 
     let mut result_idx = 0usize;
     for cluster in &resp.elements {
@@ -3903,9 +4319,7 @@ fn resolve_search_post_urn(index: usize) -> Result<String, String> {
                                 extract_activity_urn(u)
                             }
                         })
-                        .ok_or_else(|| {
-                            format!("search result {} has no activity URN", index)
-                        });
+                        .ok_or_else(|| format!("search result {} has no activity URN", index));
                 }
             }
         }
@@ -3920,8 +4334,8 @@ fn resolve_search_post_urn(index: usize) -> Result<String, String> {
 /// Extract the Nth person's profile slug from cached people search results.
 fn resolve_search_person_slug(index: usize) -> Result<String, String> {
     let cache = load_search_cache("people")?;
-    let resp: SearchResponse = serde_json::from_value(cache)
-        .map_err(|e| format!("failed to parse cached search: {e}"))?;
+    let resp: SearchResponse =
+        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
 
     let mut result_idx = 0usize;
     for cluster in &resp.elements {
@@ -3942,9 +4356,7 @@ fn resolve_search_person_slug(index: usize) -> Result<String, String> {
                             url.strip_prefix("https://www.linkedin.com/in/")
                                 .map(|rest| rest.split('?').next().unwrap_or(rest).to_string())
                         })
-                        .ok_or_else(|| {
-                            format!("search result {} has no profile URL", index)
-                        });
+                        .ok_or_else(|| format!("search result {} has no profile URL", index));
                 }
             }
         }
@@ -4085,10 +4497,7 @@ fn print_feed_item_full(index: usize, item: &serde_json::Value) {
         .unwrap_or(0);
 
     let entity_urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
-    let permalink = item
-        .get("permalink")
-        .and_then(|u| u.as_str())
-        .unwrap_or("");
+    let permalink = item.get("permalink").and_then(|u| u.as_str()).unwrap_or("");
     let activity_urn = extract_activity_urn(entity_urn).unwrap_or_default();
 
     println!("[{}] {}", index, actor_name);
@@ -4101,18 +4510,12 @@ fn print_feed_item_full(index: usize, item: &serde_json::Value) {
     // Reshared post content: LinkedIn puts reshared content in several locations.
     let reshared_update = update
         .get("resharedUpdate")
-        .or_else(|| {
-            update
-                .get("content")
-                .and_then(|c| c.get("resharedUpdate"))
-        })
+        .or_else(|| update.get("content").and_then(|c| c.get("resharedUpdate")))
         .or_else(|| {
             // Also check inside the UpdateV2 union value
             update
                 .get("content")
-                .and_then(|c| {
-                    c.get("com.linkedin.voyager.feed.render.UpdateV2")
-                })
+                .and_then(|c| c.get("com.linkedin.voyager.feed.render.UpdateV2"))
         });
     if let Some(reshared) = reshared_update {
         let orig_author = reshared
@@ -4190,13 +4593,15 @@ fn extract_article_info(update: &serde_json::Value) -> Option<ArticleInfo> {
     // Try articleComponent first (most common for shared articles).
     if let Some(article) = content
         .get("articleComponent")
-        .or_else(|| {
-            content.get("com.linkedin.voyager.feed.render.ArticleComponent")
-        })
+        .or_else(|| content.get("com.linkedin.voyager.feed.render.ArticleComponent"))
     {
         let title = article
             .get("title")
-            .and_then(|t| t.get("text").and_then(|v| v.as_str()).or_else(|| t.as_str()))
+            .and_then(|t| {
+                t.get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| t.as_str())
+            })
             .unwrap_or("")
             .to_string();
         let url = article
@@ -4244,12 +4649,27 @@ fn extract_media_type_label(update: &serde_json::Value) -> String {
     // Check for specific component types (Rest.li union keys or direct fields).
     let type_checks: &[(&str, &str)] = &[
         ("com.linkedin.voyager.feed.render.ImageComponent", "image"),
-        ("com.linkedin.voyager.feed.render.LinkedInVideoComponent", "video"),
-        ("com.linkedin.voyager.feed.render.DocumentComponent", "document"),
+        (
+            "com.linkedin.voyager.feed.render.LinkedInVideoComponent",
+            "video",
+        ),
+        (
+            "com.linkedin.voyager.feed.render.DocumentComponent",
+            "document",
+        ),
         ("com.linkedin.voyager.feed.render.PollComponent", "poll"),
-        ("com.linkedin.voyager.feed.render.ArticleComponent", "article"),
-        ("com.linkedin.voyager.feed.render.CelebrationComponent", "celebration"),
-        ("com.linkedin.voyager.feed.render.CarouselComponent", "carousel"),
+        (
+            "com.linkedin.voyager.feed.render.ArticleComponent",
+            "article",
+        ),
+        (
+            "com.linkedin.voyager.feed.render.CelebrationComponent",
+            "celebration",
+        ),
+        (
+            "com.linkedin.voyager.feed.render.CarouselComponent",
+            "carousel",
+        ),
         ("imageComponent", "image"),
         ("videoComponent", "video"),
         ("documentComponent", "document"),
@@ -4341,17 +4761,11 @@ fn extract_media_urls(update: &serde_json::Value) -> Vec<String> {
             }
         }
         // Try thumbnail/poster.
-        if let Some(poster) = vid
-            .get("thumbnail")
-            .and_then(|t| {
-                t.get("url")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        t.get("rootUrl")
-                            .and_then(|v| v.as_str())
-                    })
-            })
-        {
+        if let Some(poster) = vid.get("thumbnail").and_then(|t| {
+            t.get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| t.get("rootUrl").and_then(|v| v.as_str()))
+        }) {
             if urls.is_empty() {
                 urls.push(format!("(thumbnail) {}", poster));
             }
@@ -4443,8 +4857,8 @@ async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Result<(
     }
 
     let cache = load_feed_cache()?;
-    let feed: FeedResponse = serde_json::from_value(cache)
-        .map_err(|e| format!("failed to parse cached feed: {e}"))?;
+    let feed: FeedResponse =
+        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached feed: {e}"))?;
 
     let element = feed.elements.get(index - 1).ok_or_else(|| {
         format!(
@@ -4510,11 +4924,11 @@ async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Result<(
         let text = comment
             .get("commentary")
             .and_then(|c| {
-                c.get("text")
-                    .and_then(|t| {
-                        // Could be a string directly or a nested {text: "..."} object
-                        t.as_str().or_else(|| t.get("text").and_then(|v| v.as_str()))
-                    })
+                c.get("text").and_then(|t| {
+                    // Could be a string directly or a nested {text: "..."} object
+                    t.as_str()
+                        .or_else(|| t.get("text").and_then(|v| v.as_str()))
+                })
             })
             .unwrap_or("");
 
@@ -4606,11 +5020,7 @@ async fn cmd_search_posts(
 /// Handle `search react <index> [--type LIKE] [--json]`.
 ///
 /// Reacts to a post from cached search results.
-async fn cmd_search_react(
-    index: usize,
-    reaction_type: &str,
-    raw_json: bool,
-) -> Result<(), String> {
+async fn cmd_search_react(index: usize, reaction_type: &str, raw_json: bool) -> Result<(), String> {
     if index == 0 {
         return Err("index must be >= 1".to_string());
     }
@@ -4714,10 +5124,7 @@ fn print_search_content(index: usize, sfu: &serde_json::Value) {
         })
         .unwrap_or_default();
 
-    let permalink = sfu
-        .get("permalink")
-        .and_then(|p| p.as_str())
-        .unwrap_or("");
+    let permalink = sfu.get("permalink").and_then(|p| p.as_str()).unwrap_or("");
 
     println!("[{}] {}", index, actor_name);
     if !commentary_display.is_empty() {
