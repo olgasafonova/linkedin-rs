@@ -14,7 +14,7 @@ url = "2"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
-rand = "0.9"
+rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
 iana-time-zone = "0.1"
 tokio = { version = "1", features = ["sync", "time"] }

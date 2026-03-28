@@ -1920,7 +1920,7 @@ fn restli_encode_string(s: &str) -> String {
 /// 3. Format as 19-digit zero-padded decimal
 /// 4. Prefix with `"ajax:"`
 fn generate_jsessionid() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let raw: i64 = rng.random();
     let value = if raw == i64::MIN {
