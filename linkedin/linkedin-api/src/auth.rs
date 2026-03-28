@@ -116,6 +116,43 @@ impl Session {
     pub fn is_valid(&self) -> bool {
         !self.li_at.trim().is_empty()
     }
+
+    /// Returns how long ago this session was created.
+    pub fn age(&self) -> chrono::Duration {
+        Utc::now().signed_duration_since(self.created_at)
+    }
+
+    /// Heuristic check for likely expiry.
+    ///
+    /// LinkedIn `li_at` cookies typically expire after ~1 year, but can be
+    /// invalidated earlier by password changes, security events, or server-side
+    /// rotation. Sessions older than 30 days are flagged as potentially stale.
+    ///
+    /// Returns `None` if the session looks fresh, or a warning message if it
+    /// may be expired.
+    pub fn expiry_warning(&self) -> Option<String> {
+        let age = self.age();
+        let days = age.num_days();
+
+        if days > 365 {
+            Some(format!(
+                "Session is {} days old and almost certainly expired. Run `auth login` to refresh.",
+                days
+            ))
+        } else if days > 90 {
+            Some(format!(
+                "Session is {} days old and may be expired. Consider running `auth status` to verify.",
+                days
+            ))
+        } else if days > 30 {
+            Some(format!(
+                "Session is {} days old. If you see auth errors, run `auth login` to refresh.",
+                days
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,12 +1,57 @@
 use std::fs;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{
     ConnectionsResponse, FeedResponse, NotificationCardsResponse, Paging, SearchResponse,
 };
+
+/// Exit codes for structured error reporting.
+///
+/// Scripts can check `$?` to distinguish error types:
+/// - 0: success
+/// - 1: general/unknown error
+/// - 2: authentication error (expired session, invalid cookie)
+/// - 3: API error (rate limited, server error, bad response)
+/// - 4: input error (invalid arguments, missing required flags)
+mod exit_code {
+    pub const AUTH: i32 = 2;
+    pub const API: i32 = 3;
+    pub const INPUT: i32 = 4;
+}
+
+/// Classify an error string into an exit code.
+///
+/// Inspects the error message for known patterns to determine the
+/// appropriate exit code.
+fn classify_error(msg: &str) -> i32 {
+    if msg.contains("session")
+        || msg.contains("auth")
+        || msg.contains("li_at")
+        || msg.contains("401")
+        || msg.contains("not logged in")
+    {
+        exit_code::AUTH
+    } else if msg.contains("API")
+        || msg.contains("HTTP")
+        || msg.contains("429")
+        || msg.contains("500")
+        || msg.contains("failed to send")
+    {
+        exit_code::API
+    } else if msg.contains("index must be")
+        || msg.contains("invalid")
+        || msg.contains("must not be empty")
+        || msg.contains("out of range")
+        || msg.contains("not confirmed")
+    {
+        exit_code::INPUT
+    } else {
+        1
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "linkedin-cli")]
@@ -57,6 +102,12 @@ enum Commands {
     Notifications {
         #[command(subcommand)]
         action: NotificationsAction,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -236,13 +287,17 @@ enum ProfileAction {
 enum ConnectionsAction {
     /// List connections
     List {
-        /// Number of connections to fetch (default: 10)
+        /// Number of connections to fetch per page (default: 10)
         #[arg(long, default_value = "10")]
         count: u32,
 
         /// Pagination offset (default: 0)
         #[arg(long, default_value = "0")]
         start: u32,
+
+        /// Fetch all connections (auto-paginate with built-in throttling)
+        #[arg(long)]
+        all: bool,
 
         /// Filter by name or headline (case-insensitive substring match)
         #[arg(long)]
@@ -460,99 +515,57 @@ enum MessagesAction {
     },
 }
 
+/// Run a command and exit with a classified error code on failure.
+fn exit_on_err(result: Result<(), String>) {
+    if let Err(e) = result {
+        let code = classify_error(&e);
+        eprintln!("error: {e}");
+        process::exit(code);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Auth { action } => match action {
-            AuthAction::Login { li_at } => {
-                if let Err(e) = cmd_auth_login(li_at).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
-            AuthAction::Status { local } => {
-                if let Err(e) = cmd_auth_status(local).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
-            AuthAction::Logout => {
-                if let Err(e) = cmd_auth_logout() {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            AuthAction::Login { li_at } => exit_on_err(cmd_auth_login(li_at).await),
+            AuthAction::Status { local } => exit_on_err(cmd_auth_status(local).await),
+            AuthAction::Logout => exit_on_err(cmd_auth_logout()),
         },
         Commands::Profile { action } => match action {
-            ProfileAction::Me { json } => {
-                if let Err(e) = cmd_profile_me(json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            ProfileAction::Me { json } => exit_on_err(cmd_profile_me(json).await),
             ProfileAction::View { public_id, json } => {
-                if let Err(e) = cmd_profile_view(&public_id, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_profile_view(&public_id, json).await)
             }
             ProfileAction::Visit { public_id, json } => {
-                if let Err(e) = cmd_profile_visit(&public_id, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_profile_visit(&public_id, json).await)
             }
-            ProfileAction::Viewers { json } => {
-                if let Err(e) = cmd_profile_viewers(json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            ProfileAction::Viewers { json } => exit_on_err(cmd_profile_viewers(json).await),
         },
         Commands::Messages { action } => match action {
             MessagesAction::List {
                 count,
                 before,
                 json,
-            } => {
-                if let Err(e) = cmd_messages_list(count, before, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_messages_list(count, before, json).await),
             MessagesAction::Read {
                 conversation_id,
                 before,
                 json,
-            } => {
-                if let Err(e) = cmd_messages_read(&conversation_id, before, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_messages_read(&conversation_id, before, json).await),
             MessagesAction::Send {
                 recipient,
                 message,
                 json,
-            } => {
-                if let Err(e) = cmd_messages_send(&recipient, &message, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_messages_send(&recipient, &message, json).await),
             MessagesAction::Reply {
                 conversation_id,
                 message,
                 yes,
                 json,
-            } => {
-                if let Err(e) = cmd_messages_reply(&conversation_id, &message, yes, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_messages_reply(&conversation_id, &message, yes, json).await),
         },
         Commands::Feed { action } => match action {
             FeedAction::List {
@@ -561,115 +574,62 @@ async fn main() {
                 author,
                 keyword,
                 json,
-            } => {
-                if let Err(e) =
-                    cmd_feed_list(start, count, author.as_deref(), keyword.as_deref(), json).await
-                {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(
+                cmd_feed_list(start, count, author.as_deref(), keyword.as_deref(), json).await,
+            ),
             FeedAction::Comments { index, count, json } => {
-                if let Err(e) = cmd_feed_comments(index, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_feed_comments(index, count, json).await)
             }
-            FeedAction::Read { index, json } => {
-                if let Err(e) = cmd_feed_read(index, json) {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            FeedAction::Read { index, json } => exit_on_err(cmd_feed_read(index, json)),
             FeedAction::React {
                 post_urn,
                 reaction_type,
                 json,
-            } => {
-                if let Err(e) = cmd_feed_react(&post_urn, &reaction_type, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_feed_react(&post_urn, &reaction_type, json).await),
             FeedAction::Unreact {
                 post_urn,
                 reaction_type,
                 json,
-            } => {
-                if let Err(e) = cmd_feed_unreact(&post_urn, &reaction_type, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_feed_unreact(&post_urn, &reaction_type, json).await),
             FeedAction::Comment {
                 post_urn,
                 text,
                 yes,
                 json,
-            } => {
-                if let Err(e) = cmd_feed_comment(&post_urn, &text, yes, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
-            FeedAction::Stats { json } => {
-                if let Err(e) = cmd_feed_stats(json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_feed_comment(&post_urn, &text, yes, json).await),
+            FeedAction::Stats { json } => exit_on_err(cmd_feed_stats(json).await),
             FeedAction::Post {
                 text,
                 visibility,
                 yes,
                 json,
-            } => {
-                if let Err(e) = cmd_feed_post(&text, &visibility, yes, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_feed_post(&text, &visibility, yes, json).await),
         },
         Commands::Connections { action } => match action {
             ConnectionsAction::List {
                 count,
                 start,
+                all,
                 keyword,
                 json,
-            } => {
-                if let Err(e) = cmd_connections_list(start, count, keyword.as_deref(), json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(
+                cmd_connections_list(start, count, all, keyword.as_deref(), json).await,
+            ),
             ConnectionsAction::Invite {
                 public_id_or_urn,
                 message,
                 json,
-            } => {
-                if let Err(e) =
-                    cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await
-                {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(
+                cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await,
+            ),
             ConnectionsAction::Invitations { count, start, json } => {
-                if let Err(e) = cmd_connections_invitations(start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_connections_invitations(start, count, json).await)
             }
             ConnectionsAction::Accept {
                 invitation_id,
                 secret,
                 json,
-            } => {
-                if let Err(e) = cmd_connections_accept(&invitation_id, &secret, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_connections_accept(&invitation_id, &secret, json).await),
         },
         Commands::Search { action } => match action {
             SearchAction::People {
@@ -677,62 +637,44 @@ async fn main() {
                 count,
                 start,
                 json,
-            } => {
-                if let Err(e) = cmd_search_people(&keywords, start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_search_people(&keywords, start, count, json).await),
             SearchAction::Jobs {
                 keywords,
                 count,
                 start,
                 json,
-            } => {
-                if let Err(e) = cmd_search_jobs(&keywords, start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_search_jobs(&keywords, start, count, json).await),
             SearchAction::Posts {
                 keywords,
                 count,
                 start,
                 json,
-            } => {
-                if let Err(e) = cmd_search_posts(&keywords, start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_search_posts(&keywords, start, count, json).await),
         },
         Commands::Company { action } => match action {
             CompanyAction::View { slug, json } => {
-                if let Err(e) = cmd_company_view(&slug, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_company_view(&slug, json).await)
             }
             CompanyAction::Followers {
                 slug,
                 count,
                 start,
                 json,
-            } => {
-                if let Err(e) = cmd_company_followers(&slug, start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
+            } => exit_on_err(cmd_company_followers(&slug, start, count, json).await),
         },
         Commands::Notifications { action } => match action {
             NotificationsAction::List { count, start, json } => {
-                if let Err(e) = cmd_notifications_list(start, count, json).await {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
+                exit_on_err(cmd_notifications_list(start, count, json).await)
             }
         },
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "linkedin-cli",
+                &mut std::io::stdout(),
+            );
+        }
     }
 }
 
@@ -2095,10 +2037,15 @@ async fn cmd_messages_reply(
 async fn cmd_connections_list(
     start: u32,
     count: u32,
+    fetch_all: bool,
     keyword_filter: Option<&str>,
     raw_json: bool,
 ) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
+
+    if fetch_all {
+        return cmd_connections_list_all(&client, keyword_filter, raw_json).await;
+    }
 
     let value = client
         .get_connections(start, count)
@@ -2158,6 +2105,107 @@ async fn cmd_connections_list(
 
     if shown == 0 {
         println!("(no matching connections)");
+    }
+
+    Ok(())
+}
+
+/// Fetch all connections with auto-pagination.
+///
+/// Pages through the connections endpoint in batches of 40, printing
+/// each connection as it arrives. The client's built-in rate limiter
+/// handles throttling between requests.
+async fn cmd_connections_list_all(
+    client: &LinkedInClient,
+    keyword_filter: Option<&str>,
+    raw_json: bool,
+) -> Result<(), String> {
+    let page_size = 40u32;
+    let mut offset = 0u32;
+    let mut total_shown = 0usize;
+    let mut all_elements: Vec<serde_json::Value> = Vec::new();
+    let kw_lower = keyword_filter.map(|s| s.to_lowercase());
+
+    loop {
+        let value = client
+            .get_connections(offset, page_size)
+            .await
+            .map_err(|e| format!("API call failed: {e}"))?;
+
+        let resp: ConnectionsResponse = serde_json::from_value(value.clone())
+            .map_err(|e| format!("failed to parse connections response: {e}"))?;
+
+        if raw_json {
+            all_elements.extend(resp.elements.clone());
+        } else {
+            if offset == 0 {
+                let total = resp
+                    .paging
+                    .as_ref()
+                    .and_then(|p| p.total)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("Fetching all connections (total: {})...", total);
+                if let Some(kw) = keyword_filter {
+                    println!("  filter: \"{}\"", kw);
+                }
+                println!("---");
+            }
+
+            for element in &resp.elements {
+                let idx = offset as usize + total_shown + 1;
+
+                if let Some(ref kw) = kw_lower {
+                    let mini = element.get("miniProfile");
+                    let first = mini
+                        .and_then(|m| m.get("firstName").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let last = mini
+                        .and_then(|m| m.get("lastName").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let headline = mini
+                        .and_then(|m| m.get("occupation").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let searchable = format!("{} {} {}", first, last, headline).to_lowercase();
+                    if !searchable.contains(kw) {
+                        continue;
+                    }
+                }
+
+                total_shown += 1;
+                print_connection(idx, element);
+                println!();
+            }
+        }
+
+        let page_count = resp.elements.len() as u32;
+        if page_count < page_size {
+            break; // Last page.
+        }
+
+        // Check if we've fetched everything.
+        if let Some(total) = resp.paging.as_ref().and_then(|p| p.total) {
+            if offset + page_count >= total {
+                break;
+            }
+        }
+
+        offset += page_count;
+        eprintln!("  fetched {}...", offset);
+    }
+
+    if raw_json {
+        let combined = serde_json::json!({
+            "elements": all_elements,
+            "total": all_elements.len(),
+        });
+        let pretty = serde_json::to_string_pretty(&combined)
+            .map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else if total_shown == 0 {
+        println!("(no matching connections)");
+    } else {
+        eprintln!("Total: {} connections", total_shown);
     }
 
     Ok(())
@@ -3052,6 +3100,9 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
 }
 
 /// Load the stored session or return a descriptive error.
+///
+/// Checks for session validity and prints a warning to stderr if the
+/// session is old enough to be potentially expired.
 fn load_session() -> Result<(Session, std::path::PathBuf), String> {
     let path = Session::default_path().map_err(|e| format!("{e}"))?;
 
@@ -3066,6 +3117,11 @@ fn load_session() -> Result<(Session, std::path::PathBuf), String> {
 
     if !session.is_valid() {
         return Err("session is invalid (empty li_at cookie)".to_string());
+    }
+
+    // Warn about potentially expired sessions.
+    if let Some(warning) = session.expiry_warning() {
+        eprintln!("warning: {}", warning);
     }
 
     Ok((session, path))

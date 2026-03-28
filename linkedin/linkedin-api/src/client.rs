@@ -11,11 +11,11 @@
 //! `re/restli_protocol.md`, `re/auth_flow.md`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::auth::Session;
 use crate::error::Error;
@@ -28,6 +28,10 @@ const BASE_BACKOFF_MS: u64 = 1000;
 
 /// Maximum backoff delay cap (milliseconds).
 const MAX_BACKOFF_MS: u64 = 30_000;
+
+/// Default minimum interval between API requests (milliseconds).
+/// 1 request per second keeps well under LinkedIn's rate limits.
+const DEFAULT_MIN_REQUEST_INTERVAL_MS: u64 = 1000;
 
 /// Base URL for all LinkedIn API requests. There is no separate API subdomain;
 /// all API calls go to `www.linkedin.com` with path-based routing.
@@ -83,6 +87,13 @@ pub struct LinkedInClient {
     /// from the `/me` endpoint on first use. Avoids redundant `/me` calls
     /// when multiple messaging methods need the user's profile URN.
     profile_urn: OnceCell<String>,
+
+    /// Timestamp of the last API request, used for rate limiting.
+    /// Protected by a mutex to allow concurrent-safe updates.
+    last_request: Mutex<Instant>,
+
+    /// Minimum interval between requests (milliseconds).
+    min_request_interval: Duration,
 }
 
 impl LinkedInClient {
@@ -231,7 +242,20 @@ impl LinkedInClient {
             device_id: device_id.to_string(),
             x_li_track,
             profile_urn: OnceCell::new(),
+            last_request: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            min_request_interval: Duration::from_millis(DEFAULT_MIN_REQUEST_INTERVAL_MS),
         })
+    }
+
+    /// Wait until the minimum interval since the last request has elapsed.
+    /// This prevents hammering LinkedIn's API and triggering rate limits.
+    async fn throttle(&self) {
+        let mut last = self.last_request.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < self.min_request_interval {
+            tokio::time::sleep(self.min_request_interval - elapsed).await;
+        }
+        *last = Instant::now();
     }
 
     /// Send a GET request to a Voyager API endpoint with automatic retry.
@@ -247,6 +271,7 @@ impl LinkedInClient {
         let url = format!("{}{}{}", BASE_URL, API_PREFIX, path);
         let mut attempt = 0u32;
         loop {
+            self.throttle().await;
             let resp = self
                 .http
                 .get(&url)
@@ -276,6 +301,7 @@ impl LinkedInClient {
         let url = format!("{}{}{}", BASE_URL, API_PREFIX, path);
         let mut attempt = 0u32;
         loop {
+            self.throttle().await;
             let resp = self
                 .http
                 .post(&url)
