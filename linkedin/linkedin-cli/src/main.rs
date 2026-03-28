@@ -114,6 +114,15 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Who do you know at a company? Network overlap in one command.
+    Who {
+        /// Company URL slug (e.g. "miro" from linkedin.com/company/miro)
+        company: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -724,6 +733,7 @@ async fn main() {
             }
         },
         Commands::Inbox { json, all } => exit_on_err(cmd_inbox(json, all).await),
+        Commands::Who { company, json } => exit_on_err(cmd_who(&company, json).await),
         Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -1105,6 +1115,332 @@ async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
         if unread_notifs.len() > 5 {
             println!("  ... and {} more", unread_notifs.len() - 5);
         }
+    }
+
+    Ok(())
+}
+
+/// Handle `who <company> [--json]`.
+///
+/// Shows your network overlap with a company: connections who work there,
+/// profile viewers from there, recent messages with people there, and
+/// key people at the company.
+async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // 1. Fetch company info.
+    eprintln!("Looking up {}...", company_slug);
+    let company = client
+        .get_company(company_slug)
+        .await
+        .map_err(|e| format!("company lookup failed: {e}"))?;
+
+    let company_name = company
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(company_slug);
+    let hq = company
+        .get("headquarter")
+        .and_then(|h| h.get("city"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let hq_country = company
+        .get("headquarter")
+        .and_then(|h| h.get("country"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let staff = company
+        .get("staffCount")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let industry = company
+        .get("companyIndustries")
+        .and_then(|arr| arr.as_array())
+        .and_then(|a| a.first())
+        .and_then(|i| i.get("localizedName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tagline = company
+        .get("tagline")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Build search terms: company name and common variants.
+    let name_lower = company_name.to_lowercase();
+
+    // 2. Scan connections (all pages) for people at this company.
+    eprintln!("Scanning connections...");
+    let mut my_connections: Vec<(String, String, String)> = Vec::new(); // (name, headline, public_id)
+    let page_size = 40u32;
+    let mut offset = 0u32;
+    loop {
+        let value = client
+            .get_connections(offset, page_size)
+            .await
+            .map_err(|e| format!("connections fetch failed: {e}"))?;
+        let resp: ConnectionsResponse =
+            serde_json::from_value(value).map_err(|e| format!("parse error: {e}"))?;
+
+        for element in &resp.elements {
+            let mini = element.get("miniProfile");
+            let first = mini
+                .and_then(|m| m.get("firstName").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let last = mini
+                .and_then(|m| m.get("lastName").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let headline = mini
+                .and_then(|m| m.get("occupation").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let pub_id = mini
+                .and_then(|m| m.get("publicIdentifier").and_then(|v| v.as_str()))
+                .unwrap_or("");
+
+            if headline.to_lowercase().contains(&name_lower)
+                || headline
+                    .to_lowercase()
+                    .contains(&company_slug.to_lowercase())
+            {
+                my_connections.push((
+                    format!("{} {}", first, last).trim().to_string(),
+                    headline.to_string(),
+                    pub_id.to_string(),
+                ));
+            }
+        }
+
+        let page_count = resp.elements.len() as u32;
+        if page_count < page_size {
+            break;
+        }
+        if let Some(total) = resp.paging.as_ref().and_then(|p| p.total) {
+            if offset + page_count >= total {
+                break;
+            }
+        }
+        offset += page_count;
+    }
+
+    // 3. Check profile viewers for anyone at this company.
+    eprintln!("Checking profile viewers...");
+    let mut viewers_at_company: Vec<(String, String)> = Vec::new(); // (name, headline)
+    if let Ok(viewers_data) = client.get_profile_viewers().await {
+        let viewers_str = serde_json::to_string(&viewers_data).unwrap_or_default();
+        // Quick scan: if company name appears anywhere in the viewers response,
+        // extract the individual viewer cards.
+        if viewers_str.to_lowercase().contains(&name_lower) {
+            if let Some(elements) = viewers_data.get("elements").and_then(|e| e.as_array()) {
+                for el in elements {
+                    let el_str = serde_json::to_string(el).unwrap_or_default();
+                    if el_str.to_lowercase().contains(&name_lower) {
+                        // Try to extract name and headline from the deeply nested structure.
+                        let name = el
+                            .pointer("/value/com.linkedin.voyager.identity.me.WvmpViewersCard/insightCards")
+                            .and_then(|cards| cards.as_array())
+                            .and_then(|arr| arr.iter().find(|c| {
+                                serde_json::to_string(c).unwrap_or_default().to_lowercase().contains(&name_lower)
+                            }))
+                            .and_then(|card| {
+                                // Extract from card text
+                                card.pointer("/value/com.linkedin.voyager.identity.me.WvmpSummaryInsightCard/cards")
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|arr| arr.iter().find(|c| {
+                                        serde_json::to_string(c).unwrap_or_default().to_lowercase().contains(&name_lower)
+                                    }))
+                            });
+                        if name.is_some() {
+                            viewers_at_company.push((
+                                "(viewer from company)".to_string(),
+                                company_name.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Check recent messages for conversations with people at this company.
+    eprintln!("Checking messages...");
+    let mut messages_from_company: Vec<(String, String, String)> = Vec::new(); // (name, last_msg, conv_id)
+    if let Ok(conversations) = client.get_conversations(20, None).await {
+        if let Some(elements) = conversations.get("elements").and_then(|e| e.as_array()) {
+            for conv in elements {
+                let conv_str = serde_json::to_string(conv).unwrap_or_default();
+                if conv_str.to_lowercase().contains(&name_lower) {
+                    let names = extract_conversation_names(conv);
+                    let display = names.join(", ");
+                    let last_msg = conv
+                        .get("messages")
+                        .and_then(|m| m.get("elements"))
+                        .and_then(|e| e.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|msg| {
+                            msg.get("body").and_then(|b| {
+                                if b.is_string() {
+                                    b.as_str().map(|s| s.to_string())
+                                } else {
+                                    b.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| s.to_string())
+                                }
+                            })
+                        })
+                        .unwrap_or_default();
+                    let conv_id = conv
+                        .get("backendUrn")
+                        .and_then(|u| u.as_str())
+                        .and_then(|u| u.strip_prefix("urn:li:messagingThread:"))
+                        .unwrap_or("")
+                        .to_string();
+                    messages_from_company.push((display, last_msg, conv_id));
+                }
+            }
+        }
+    }
+
+    // 5. Search for notable people at the company.
+    eprintln!("Searching people at {}...", company_name);
+    let search_results = client
+        .search_people(company_name, 0, 5)
+        .await
+        .unwrap_or_default();
+    let mut notable_people: Vec<(String, String, String, String)> = Vec::new(); // (name, headline, degree, pub_id)
+    if let Some(elements) = search_results.get("elements").and_then(|e| e.as_array()) {
+        for el in elements {
+            if let Some(items) = el.get("items").and_then(|i| i.as_array()) {
+                for item in items {
+                    let er = item
+                        .pointer("/item/entityResult")
+                        .unwrap_or(&serde_json::Value::Null);
+                    let title = er
+                        .get("title")
+                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let headline = er
+                        .get("primarySubtitle")
+                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let badge = er
+                        .get("badgeText")
+                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let nav_url = er
+                        .get("navigationUrl")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let pub_id = nav_url
+                        .strip_prefix("https://www.linkedin.com/in/")
+                        .and_then(|s| s.split('?').next())
+                        .unwrap_or("");
+
+                    // Only include people whose headline mentions the company.
+                    if headline.to_lowercase().contains(&name_lower)
+                        || headline
+                            .to_lowercase()
+                            .contains(&company_slug.to_lowercase())
+                    {
+                        notable_people.push((
+                            title.to_string(),
+                            headline.to_string(),
+                            badge.to_string(),
+                            pub_id.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Output ---
+
+    if raw_json {
+        let output = serde_json::json!({
+            "company": {
+                "name": company_name,
+                "slug": company_slug,
+                "hq": format!("{}, {}", hq, hq_country),
+                "staff": staff,
+                "industry": industry,
+            },
+            "connections": my_connections.iter().map(|(n, h, p)| serde_json::json!({"name": n, "headline": h, "publicId": p})).collect::<Vec<_>>(),
+            "viewers": viewers_at_company.iter().map(|(n, h)| serde_json::json!({"name": n, "headline": h})).collect::<Vec<_>>(),
+            "messages": messages_from_company.iter().map(|(n, m, c)| serde_json::json!({"name": n, "lastMessage": m, "conversationId": c})).collect::<Vec<_>>(),
+            "people": notable_people.iter().map(|(n, h, d, p)| serde_json::json!({"name": n, "headline": h, "degree": d, "publicId": p})).collect::<Vec<_>>(),
+        });
+        let pretty =
+            serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    // Header.
+    println!("{}", company_name);
+    let mut meta = Vec::new();
+    if !hq.is_empty() {
+        if !hq_country.is_empty() {
+            meta.push(format!("{}, {}", hq, hq_country));
+        } else {
+            meta.push(hq.to_string());
+        }
+    }
+    if staff > 0 {
+        meta.push(format!("{} employees", staff));
+    }
+    if !industry.is_empty() {
+        meta.push(industry.to_string());
+    }
+    if !meta.is_empty() {
+        println!("  {}", meta.join("  |  "));
+    }
+    if !tagline.is_empty() {
+        println!("  \"{}\"", truncate_with_ellipsis(tagline, 80));
+    }
+    println!();
+
+    // Connections.
+    println!("Your connections there: {}", my_connections.len());
+    if !my_connections.is_empty() {
+        for (name, headline, pub_id) in &my_connections {
+            println!("  {} ({})", name, pub_id);
+            println!("    {}", truncate_with_ellipsis(headline, 80));
+        }
+    }
+    println!();
+
+    // Profile viewers.
+    if !viewers_at_company.is_empty() {
+        println!(
+            "Recent profile viewers from {}: {}",
+            company_name,
+            viewers_at_company.len()
+        );
+        for (name, headline) in &viewers_at_company {
+            println!("  {} — {}", name, headline);
+        }
+        println!();
+    }
+
+    // Messages.
+    if !messages_from_company.is_empty() {
+        println!("Recent messages:");
+        for (name, last_msg, conv_id) in &messages_from_company {
+            println!("  {}", name);
+            println!("    \"{}\"", truncate_with_ellipsis(last_msg, 80));
+            println!("    read: messages read {}", conv_id);
+        }
+        println!();
+    }
+
+    // Notable people (from search).
+    if !notable_people.is_empty() {
+        println!("People at {} (from search):", company_name);
+        for (name, headline, degree, pub_id) in &notable_people {
+            println!("  {} {} ({})", name, degree, pub_id);
+            println!("    {}", truncate_with_ellipsis(headline, 80));
+        }
+    } else {
+        println!("No people found at {} in search.", company_name);
     }
 
     Ok(())
