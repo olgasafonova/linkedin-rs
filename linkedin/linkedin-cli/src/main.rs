@@ -187,6 +187,15 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// Fetch and display a single post by activity URN
+    View {
+        /// Activity URN (urn:li:activity:1234...) or just the numeric ID
+        activity_urn: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// React to a post (like, celebrate, etc.)
     React {
         /// Post/activity URN or 1-based index from last `feed list`
@@ -621,6 +630,9 @@ async fn main() {
                 exit_on_err(cmd_feed_comments(index, count, json).await)
             }
             FeedAction::Read { index, json } => exit_on_err(cmd_feed_read(index, json)),
+            FeedAction::View { activity_urn, json } => {
+                exit_on_err(cmd_feed_view(&activity_urn, json).await)
+            }
             FeedAction::React {
                 post_urn,
                 reaction_type,
@@ -4465,6 +4477,28 @@ fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
     }
 
     print_feed_item_full(index, element);
+    Ok(())
+}
+
+/// Handle `feed view <activity_urn> [--json]`.
+///
+/// Fetches a single post by activity URN from the API and displays it.
+async fn cmd_feed_view(activity_urn: &str, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    let post = client
+        .get_post(activity_urn)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&post).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    print_feed_item_full(0, &post);
     Ok(())
 }
 

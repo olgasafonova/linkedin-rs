@@ -464,6 +464,50 @@ impl LinkedInClient {
         self.get(&path).await
     }
 
+    /// Fetch a single feed update by activity URN.
+    ///
+    /// Accepts either a full URN (`urn:li:activity:1234567890`) or just the
+    /// numeric activity ID (`1234567890`). Uses the feed/updates finder with
+    /// `q=feedUpdate` and the activity URN wrapped in a `feedUpdate` key.
+    /// Fetch a single feed update by activity URN.
+    ///
+    /// Accepts either a full URN (`urn:li:activity:1234567890`) or just the
+    /// numeric activity ID (`1234567890`). Uses the socialDetail endpoint
+    /// for basic post data, and the feed/updates finder for full rendering.
+    pub async fn get_post(&self, activity_urn: &str) -> Result<Value, Error> {
+        let urn = if activity_urn.starts_with("urn:li:activity:") {
+            activity_urn.to_string()
+        } else {
+            format!("urn:li:activity:{}", activity_urn)
+        };
+
+        // LinkedIn's Voyager API doesn't expose a simple single-post REST
+        // endpoint. Scan the recent feed for a matching activity URN.
+        // TODO: RE the actual web client endpoint (chrome-recon task).
+        let activity_id = urn
+            .strip_prefix("urn:li:activity:")
+            .unwrap_or(&urn);
+        let feed = self.get("feed/updates?q=findFeed&start=0&count=50").await?;
+        if let Some(elements) = feed.get("elements").and_then(|e| e.as_array()) {
+            for element in elements {
+                // Match on the activity ID portion, since the feed uses various
+                // URN prefixes (V2, V2&FOLLOW_FEED, SU&V2, etc.).
+                let element_str = serde_json::to_string(element).unwrap_or_default();
+                if element_str.contains(activity_id) {
+                    return Ok(element.clone());
+                }
+            }
+        }
+        Err(Error::Api {
+            status: 404,
+            body: format!(
+                "post {} not found in recent feed (50 items scanned). \
+                 The post may be older or from outside your network.",
+                urn
+            ),
+        })
+    }
+
     /// Fetch a user's full profile by public identifier (vanity URL slug).
     ///
     /// Uses the Voyager GraphQL endpoint with the `identityDashProfilesByMemberIdentity`
