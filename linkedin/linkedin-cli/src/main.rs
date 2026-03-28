@@ -103,6 +103,12 @@ enum Commands {
         #[command(subcommand)]
         action: NotificationsAction,
     },
+    /// Daily inbox: unread messages, pending invitations, recent notifications
+    Inbox {
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -403,6 +409,28 @@ enum SearchAction {
         #[arg(long)]
         json: bool,
     },
+    /// React to a post from the last search results
+    React {
+        /// 1-based index from the most recent `search posts` results
+        index: usize,
+
+        /// Reaction type: LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION
+        #[arg(long = "type", default_value = "LIKE")]
+        reaction_type: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// View a profile from the last people search results
+    View {
+        /// 1-based index from the most recent `search people` results
+        index: usize,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -650,6 +678,14 @@ async fn main() {
                 start,
                 json,
             } => exit_on_err(cmd_search_posts(&keywords, start, count, json).await),
+            SearchAction::React {
+                index,
+                reaction_type,
+                json,
+            } => exit_on_err(cmd_search_react(index, &reaction_type, json).await),
+            SearchAction::View { index, json } => {
+                exit_on_err(cmd_search_view(index, json).await)
+            }
         },
         Commands::Company { action } => match action {
             CompanyAction::View { slug, json } => {
@@ -667,6 +703,7 @@ async fn main() {
                 exit_on_err(cmd_notifications_list(start, count, json).await)
             }
         },
+        Commands::Inbox { json } => exit_on_err(cmd_inbox(json).await),
         Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -676,6 +713,244 @@ async fn main() {
             );
         }
     }
+}
+
+/// Handle `inbox [--json]`.
+///
+/// Shows a daily summary: unread messages, pending invitations, and
+/// recent unread notifications in one view.
+async fn cmd_inbox(raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Fetch all three in sequence (rate limiter handles throttling).
+    let conversations = client
+        .get_conversations(10, None)
+        .await
+        .map_err(|e| format!("failed to fetch messages: {e}"))?;
+    let invitations = client
+        .get_invitations(0, 10)
+        .await
+        .map_err(|e| format!("failed to fetch invitations: {e}"))?;
+    let notifications = client
+        .get_notifications(0, 10)
+        .await
+        .map_err(|e| format!("failed to fetch notifications: {e}"))?;
+
+    if raw_json {
+        let combined = serde_json::json!({
+            "unreadMessages": conversations,
+            "pendingInvitations": invitations,
+            "recentNotifications": notifications,
+        });
+        let pretty = serde_json::to_string_pretty(&combined)
+            .map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    // --- Unread messages ---
+    let conv_elements = conversations
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    let unread: Vec<&serde_json::Value> = conv_elements
+        .iter()
+        .filter(|c| {
+            c.get("read").and_then(|r| r.as_bool()) == Some(false)
+                || c.get("unreadCount")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0)
+                    > 0
+        })
+        .collect();
+
+    println!("Unread Messages ({})", unread.len());
+    println!("---");
+    if unread.is_empty() {
+        println!("  (all caught up)");
+    } else {
+        for (i, conv) in unread.iter().enumerate() {
+            let title = conv.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let names = extract_conversation_names(conv);
+            let display = if !title.is_empty() {
+                title.to_string()
+            } else if !names.is_empty() {
+                names.join(", ")
+            } else {
+                "(unknown)".to_string()
+            };
+
+            let backend_urn = conv
+                .get("backendUrn")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            let conv_id = backend_urn
+                .strip_prefix("urn:li:messagingThread:")
+                .unwrap_or(backend_urn);
+
+            let last_msg = conv
+                .get("messages")
+                .and_then(|m| m.get("elements"))
+                .and_then(|e| e.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|msg| {
+                    msg.get("body").and_then(|b| {
+                        if b.is_string() {
+                            b.as_str().map(|s| s.to_string())
+                        } else {
+                            b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        }
+                    })
+                })
+                .unwrap_or_default();
+
+            let unread_count = conv
+                .get("unreadCount")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(1);
+
+            println!("  [{}] {} ({} unread)", i + 1, display, unread_count);
+            if !last_msg.is_empty() {
+                println!("      {}", truncate_with_ellipsis(&last_msg, 80));
+            }
+            println!("      read: messages read {}", conv_id);
+        }
+    }
+    println!();
+
+    // --- Pending invitations ---
+    let inv_elements = invitations
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    println!("Pending Invitations ({})", inv_elements.len());
+    println!("---");
+    if inv_elements.is_empty() {
+        println!("  (none)");
+    } else {
+        for (i, inv) in inv_elements.iter().enumerate() {
+            let name = inv
+                .get("title")
+                .and_then(|t| t.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let headline = inv
+                .get("subtitle")
+                .and_then(|t| t.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sent_time = inv
+                .get("sentTimeLabel")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let invitation_id = inv
+                .get("invitation")
+                .and_then(|i| i.get("entityUrn"))
+                .and_then(|v| v.as_str())
+                .and_then(|u| u.rsplit(':').next())
+                .unwrap_or("");
+            let secret = inv
+                .get("invitation")
+                .and_then(|i| i.get("sharedSecret"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            print!("  [{}] {}", i + 1, name);
+            if !sent_time.is_empty() {
+                print!("  ({})", sent_time);
+            }
+            println!();
+            if !headline.is_empty() {
+                println!("      {}", truncate_with_ellipsis(headline, 60));
+            }
+            if !invitation_id.is_empty() {
+                println!(
+                    "      accept: connections accept {} --secret \"{}\"",
+                    invitation_id, secret
+                );
+            }
+        }
+    }
+    println!();
+
+    // --- Recent notifications (unread only) ---
+    let notif_elements = notifications
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    let unread_notifs: Vec<&serde_json::Value> = notif_elements
+        .iter()
+        .filter(|n| n.get("read").and_then(|r| r.as_bool()) == Some(false))
+        .collect();
+
+    println!("Unread Notifications ({})", unread_notifs.len());
+    println!("---");
+    if unread_notifs.is_empty() {
+        println!("  (all read)");
+    } else {
+        for (i, notif) in unread_notifs.iter().take(5).enumerate() {
+            let headline = notif
+                .get("headline")
+                .and_then(|h| h.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("(no headline)");
+            let kicker = notif
+                .get("kicker")
+                .and_then(|k| k.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("");
+
+            print!("  [{}] {}", i + 1, truncate_with_ellipsis(headline, 80));
+            if !kicker.is_empty() {
+                print!("  ({})", kicker);
+            }
+            println!();
+        }
+        if unread_notifs.len() > 5 {
+            println!("  ... and {} more", unread_notifs.len() - 5);
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract participant names from a conversation element.
+fn extract_conversation_names(conv: &serde_json::Value) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(participants) = conv
+        .get("conversationParticipants")
+        .and_then(|p| p.as_array())
+    {
+        for p in participants {
+            if let Some(name) = p
+                .get("participantType")
+                .and_then(|pt| pt.get("member"))
+                .and_then(|member| {
+                    let first = member
+                        .get("firstName")
+                        .and_then(|f| f.get("text").and_then(|v| v.as_str()).or_else(|| f.as_str()))
+                        .unwrap_or("");
+                    let last = member
+                        .get("lastName")
+                        .and_then(|l| l.get("text").and_then(|v| v.as_str()).or_else(|| l.as_str()))
+                        .unwrap_or("");
+                    if first.is_empty() && last.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{} {}", first, last).trim().to_string())
+                    }
+                })
+            {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Handle `auth login --li-at <value>`.
@@ -1896,15 +2171,20 @@ async fn cmd_messages_read(
 async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
-    // Resolve public identifier to fsd_profile URN.
-    // The recipient can be either a public_id (vanity URL slug) or a direct
-    // fsd_profile URN like "urn:li:fsd_profile:ACoAABivN...".
+    // Resolve recipient to fsd_profile URN. Accepts:
+    // - Direct URN: urn:li:fsd_profile:ACoAABivN...
+    // - Vanity slug: john-doe-123
+    // - Name with spaces: "Paul Bang" (fuzzy-matched against connections)
     let profile_urn = if recipient.starts_with("urn:li:fsd_profile:")
         || recipient.starts_with("urn:li:member:")
         || recipient.starts_with("urn:li:fs_miniProfile:")
     {
         eprintln!("Using provided URN directly.");
         recipient.to_string()
+    } else if recipient.contains(' ') {
+        // Name-based lookup: search connections for a match.
+        eprintln!("Searching connections for '{}'...", recipient);
+        resolve_recipient_by_name(&client, recipient).await?
     } else {
         eprintln!("Resolving profile URN for '{}'...", recipient);
         client
@@ -1930,6 +2210,106 @@ async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Re
     }
 
     Ok(())
+}
+
+/// Resolve a recipient name to a profile URN by searching connections.
+///
+/// Fetches connections and finds the best match for the given name
+/// (case-insensitive substring match on first+last name). If multiple
+/// matches are found, lists them and asks the user to be more specific.
+async fn resolve_recipient_by_name(
+    client: &LinkedInClient,
+    name: &str,
+) -> Result<String, String> {
+    let name_lower = name.to_lowercase();
+
+    // Search through connections (fetch up to 200 to get a good match).
+    let mut offset = 0u32;
+    let page_size = 40u32;
+    let mut matches: Vec<(String, String, String)> = Vec::new(); // (name, slug, urn)
+
+    loop {
+        let value = client
+            .get_connections(offset, page_size)
+            .await
+            .map_err(|e| format!("failed to fetch connections: {e}"))?;
+
+        let elements = value
+            .get("elements")
+            .and_then(|e| e.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+
+        for conn in elements {
+            let mini = match conn.get("miniProfile") {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let first = mini
+                .get("firstName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let last = mini
+                .get("lastName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let full_name = format!("{} {}", first, last);
+            let slug = mini
+                .get("publicIdentifier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let urn = mini
+                .get("dashEntityUrn")
+                .or_else(|| mini.get("entityUrn"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if full_name.to_lowercase().contains(&name_lower) {
+                matches.push((full_name.trim().to_string(), slug.to_string(), urn.to_string()));
+            }
+        }
+
+        let page_count = elements.len() as u32;
+        if page_count < page_size || offset + page_count >= 200 {
+            break;
+        }
+        offset += page_count;
+    }
+
+    match matches.len() {
+        0 => Err(format!(
+            "no connection found matching '{}'. Try a vanity slug instead.",
+            name
+        )),
+        1 => {
+            let (matched_name, slug, urn) = &matches[0];
+            eprintln!("Matched: {} ({})", matched_name, slug);
+            let profile_urn = if !urn.is_empty() {
+                // Convert fs_miniProfile URN to fsd_profile if needed.
+                urn.replace("fs_miniProfile", "fsd_profile")
+            } else if !slug.is_empty() {
+                client
+                    .resolve_profile_urn(slug)
+                    .await
+                    .map_err(|e| format!("failed to resolve profile: {e}"))?
+            } else {
+                return Err("matched connection has no URN or slug".to_string());
+            };
+            Ok(profile_urn)
+        }
+        _ => {
+            eprintln!("Multiple matches for '{}':", name);
+            for (i, (n, s, _)) in matches.iter().enumerate() {
+                eprintln!("  [{}] {} ({})", i + 1, n, s);
+            }
+            Err(format!(
+                "ambiguous name '{}': {} matches found. Use a more specific name or the vanity slug.",
+                name,
+                matches.len()
+            ))
+        }
+    }
 }
 
 /// Handle `messages reply <conversation_id> <message> [--yes] [--json]`.
@@ -2767,6 +3147,11 @@ async fn cmd_search_people(
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
+    // Cache results for index-based profile view.
+    if let Err(e) = save_search_cache("people", &value) {
+        eprintln!("warning: failed to cache search results: {e}");
+    }
+
     if raw_json {
         let pretty =
             serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
@@ -3455,6 +3840,122 @@ fn load_feed_cache() -> Result<serde_json::Value, String> {
     serde_json::from_str(&data).map_err(|e| format!("failed to parse feed cache: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Search cache utilities
+// ---------------------------------------------------------------------------
+
+fn search_cache_path(kind: &str) -> Result<std::path::PathBuf, String> {
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| "could not determine data directory".to_string())?;
+    Ok(data_dir
+        .join("linkedin")
+        .join(format!("last_search_{}.json", kind)))
+}
+
+fn save_search_cache(kind: &str, value: &serde_json::Value) -> Result<(), String> {
+    let path = search_cache_path(kind)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create cache dir: {e}"))?;
+    }
+    let json = serde_json::to_string(value)
+        .map_err(|e| format!("failed to serialize search cache: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("failed to write search cache: {e}"))?;
+    Ok(())
+}
+
+fn load_search_cache(kind: &str) -> Result<serde_json::Value, String> {
+    let path = search_cache_path(kind)?;
+    let data = std::fs::read_to_string(&path)
+        .map_err(|_| format!("no cached {} search. Run `search {}` first.", kind, kind))?;
+    serde_json::from_str(&data).map_err(|e| format!("failed to parse search cache: {e}"))
+}
+
+/// Extract the Nth post's activity URN from cached search results.
+fn resolve_search_post_urn(index: usize) -> Result<String, String> {
+    let cache = load_search_cache("posts")?;
+    let resp: SearchResponse = serde_json::from_value(cache)
+        .map_err(|e| format!("failed to parse cached search: {e}"))?;
+
+    let mut result_idx = 0usize;
+    for cluster in &resp.elements {
+        let items = cluster
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for item_wrapper in items {
+            let sfu = item_wrapper
+                .get("item")
+                .and_then(|i| i.get("searchFeedUpdate"));
+            if let Some(sfu) = sfu {
+                result_idx += 1;
+                if result_idx == index {
+                    let update = sfu.get("update").unwrap_or(sfu);
+                    return update
+                        .get("metadata")
+                        .and_then(|m| m.get("backendUrn"))
+                        .and_then(|u| u.as_str())
+                        .and_then(|u| {
+                            if u.starts_with("urn:li:activity:") {
+                                Some(u.to_string())
+                            } else {
+                                extract_activity_urn(u)
+                            }
+                        })
+                        .ok_or_else(|| {
+                            format!("search result {} has no activity URN", index)
+                        });
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "index {} out of range (search has {} results)",
+        index, result_idx
+    ))
+}
+
+/// Extract the Nth person's profile slug from cached people search results.
+fn resolve_search_person_slug(index: usize) -> Result<String, String> {
+    let cache = load_search_cache("people")?;
+    let resp: SearchResponse = serde_json::from_value(cache)
+        .map_err(|e| format!("failed to parse cached search: {e}"))?;
+
+    let mut result_idx = 0usize;
+    for cluster in &resp.elements {
+        let items = cluster
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for item_wrapper in items {
+            let entity = item_wrapper.get("item").and_then(|i| i.get("entityResult"));
+            if let Some(entity) = entity {
+                result_idx += 1;
+                if result_idx == index {
+                    return entity
+                        .get("navigationUrl")
+                        .and_then(|v| v.as_str())
+                        .and_then(|url| {
+                            url.strip_prefix("https://www.linkedin.com/in/")
+                                .map(|rest| rest.split('?').next().unwrap_or(rest).to_string())
+                        })
+                        .ok_or_else(|| {
+                            format!("search result {} has no profile URL", index)
+                        });
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "index {} out of range (search has {} results)",
+        index, result_idx
+    ))
+}
+
 /// Extract the inner `urn:li:activity:XXXXX` from a feed element's entityUrn.
 ///
 /// Feed entityUrns have formats like:
@@ -4053,6 +4554,11 @@ async fn cmd_search_posts(
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
+    // Cache results for index-based react/comment.
+    if let Err(e) = save_search_cache("posts", &value) {
+        eprintln!("warning: failed to cache search results: {e}");
+    }
+
     if raw_json {
         let pretty =
             serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
@@ -4095,6 +4601,52 @@ async fn cmd_search_posts(
     }
 
     Ok(())
+}
+
+/// Handle `search react <index> [--type LIKE] [--json]`.
+///
+/// Reacts to a post from cached search results.
+async fn cmd_search_react(
+    index: usize,
+    reaction_type: &str,
+    raw_json: bool,
+) -> Result<(), String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+
+    let activity_urn = resolve_search_post_urn(index)?;
+    let rt_upper = reaction_type.to_uppercase();
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Reacting to {} with {}...", activity_urn, rt_upper);
+    let result = client
+        .react_to_post(&activity_urn, &rt_upper)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Reacted with {} to search result [{}]", rt_upper, index);
+    }
+
+    Ok(())
+}
+
+/// Handle `search view <index> [--json]`.
+///
+/// Views a profile from cached people search results.
+async fn cmd_search_view(index: usize, raw_json: bool) -> Result<(), String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+
+    let slug = resolve_search_person_slug(index)?;
+    eprintln!("Loading profile '{}'...", slug);
+    cmd_profile_view(&slug, raw_json).await
 }
 
 /// Print a human-readable summary of a content search result.
