@@ -48,7 +48,7 @@ The CLI exposes 30+ subcommands across 8 domains:
 ### Connections
 | Command | Description |
 |---------|-------------|
-| `connections list` | List connections with `--keyword` filter |
+| `connections list` | List connections with `--keyword` filter and `--all` auto-pagination |
 | `connections invite <id>` | Send a connection request |
 | `connections invitations` | Pending received invitations |
 | `connections accept <id>` | Accept an invitation |
@@ -71,6 +71,11 @@ The CLI exposes 30+ subcommands across 8 domains:
 |---------|-------------|
 | `notifications list` | List notification cards |
 
+### Utilities
+| Command | Description |
+|---------|-------------|
+| `completions bash\|zsh\|fish` | Generate shell completions |
+
 All list commands support `--count`, `--start` (or `--before`), and `--json`. Write commands require `--yes`.
 
 ## What's New
@@ -89,7 +94,17 @@ Features added in this fork:
 
 **Post analytics** -- `feed stats` fetches views, impressions, and engagement via `identity/socialUpdateAnalytics`.
 
-**Rate limiting** -- Automatic retry with exponential backoff (1s, 2s, 4s) on HTTP 429 and 5xx errors. Respects `Retry-After` headers. Max 3 retries on all API calls.
+**Rate limiting** -- Automatic retry with exponential backoff (1s, 2s, 4s) on HTTP 429 and 5xx errors. Respects `Retry-After` headers. Max 3 retries. Proactive throttling at 1 req/sec to stay under LinkedIn's rate limits.
+
+**Auto-pagination** -- `connections list --all` fetches every connection with built-in throttling. Supports `--keyword` filter during pagination and `--json` for bulk export.
+
+**Session lifecycle** -- Detects stale sessions (30/90/365 day thresholds) and warns before API calls. No more silent 401 surprises.
+
+**Structured exit codes** -- Scripts can check `$?`: 0=success, 2=auth error, 3=API error, 4=input error.
+
+**Shell completions** -- `linkedin-cli completions bash|zsh|fish` for tab completion.
+
+**CI pipeline** -- GitHub Actions runs build, test, clippy, format check, and PII scan on every push.
 
 ## Installation
 
@@ -196,7 +211,11 @@ Core types:
 - **Rest.li 2.0** -- LinkedIn's custom REST framework with `X-RestLi-Protocol-Version: 2.0.0`, parenthesized record encoding, and `elements`/`paging` response wrappers.
 - **GraphQL (Dash)** -- Newer endpoints using hardcoded `queryId` values from the decompiled APK.
 
-**Retry**: Exponential backoff on 429/5xx with `Retry-After` header support. GET and POST requests retry automatically up to 3 times.
+**Resilience**: Two layers of protection against rate limits:
+1. Proactive throttle (1 req/sec minimum interval between API calls)
+2. Reactive retry (exponential backoff on 429/5xx, `Retry-After` header support, max 3 retries)
+
+**Session management**: Sessions track creation time. The CLI warns at 30/90/365 day thresholds so you re-authenticate before getting silent 401s.
 
 **Headers**: Every request includes Android app headers (`User-Agent`, `X-Li-Track`, `X-UDID`, `X-Li-Lang`, CSRF token) matching a Google Pixel 8 on Android 14.
 
@@ -204,7 +223,7 @@ Core types:
 
 - **TLS fingerprint**: Uses rustls, not BoringSSL. LinkedIn may detect the difference. See `re/tls_configuration.md`.
 - **Query ID brittleness**: GraphQL `queryId` values are extracted from the APK and may break with app updates.
-- **Write operations**: Posts, comments, messages hit LinkedIn's live systems. May trigger CAPTCHA or rate limiting.
+- **Write operations**: Posts, comments, messages hit LinkedIn's live systems. May trigger CAPTCHA challenges beyond what the retry logic handles.
 - **No real-time messaging**: Request/response only. LinkedIn's long-poll/SSE system is documented in `re/` but not implemented.
 
 ## Security
