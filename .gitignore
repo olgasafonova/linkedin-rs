@@ -15,3 +15,5 @@ linkedin/target/
 secrets/
 docs/superpowers/plans/
 CLAUDE.md
+backlog/
+.claude/
