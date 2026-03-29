@@ -28,4 +28,4 @@ e2e: build test lint fmt-check
 
 # Run the CLI with arguments
 run *ARGS:
-    cargo run --manifest-path {{MANIFEST}} --bin linkedin-cli -- {{ARGS}}
+    cargo run --manifest-path {{MANIFEST}} --bin li -- {{ARGS}}

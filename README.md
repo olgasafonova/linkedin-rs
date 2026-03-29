@@ -3,13 +3,13 @@
 Check your inbox, reply to messages, browse your feed, react to posts, look up companies, message people by name. No browser needed.
 
 ```bash
-linkedin-cli inbox                                    # morning check
-linkedin-cli feed list --author "Satya" --count 20    # filtered feed
-linkedin-cli feed read 3                              # full post + media
-linkedin-cli feed react 3 --type CELEBRATION           # react by index
-linkedin-cli messages send "Jane Doe" "coffee next week?"   # send by name
-linkedin-cli search posts "AI engineering"             # search + links
-linkedin-cli search react 2                            # like result #2
+li inbox                                    # morning check
+li feed list --author "Satya" --count 20    # filtered feed
+li feed read 3                              # full post + media
+li feed react 3 --type CELEBRATION           # react by index
+li messages send "Jane Doe" "coffee next week?"   # send by name
+li search posts "AI engineering"             # search + links
+li search react 2                            # like result #2
 ```
 
 Built in Rust. Reverse-engineered from the LinkedIn Android app. For personal and educational use only.
@@ -23,15 +23,15 @@ Built in Rust. Reverse-engineered from the LinkedIn Android app. For personal an
 #    (linkedin.com > F12 > Application > Cookies > li_at)
 
 # 2. Authenticate
-linkedin-cli auth login --li-at "AQEDAQx..."
+li auth login --li-at "AQEDAQx..."
 
 # 3. Go
-linkedin-cli inbox
+li inbox
 ```
 
 **About the cookie:** This CLI piggybacks on your browser session via the `li_at` cookie. It's not a stable API key; LinkedIn can expire or invalidate it at any time (password change, security event, or just because). When it stops working, grab a fresh cookie from your browser. The CLI warns you when your session is getting old.
 
-Requires Rust 1.75+. Install with `cargo install --path linkedin/linkedin-cli`.
+Requires Rust 1.75+. Install with `cargo install --path linkedin/li`.
 
 ## What You Can Do
 
@@ -97,7 +97,7 @@ Built-in resilience: 1 req/sec throttle to stay under rate limits, exponential b
 ```bash
 cd linkedin
 cargo build --release
-cargo install --path linkedin-cli
+cargo install --path li
 ```
 
 ### Nix
@@ -124,7 +124,7 @@ Your `li_at` cookie is stored at `~/.local/share/linkedin/session.json` with 060
 ```
 linkedin/
   linkedin-api/     Rust library (client, auth, models)
-  linkedin-cli/     Rust binary (clap CLI)
+  li/     Rust binary (clap CLI)
 re/                 Reverse engineering docs
 secrets/            Tokens and captured responses (gitignored)
 ```

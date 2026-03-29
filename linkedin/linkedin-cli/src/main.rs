@@ -55,8 +55,8 @@ fn classify_error(msg: &str) -> i32 {
 }
 
 #[derive(Parser)]
-#[command(name = "linkedin-cli")]
-#[command(about = "CLI for LinkedIn API", version)]
+#[command(name = "li")]
+#[command(about = "LinkedIn in the terminal", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -735,12 +735,7 @@ async fn main() {
         Commands::Inbox { json, all } => exit_on_err(cmd_inbox(json, all).await),
         Commands::Who { company, json } => exit_on_err(cmd_who(&company, json).await),
         Commands::Completions { shell } => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "linkedin-cli",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(shell, &mut Cli::command(), "li", &mut std::io::stdout());
         }
     }
 }
