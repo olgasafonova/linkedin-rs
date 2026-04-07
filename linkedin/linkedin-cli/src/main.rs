@@ -250,7 +250,47 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
-    /// Show analytics for your recent posts (views, impressions)
+    /// List your own posts with engagement analytics
+    ///
+    /// Shows your recent posts with impressions, reactions, comments, and
+    /// shares. Data comes from LinkedIn's content analytics ("Me" tab).
+    MyPosts {
+        /// Number of posts to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show who reacted to a specific post
+    ///
+    /// Lists reactor names, headlines, and reaction types (like, celebrate,
+    /// love, insightful, support, funny) for a given post.
+    Reactions {
+        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
+        post_urn: String,
+
+        /// Number of reactions to fetch (default: 50)
+        #[arg(long, default_value = "50")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show aggregate engagement stats across your recent posts
+    ///
+    /// Fetches your last 20 posts and computes totals and averages for
+    /// views, reactions, comments, and reposts.
     Stats {
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -658,6 +698,15 @@ async fn main() {
                 yes,
                 json,
             } => exit_on_err(cmd_feed_comment(&post_urn, &text, yes, json).await),
+            FeedAction::MyPosts { count, start, json } => {
+                exit_on_err(cmd_feed_my_posts(start, count, json).await)
+            }
+            FeedAction::Reactions {
+                post_urn,
+                count,
+                start,
+                json,
+            } => exit_on_err(cmd_feed_reactions(&post_urn, start, count, json).await),
             FeedAction::Stats { json } => exit_on_err(cmd_feed_stats(json).await),
             FeedAction::Post {
                 text,
@@ -2558,6 +2607,237 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         print!("    ");
     }
     println!("likes: {}  comments: {}", likes, comments);
+}
+
+/// Handle `feed my-posts [--start N] [--count N] [--json]`.
+///
+/// Fetches the authenticated user's own posts with engagement metrics.
+/// Uses `identity/profileUpdatesV2?q=memberShareFeed` which returns
+/// standard UpdateV2 records with full social detail.
+async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    let value = client
+        .get_my_posts(start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    let feed: FeedResponse = serde_json::from_value(value.clone())
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    if let Some(ref paging) = feed.paging {
+        print_paging_header("My posts", paging);
+    }
+    println!("---");
+
+    if feed.elements.is_empty() {
+        println!("(no posts found)");
+        return Ok(());
+    }
+
+    for (i, element) in feed.elements.iter().enumerate() {
+        let idx = start as usize + i + 1;
+        print_my_post(idx, element);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Print a human-readable summary of one of the user's own posts.
+///
+/// Same UpdateV2 format as general feed items, but we also show view count
+/// since it's available for own posts.
+fn print_my_post(index: usize, item: &serde_json::Value) {
+    let update = item
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(item);
+
+    // Commentary text.
+    let commentary = update
+        .get("commentary")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+
+    let commentary_display = truncate_with_ellipsis(commentary, 120);
+
+    // Activity URN -- extract from the composite entityUrn.
+    // The profileUpdatesV2 response uses MEMBER_SHARES context, so we need to
+    // trim at the first comma to get just the activity URN.
+    let entity_urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
+    let activity_urn = extract_activity_urn(entity_urn)
+        .map(|u| u.split(',').next().unwrap_or(&u).to_string())
+        .unwrap_or_default();
+
+    // Social counts.
+    let social = update
+        .get("socialDetail")
+        .and_then(|s| s.get("totalSocialActivityCounts"));
+
+    let likes = social
+        .and_then(|c| c.get("numLikes"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let comments = social
+        .and_then(|c| c.get("numComments"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let shares = social
+        .and_then(|c| c.get("numShares"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let views = social
+        .and_then(|c| c.get("numViews"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+
+    // Timestamp from actor subDescription (e.g. "3d • ").
+    let time_desc = update
+        .get("actor")
+        .and_then(|a| a.get("subDescription"))
+        .and_then(|s| s.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches("• \u{a0}\u{a0}")
+        .trim_end_matches("•")
+        .trim();
+
+    println!("[{}] {}", index, if !activity_urn.is_empty() { &activity_urn } else { entity_urn });
+    if !time_desc.is_empty() {
+        println!("    posted: {}", time_desc);
+    }
+    if !commentary_display.is_empty() {
+        println!("    {}", commentary_display);
+    }
+    println!(
+        "    views: {}  reactions: {}  comments: {}  reposts: {}",
+        views, likes, comments, shares
+    );
+
+    // Reaction type breakdown (if available).
+    if let Some(rtc) = social.and_then(|c| c.get("reactionTypeCounts")).and_then(|r| r.as_array())
+    {
+        if !rtc.is_empty() {
+            let parts: Vec<String> = rtc
+                .iter()
+                .filter_map(|r| {
+                    let rtype = r.get("reactionType").and_then(|t| t.as_str())?;
+                    let count = r.get("count").and_then(|c| c.as_u64())?;
+                    Some(format!("{}: {}", reaction_emoji(rtype), count))
+                })
+                .collect();
+            println!("    {}", parts.join("  "));
+        }
+    }
+}
+
+/// Map reaction type strings to compact display labels.
+fn reaction_emoji(reaction_type: &str) -> &str {
+    match reaction_type {
+        "LIKE" => "like",
+        "PRAISE" | "CELEBRATION" => "celebrate",
+        "EMPATHY" => "love",
+        "INTEREST" | "CURIOSITY" => "insightful",
+        "APPRECIATION" => "support",
+        "ENTERTAINMENT" => "funny",
+        _ => reaction_type,
+    }
+}
+
+/// Handle `feed reactions <post_urn> [--start N] [--count N] [--json]`.
+///
+/// Fetches and displays the list of people who reacted to a specific post.
+async fn cmd_feed_reactions(
+    post_urn: &str,
+    start: u32,
+    count: u32,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    // Normalize: accept bare activity IDs or full URNs.
+    let urn = if post_urn.starts_with("urn:li:") {
+        post_urn.to_string()
+    } else {
+        format!("urn:li:activity:{}", post_urn)
+    };
+
+    let value = client
+        .get_post_reactions(&urn, start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    let elements = value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let total = value
+        .get("paging")
+        .and_then(|p| p.get("total"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0);
+
+    println!("Reactions on {} ({} total)", urn, total);
+    println!("---");
+
+    if elements.is_empty() {
+        println!("(no reactions)");
+        return Ok(());
+    }
+
+    for element in &elements {
+        let lockup = element.get("reactorLockup").unwrap_or(element);
+        let name = lockup
+            .get("title")
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("(unknown)");
+        let subtitle = lockup
+            .get("subtitle")
+            .and_then(|s| s.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        let rtype = element
+            .get("reactionType")
+            .and_then(|r| r.as_str())
+            .unwrap_or("?");
+
+        let subtitle_display = truncate_with_ellipsis(subtitle, 60);
+
+        println!(
+            "  {:12} {} {}",
+            reaction_emoji(rtype),
+            name,
+            if subtitle_display.is_empty() {
+                String::new()
+            } else {
+                format!("- {}", subtitle_display)
+            }
+        );
+    }
+
+    Ok(())
 }
 
 /// Handle `feed react <post_urn> [--type LIKE] [--json]`.

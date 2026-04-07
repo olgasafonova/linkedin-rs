@@ -1413,6 +1413,59 @@ impl LinkedInClient {
         self.get("identity/wvmpCards").await
     }
 
+    /// Fetch the authenticated user's own posts with engagement metrics.
+    ///
+    /// Uses `identity/profileUpdatesV2?q=memberShareFeed` which returns the
+    /// user's posts as standard `UpdateV2` records with full social detail
+    /// (likes, comments, shares, views).
+    ///
+    /// The endpoint requires the user's `fsd_profile` URN, which is fetched
+    /// automatically from the `/me` endpoint on first call.
+    ///
+    /// # Parameters
+    /// - `start`: 0-based pagination offset.
+    /// - `count`: Number of posts per page.
+    /// Fetch the list of reactors for a specific post.
+    ///
+    /// Returns a paginated list of people who reacted to the post, including
+    /// their name, headline, and reaction type (LIKE, PRAISE, EMPATHY, etc.).
+    ///
+    /// Uses the GraphQL finder `socialDashReactionsByReactionType` on the
+    /// `voyagerSocialDashReactions` Dash endpoint.
+    ///
+    /// # Parameters
+    /// - `activity_urn`: The activity URN (e.g. `urn:li:activity:7447...`).
+    /// - `start`: 0-based pagination offset.
+    /// - `count`: Number of reactions per page.
+    pub async fn get_post_reactions(
+        &self,
+        activity_urn: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        let encoded_urn = restli_encode_string(activity_urn);
+        let params = format!(
+            "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
+            count, start, encoded_urn
+        );
+        let result = self.graphql_get(&params).await?;
+        unwrap_graphql(&result, "socialDashReactionsByReactionType")
+    }
+
+    pub async fn get_my_posts(
+        &self,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        let profile_urn = self.my_profile_urn().await?;
+        let encoded_urn = restli_encode_string(profile_urn);
+        let path = format!(
+            "identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
+            encoded_urn, start, count
+        );
+        self.get(&path).await
+    }
+
     /// Create a new text-only post (share) on the authenticated user's feed.
     ///
     /// Uses the Dash GraphQL CREATE mutation `createContentcreationDashShares`

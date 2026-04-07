@@ -171,6 +171,68 @@ The SDUI payload uses a protobuf-like structure with `ReactionType_LIKE`
 (prefixed) and nested `threadUrnActivityThreadUrn`. This is the web-specific
 transport; the Android app uses the Voyager GraphQL endpoint directly.
 
+## List Reactions (Finder)
+
+The finder query `socialDashReactionsByReactionType` returns a paginated list of
+reactors for a given post. Discovered via web client network capture (April 2026).
+
+```
+GET /voyager/api/graphql?variables=(count:50,start:0,threadUrn:urn%3Ali%3Aactivity%3A7447168805107032064)&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b
+```
+
+### Query ID
+
+| Operation | Key in hashMap | Query ID |
+|-----------|---------------|----------|
+| List reactions | `socialDashReactionsByReactionType` | `voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b` |
+
+### Variables
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `threadUrn` | URN | Activity URN of the post (Rest.li-encoded) |
+| `start` | int | 0-based pagination offset |
+| `count` | int | Page size |
+
+### Response (HTTP 200)
+
+The response is wrapped in the standard GraphQL envelope: `data.socialDashReactionsByReactionType`.
+
+```json
+{
+  "data": {
+    "socialDashReactionsByReactionType": {
+      "elements": [
+        {
+          "reactionType": "EMPATHY",
+          "reactorLockup": {
+            "title": { "text": "Kirill Petrovsky" },
+            "subtitle": { "text": "Director of Product and AI | ..." },
+            "navigationContext": {
+              "actionTarget": "https://www.linkedin.com/in/kirill-petrovsky-123"
+            }
+          }
+        }
+      ],
+      "paging": {
+        "count": 50,
+        "start": 0,
+        "total": 40
+      }
+    }
+  }
+}
+```
+
+### Key Observations
+
+- Returns reactor name, headline, and profile link via the `reactorLockup` structure.
+- The `total` in paging accurately reflects the total reaction count.
+- Results include all reaction types mixed together (not filtered by type).
+- Company pages appear as reactors too (e.g. "SkillCheck - 60 followers").
+- The queryId hash (`41ebf31a9f4c4a84e35a49d5abc9010b`) was captured from the web
+  client — it's different from the mutation hashes found in the Android APK.
+
 ## CLI Usage
 
 ```bash
@@ -185,4 +247,13 @@ linkedin-cli feed unreact urn:li:activity:7442172982820524035
 
 # Remove a specific reaction type
 linkedin-cli feed unreact urn:li:activity:7442172982820524035 --type CELEBRATION
+
+# List who reacted to a post
+linkedin-cli feed reactions urn:li:activity:7447168805107032064
+
+# With pagination
+linkedin-cli feed reactions urn:li:activity:7447168805107032064 --count 10 --start 0
+
+# Bare activity ID also works
+linkedin-cli feed reactions 7447168805107032064
 ```
