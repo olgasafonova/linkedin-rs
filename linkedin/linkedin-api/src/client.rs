@@ -1444,12 +1444,61 @@ impl LinkedInClient {
         count: u32,
     ) -> Result<Value, Error> {
         let encoded_urn = restli_encode_string(activity_urn);
-        let params = format!(
-            "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
-            count, start, encoded_urn
-        );
-        let result = self.graphql_get(&params).await?;
-        unwrap_graphql(&result, "socialDashReactionsByReactionType")
+        // LinkedIn caps page size at ~10 for this endpoint. To get more,
+        // we auto-paginate and merge results.
+        let page_size = 10u32;
+        let mut all_elements = Vec::new();
+        let mut current_start = start;
+        let mut total: Option<u64> = None;
+        let remaining = count;
+
+        loop {
+            let batch = std::cmp::min(page_size, remaining - all_elements.len() as u32);
+            if batch == 0 {
+                break;
+            }
+            let params = format!(
+                "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
+                batch, current_start, encoded_urn
+            );
+            let result = self.graphql_get(&params).await?;
+            let page = unwrap_graphql(&result, "socialDashReactionsByReactionType")?;
+
+            if total.is_none() {
+                total = page
+                    .get("paging")
+                    .and_then(|p| p.get("total"))
+                    .and_then(|t| t.as_u64());
+            }
+
+            let elements = page
+                .get("elements")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if elements.is_empty() {
+                break;
+            }
+            all_elements.extend(elements);
+            current_start += batch;
+
+            // Stop if we've reached the reported total.
+            if let Some(t) = total {
+                if current_start as u64 >= t {
+                    break;
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "elements": all_elements,
+            "paging": {
+                "start": start,
+                "count": all_elements.len(),
+                "total": total.unwrap_or(all_elements.len() as u64)
+            }
+        }))
     }
 
     pub async fn get_my_posts(
