@@ -1425,11 +1425,7 @@ impl LinkedInClient {
     /// # Parameters
     /// - `start`: 0-based pagination offset.
     /// - `count`: Number of posts per page.
-    pub async fn get_my_posts(
-        &self,
-        start: u32,
-        count: u32,
-    ) -> Result<Value, Error> {
+    pub async fn get_my_posts(&self, start: u32, count: u32) -> Result<Value, Error> {
         let profile_urn = self.my_profile_urn().await?;
         let encoded_urn = restli_encode_string(profile_urn);
         let path = format!(

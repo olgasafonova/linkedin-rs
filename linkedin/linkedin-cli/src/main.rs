@@ -2759,7 +2759,15 @@ fn print_my_post(index: usize, item: &serde_json::Value) {
         .trim_end_matches("•")
         .trim();
 
-    println!("[{}] {}", index, if !activity_urn.is_empty() { &activity_urn } else { entity_urn });
+    println!(
+        "[{}] {}",
+        index,
+        if !activity_urn.is_empty() {
+            &activity_urn
+        } else {
+            entity_urn
+        }
+    );
     if !time_desc.is_empty() {
         println!("    posted: {}", time_desc);
     }
@@ -2772,7 +2780,9 @@ fn print_my_post(index: usize, item: &serde_json::Value) {
     );
 
     // Reaction type breakdown (if available).
-    if let Some(rtc) = social.and_then(|c| c.get("reactionTypeCounts")).and_then(|r| r.as_array())
+    if let Some(rtc) = social
+        .and_then(|c| c.get("reactionTypeCounts"))
+        .and_then(|r| r.as_array())
     {
         if !rtc.is_empty() {
             let parts: Vec<String> = rtc
@@ -5907,8 +5917,8 @@ async fn cmd_event_view(event_id: &str, raw_json: bool) -> Result<(), String> {
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty = serde_json::to_string_pretty(&event)
-            .map_err(|e| format!("JSON format error: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(&event).map_err(|e| format!("JSON format error: {e}"))?;
         println!("{}", pretty);
         return Ok(());
     }
@@ -5921,7 +5931,10 @@ async fn cmd_event_view(event_id: &str, raw_json: bool) -> Result<(), String> {
 
     let ev = elements.first().unwrap_or(&event);
 
-    let name = ev.get("name").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+    let name = ev
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
     let time = ev
         .get("displayEventTime")
         .and_then(|v| v.as_str())
@@ -5930,15 +5943,12 @@ async fn cmd_event_view(event_id: &str, raw_json: bool) -> Result<(), String> {
         .get("lifecycleState")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let external_url = ev
-        .get("externalUrl")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let vanity = ev
-        .get("vanityName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let host = ev.get("viewerHost").and_then(|v| v.as_bool()).unwrap_or(false);
+    let external_url = ev.get("externalUrl").and_then(|v| v.as_str()).unwrap_or("");
+    let vanity = ev.get("vanityName").and_then(|v| v.as_str()).unwrap_or("");
+    let host = ev
+        .get("viewerHost")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     println!("{}", name);
     println!("{}", "=".repeat(name.len()));
@@ -5990,8 +6000,8 @@ async fn cmd_event_attendees(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty = serde_json::to_string_pretty(&resp)
-            .map_err(|e| format!("JSON format error: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(&resp).map_err(|e| format!("JSON format error: {e}"))?;
         println!("{}", pretty);
         return Ok(());
     }
@@ -6021,15 +6031,14 @@ async fn cmd_event_attendees(
             let entity = item_wrapper
                 .get("itemUnion")
                 .and_then(|iu| iu.get("entityResult"))
-                .or_else(|| {
-                    item_wrapper
-                        .get("item")
-                        .and_then(|i| i.get("entityResult"))
-                });
+                .or_else(|| item_wrapper.get("item").and_then(|i| i.get("entityResult")));
             if let Some(entity) = entity {
                 idx += 1;
                 printed += 1;
-                let name = entity.pointer("/title/text").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = entity
+                    .pointer("/title/text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let headline = entity
                     .pointer("/primarySubtitle/text")
                     .and_then(|v| v.as_str())
@@ -6055,7 +6064,12 @@ async fn cmd_event_attendees(
         }
     } else {
         println!("---");
-        println!("Showing {}-{} of {} attendees", start + 1, start + printed, total);
+        println!(
+            "Showing {}-{} of {} attendees",
+            start + 1,
+            start + printed,
+            total
+        );
     }
 
     Ok(())
