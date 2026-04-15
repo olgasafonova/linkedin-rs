@@ -6,35 +6,61 @@ This project is for personal and educational use only.
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 25 subcommands across 7 domains:
+The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 
 | Command | Description |
 |---------|-------------|
+| **Auth** | |
 | `auth login` | Authenticate with a `li_at` cookie (from browser or env var) |
 | `auth status` | Check session validity (live API call or local-only) |
 | `auth logout` | Clear stored session |
+| **Profile** | |
 | `profile me` | Fetch your own profile |
 | `profile view <id>` | View a profile by public identifier (vanity URL slug) |
 | `profile visit <id>` | Visit a profile (registers in "who viewed my profile") |
 | `profile viewers` | Show who viewed your profile |
+| `profile audit` | Audit your profile for staleness and missing sections |
+| **Feed** | |
 | `feed list` | List feed updates (paginated) |
+| `feed read <n>` | Show full post details for item N from the last `feed list` |
+| `feed view <urn>` | Fetch and display a single post by activity URN |
+| `feed comments <n>` | Show comments on post N from the last `feed list` |
 | `feed react <urn>` | React to a post (LIKE, PRAISE, EMPATHY, etc.) |
 | `feed unreact <urn>` | Remove a reaction from a post |
 | `feed comment <urn> <text>` | Comment on a feed post |
-| `feed my-posts` | List your own posts with engagement analytics (views, reactions, comments) |
+| `feed my-posts` | List your own posts with engagement analytics |
 | `feed reactions <urn>` | Show who reacted to a post (names, headlines, reaction types) |
 | `feed stats` | Aggregate engagement stats across your recent posts |
 | `feed post <text>` | Create a new text post (public or connections-only) |
+| **Messages** | |
+| `messages list` | List conversations (cursor-based pagination) |
+| `messages read <id>` | Read messages in a conversation |
+| `messages send <recipient> <text>` | Send a message to a connection (new conversation) |
+| `messages reply <id> <text>` | Reply to an existing conversation thread |
+| **Connections** | |
 | `connections list` | List your connections (paginated) |
 | `connections invite <id>` | Send a connection request with optional message |
 | `connections invitations` | List pending received invitations |
 | `connections accept <id>` | Accept a pending invitation |
+| **Search** | |
 | `search people <keywords>` | Search for people by keywords |
 | `search jobs <keywords>` | Search for jobs by keywords |
-| `messages list` | List conversations (cursor-based pagination) |
-| `messages read <id>` | Read messages in a conversation |
-| `messages send <recipient> <text>` | Send a message to a connection |
+| `search posts <keywords>` | Search for posts/content by keywords |
+| `search react <n>` | React to a post from the last search results |
+| `search view <n>` | View a profile from the last people search results |
+| **Company** | |
+| `company view <slug>` | View company info by URL slug |
+| `company followers <slug>` | List company page followers (requires admin access) |
+| **Events** | |
+| `events view <id>` | View event details by event ID |
+| `events attendees <id>` | List event attendees (paginated) |
+| **Notifications** | |
 | `notifications list` | List notification cards (paginated) |
+| **Composite** | |
+| `inbox` | Daily inbox: unread messages, pending invitations, recent notifications |
+| `who <company>` | Who do you know at a company? Network overlap in one command |
+| **Shell** | |
+| `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell, elvish) |
 
 All list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
 
@@ -82,14 +108,14 @@ LinkedIn API access requires a `li_at` session cookie. This is a cookie-based au
 
 ```bash
 # Pass directly
-linkedin-cli auth login --li-at "AQEDAQx..."
+li auth login --li-at "AQEDAQx..."
 
 # Or via environment variable
 export LINKEDIN_LI_AT="AQEDAQx..."
-linkedin-cli auth login
+li auth login
 
 # Verify the session works
-linkedin-cli auth status
+li auth status
 ```
 
 The session is stored locally at `~/.config/linkedin-cli/session.json`.
@@ -100,95 +126,152 @@ The session is stored locally at `~/.config/linkedin-cli/session.json`.
 
 ```bash
 # Your own profile
-linkedin-cli profile me
+li profile me
 
 # View someone's profile
-linkedin-cli profile view john-doe-123
+li profile view john-doe-123
 
 # Visit a profile (shows up in "who viewed")
-linkedin-cli profile visit john-doe-123
+li profile visit john-doe-123
 
 # Who viewed your profile
-linkedin-cli profile viewers
+li profile viewers
+
+# Audit your profile for staleness
+li profile audit
 ```
 
 ### Feed
 
 ```bash
 # List recent feed items
-linkedin-cli feed list --count 20
+li feed list --count 20
+
+# Read full details of post #3 from the last feed list
+li feed read 3
+
+# View a specific post by URN
+li feed view urn:li:activity:7312345678901234567
+
+# Show comments on post #5 from the last feed list
+li feed comments 5
 
 # Your own posts with engagement metrics
-linkedin-cli feed my-posts --count 10
+li feed my-posts --count 10
 
 # Who reacted to a specific post
-linkedin-cli feed reactions urn:li:activity:7312345678901234567
+li feed reactions urn:li:activity:7312345678901234567
 
 # Aggregate stats across your recent posts
-linkedin-cli feed stats
+li feed stats
 
 # Like a post
-linkedin-cli feed react urn:li:activity:7312345678901234567
+li feed react urn:li:activity:7312345678901234567
 
 # Celebrate a post
-linkedin-cli feed react urn:li:activity:7312345678901234567 --type CELEBRATION
+li feed react urn:li:activity:7312345678901234567 --type CELEBRATION
 
 # Remove a reaction
-linkedin-cli feed unreact urn:li:activity:7312345678901234567
+li feed unreact urn:li:activity:7312345678901234567
 
 # Comment on a post
-linkedin-cli feed comment urn:li:activity:7312345678901234567 "Great post!" --yes
+li feed comment urn:li:activity:7312345678901234567 "Great post!" --yes
 
 # Create a post
-linkedin-cli feed post "Hello LinkedIn!" --yes
-linkedin-cli feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
+li feed post "Hello LinkedIn!" --yes
+li feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
 ```
 
 ### Messages
 
 ```bash
 # List conversations
-linkedin-cli messages list --count 20
+li messages list --count 20
 
 # Read a conversation
-linkedin-cli messages read 2-abc123
+li messages read 2-abc123
 
-# Send a message
-linkedin-cli messages send john-doe-123 "Hey, wanted to connect about..."
+# Send a message (new conversation)
+li messages send john-doe-123 "Hey, wanted to connect about..."
+
+# Reply to an existing conversation
+li messages reply 2-abc123 "Thanks for getting back to me" --yes
 ```
 
 ### Connections
 
 ```bash
 # List connections
-linkedin-cli connections list --count 50
+li connections list --count 50
 
 # Send a connection request
-linkedin-cli connections invite john-doe-123
-linkedin-cli connections invite john-doe-123 --message "Met you at the conference"
+li connections invite john-doe-123
+li connections invite john-doe-123 --message "Met you at the conference"
 
 # List pending invitations
-linkedin-cli connections invitations
+li connections invitations
 
 # Accept an invitation (get ID and secret from invitations --json)
-linkedin-cli connections accept 7312345678901234567 --secret abc123
+li connections accept 7312345678901234567 --secret abc123
 ```
 
 ### Search
 
 ```bash
 # Search for people
-linkedin-cli search people "rust developer" --count 20
+li search people "rust developer" --count 20
 
 # Search for jobs
-linkedin-cli search jobs "senior backend engineer"
+li search jobs "senior backend engineer"
+
+# Search for posts
+li search posts "MCP server" --count 10
+
+# React to post #2 from the last search results
+li search react 2
+
+# View profile #3 from the last people search
+li search view 3
+```
+
+### Company
+
+```bash
+# View company info
+li company view microsoft
+
+# List company page followers (requires admin access)
+li company followers getskillcheck --count 50
+```
+
+### Events
+
+```bash
+# View event details (ID from the event URL)
+li events view 7447661801514938369
+
+# List event attendees
+li events attendees 7447661801514938369 --count 50
 ```
 
 ### Notifications
 
 ```bash
 # List notifications
-linkedin-cli notifications list --count 20
+li notifications list --count 20
+```
+
+### Composite Commands
+
+```bash
+# Daily inbox: unread messages, invitations, notifications in one shot
+li inbox
+
+# Show inbox without spam filtering
+li inbox --all
+
+# Who do you know at a company?
+li who miro
 ```
 
 ### JSON output
@@ -196,8 +279,17 @@ linkedin-cli notifications list --count 20
 All commands support `--json` for machine-readable output:
 
 ```bash
-linkedin-cli profile me --json | jq '.firstName'
-linkedin-cli feed list --json --count 5 | jq '.elements[].text'
+li profile me --json | jq '.firstName'
+li feed list --json --count 5 | jq '.elements[].text'
+```
+
+### Shell completions
+
+```bash
+# Generate completions for your shell
+li completions zsh > ~/.zfunc/_li
+li completions bash > ~/.local/share/bash-completion/completions/li
+li completions fish > ~/.config/fish/completions/li.fish
 ```
 
 ## API Library
