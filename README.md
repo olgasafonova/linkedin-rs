@@ -159,7 +159,13 @@ li feed comments 5
 # Your own posts with engagement metrics
 li feed my-posts --count 10
 
-# Who reacted to a specific post
+# Who reacted to a specific post — use --from-list N after `feed list` /
+# `feed my-posts` so the CLI picks the right URN type (ugcPost vs activity;
+# LinkedIn's reactions endpoint is picky depending on post backing)
+li feed list --count 10
+li feed reactions --from-list 3
+# Passing a URN directly also works, but activity URNs silently return 0
+# for ugcPost-backed posts — the CLI prints a hint when it sees that
 li feed reactions urn:li:activity:7312345678901234567
 
 # Aggregate stats across your recent posts

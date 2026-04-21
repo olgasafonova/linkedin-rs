@@ -233,6 +233,33 @@ The response is wrapped in the standard GraphQL envelope: `data.socialDashReacti
 - The queryId hash (`41ebf31a9f4c4a84e35a49d5abc9010b`) was captured from the web
   client — it's different from the mutation hashes found in the Android APK.
 
+### threadUrn Type Is Post-Backing-Specific
+
+The finder's `threadUrn` is URN-type-picky and the correct URN type depends on
+what the post is backed by. This was verified via direct curl probes against
+three different posts.
+
+| Post backing | URN that works | URN that fails |
+|---|---|---|
+| `ugcPost` (own posts, plain text) | `urn:li:ugcPost:...` | `urn:li:activity:...` — silently returns `total: 0` OR HTTP 200 with GraphQL error `"Reaction cannot be found."` |
+| `share` (reshared content, link shares) | `urn:li:activity:...` | `urn:li:share:...` — silently returns `total: 0` |
+
+The feed response exposes both URN types side-by-side in `updateMetadata`:
+
+```
+updateMetadata.urn      = urn:li:activity:7450891298279972864
+updateMetadata.shareUrn = urn:li:ugcPost:7450888187100639232   // or urn:li:share:...
+```
+
+Rule the CLI uses (`extract_reactions_urn` in `linkedin-cli/src/main.rs`):
+
+- If `shareUrn` starts with `urn:li:ugcPost:` → use `shareUrn`.
+- Otherwise → use the activity URN (`updateMetadata.urn`).
+
+This asymmetry is a LinkedIn-side backend quirk, not a protocol detail in the
+decompiled APK. The CREATE and DELETE reaction mutations accept the activity
+URN for both post backings; only the LIST finder is picky.
+
 ## CLI Usage
 
 ```bash

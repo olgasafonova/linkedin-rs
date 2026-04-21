@@ -276,9 +276,21 @@ enum FeedAction {
     ///
     /// Lists reactor names, headlines, and reaction types (like, celebrate,
     /// love, insightful, support, funny) for a given post.
+    ///
+    /// LinkedIn's reactions endpoint requires different URN types for
+    /// different post backings (ugcPost for own posts, activity for reshares).
+    /// Prefer `--from-list N` after a `feed list` or `feed my-posts` call to
+    /// let the CLI pick the right URN from the cached listing.
     Reactions {
-        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
-        post_urn: String,
+        /// Post/activity URN (e.g. urn:li:activity:7312345678901234567).
+        /// Omit when using --from-list.
+        post_urn: Option<String>,
+
+        /// Use item N from the last `feed list` or `feed my-posts` listing.
+        /// The CLI extracts the correct URN (ugcPost vs activity) from the
+        /// cached element.
+        #[arg(long, conflicts_with = "post_urn")]
+        from_list: Option<usize>,
 
         /// Number of reactions to fetch (default: 50)
         #[arg(long, default_value = "50")]
@@ -738,10 +750,13 @@ async fn main() {
             }
             FeedAction::Reactions {
                 post_urn,
+                from_list,
                 count,
                 start,
                 json,
-            } => exit_on_err(cmd_feed_reactions(&post_urn, start, count, json).await),
+            } => exit_on_err(
+                cmd_feed_reactions(post_urn.as_deref(), from_list, start, count, json).await,
+            ),
             FeedAction::Stats { json } => exit_on_err(cmd_feed_stats(json).await),
             FeedAction::Post {
                 text,
@@ -2668,6 +2683,10 @@ async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result<(),
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
+    if let Err(e) = save_feed_cache(&value) {
+        eprintln!("warning: failed to cache feed: {}", e);
+    }
+
     if raw_json {
         let pretty =
             serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
@@ -2815,20 +2834,25 @@ fn reaction_emoji(reaction_type: &str) -> &str {
 ///
 /// Fetches and displays the list of people who reacted to a specific post.
 async fn cmd_feed_reactions(
-    post_urn: &str,
+    post_urn: Option<&str>,
+    from_list: Option<usize>,
     start: u32,
     count: u32,
     raw_json: bool,
 ) -> Result<(), String> {
-    let (client, _path) = load_session_client()?;
-
-    // Normalize: accept bare activity IDs or full URNs.
-    let urn = if post_urn.starts_with("urn:li:") {
-        post_urn.to_string()
-    } else {
-        format!("urn:li:activity:{}", post_urn)
+    let urn = match (post_urn, from_list) {
+        (Some(u), None) => normalize_reactions_urn(u),
+        (None, Some(index)) => reactions_urn_from_cache(index)?,
+        (None, None) => {
+            return Err(
+                "provide a post URN or use --from-list N after `feed list`/`feed my-posts`"
+                    .to_string(),
+            )
+        }
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with guards this"),
     };
 
+    let (client, _path) = load_session_client()?;
     let value = client
         .get_post_reactions(&urn, start, count)
         .await
@@ -2858,6 +2882,17 @@ async fn cmd_feed_reactions(
 
     if elements.is_empty() {
         println!("(no reactions)");
+        if from_list.is_none() && urn.starts_with("urn:li:activity:") {
+            println!();
+            println!(
+                "Hint: LinkedIn's reactions endpoint uses different URN types \
+                 depending on the post backing (ugcPost for most posts, \
+                 activity for reshares). If you expected reactions here, try \
+                 `feed list` or `feed my-posts` first, then run \
+                 `feed reactions --from-list N` — the CLI will pick the \
+                 right URN. See re/reactions.md."
+            );
+        }
         return Ok(());
     }
 
@@ -4990,8 +5025,67 @@ fn save_feed_cache(value: &serde_json::Value) -> Result<(), String> {
 fn load_feed_cache() -> Result<serde_json::Value, String> {
     let path = feed_cache_path()?;
     let data = std::fs::read_to_string(&path)
-        .map_err(|_| "no cached feed. Run `feed list` first.".to_string())?;
+        .map_err(|_| "no cached feed. Run `feed list` or `feed my-posts` first.".to_string())?;
     serde_json::from_str(&data).map_err(|e| format!("failed to parse feed cache: {e}"))
+}
+
+/// Normalize a user-supplied reactions URN. Accepts full URNs (any type) or a
+/// bare activity ID (digits only), which is wrapped as `urn:li:activity:...`.
+fn normalize_reactions_urn(input: &str) -> String {
+    if input.starts_with("urn:li:") {
+        input.to_string()
+    } else {
+        format!("urn:li:activity:{}", input)
+    }
+}
+
+/// Extract the right thread URN for the reactions endpoint from a cached feed
+/// element. LinkedIn's `socialDashReactionsByReactionType` is URN-type-picky:
+/// ugcPost-backed posts require the ugcPost URN, share-backed posts require
+/// the activity URN. `updateMetadata.shareUrn` carries the underlying object
+/// URN, so we use that when it's a `ugcPost:`; otherwise we fall back to the
+/// activity URN. See `re/reactions.md` for the investigation.
+fn extract_reactions_urn(element: &serde_json::Value) -> Option<String> {
+    let update = element
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(element);
+    let metadata = update.get("updateMetadata")?;
+    let activity_urn = metadata.get("urn").and_then(|u| u.as_str());
+    let share_urn = metadata.get("shareUrn").and_then(|u| u.as_str());
+
+    match (share_urn, activity_urn) {
+        (Some(s), _) if s.starts_with("urn:li:ugcPost:") => Some(s.to_string()),
+        (_, Some(a)) => Some(a.to_string()),
+        (Some(s), None) => Some(s.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Resolve a 1-based index from the last cached feed listing into a reactions
+/// thread URN.
+fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+    let cache = load_feed_cache()?;
+    let elements = cache
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "cached feed has no elements array".to_string())?;
+    let element = elements.get(index - 1).ok_or_else(|| {
+        format!(
+            "index {} out of range (cached feed has {} items)",
+            index,
+            elements.len()
+        )
+    })?;
+    extract_reactions_urn(element).ok_or_else(|| {
+        format!(
+            "could not extract a reactions URN from cached item {}",
+            index
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6073,4 +6167,92 @@ async fn cmd_event_attendees(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_reactions_urn_passes_full_urn_through() {
+        assert_eq!(
+            normalize_reactions_urn("urn:li:activity:7450808005048094720"),
+            "urn:li:activity:7450808005048094720"
+        );
+        assert_eq!(
+            normalize_reactions_urn("urn:li:ugcPost:7450808001881534464"),
+            "urn:li:ugcPost:7450808001881534464"
+        );
+    }
+
+    #[test]
+    fn normalize_reactions_urn_wraps_bare_id_as_activity() {
+        assert_eq!(
+            normalize_reactions_urn("7450808005048094720"),
+            "urn:li:activity:7450808005048094720"
+        );
+    }
+
+    #[test]
+    fn extract_reactions_urn_prefers_ugcpost_sharureurn() {
+        // UGC-backed post (e.g. an own text post): reactions endpoint
+        // requires the ugcPost URN, not the activity URN.
+        let element = json!({
+            "value": {
+                "com.linkedin.voyager.feed.render.UpdateV2": {
+                    "updateMetadata": {
+                        "urn": "urn:li:activity:7450891298279972864",
+                        "shareUrn": "urn:li:ugcPost:7450888187100639232"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            extract_reactions_urn(&element),
+            Some("urn:li:ugcPost:7450888187100639232".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_reactions_urn_uses_activity_for_share_backed() {
+        // Share-backed post (reshare): reactions endpoint requires the
+        // activity URN; passing the share URN silently returns total=0.
+        let element = json!({
+            "value": {
+                "com.linkedin.voyager.feed.render.UpdateV2": {
+                    "updateMetadata": {
+                        "urn": "urn:li:activity:7450895500045598720",
+                        "shareUrn": "urn:li:share:7450895499496202240"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            extract_reactions_urn(&element),
+            Some("urn:li:activity:7450895500045598720".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_reactions_urn_handles_unwrapped_update_element() {
+        // `feed my-posts` returns elements without the `value.UpdateV2`
+        // wrapper — the updateMetadata sits at the root.
+        let element = json!({
+            "updateMetadata": {
+                "urn": "urn:li:activity:7450808005048094720",
+                "shareUrn": "urn:li:ugcPost:7450808001881534464"
+            }
+        });
+        assert_eq!(
+            extract_reactions_urn(&element),
+            Some("urn:li:ugcPost:7450808001881534464".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_reactions_urn_returns_none_when_metadata_missing() {
+        let element = json!({"foo": "bar"});
+        assert_eq!(extract_reactions_urn(&element), None);
+    }
 }
