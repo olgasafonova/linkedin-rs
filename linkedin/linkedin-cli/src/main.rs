@@ -3029,135 +3029,174 @@ async fn cmd_feed_comment(
 
 /// Handle `feed stats [--json]`.
 ///
-/// Fetches analytics for the user's recent posts (views, impressions).
-/// Uses the `identity/socialUpdateAnalytics` endpoint. This may require
-/// Premium or Creator Mode for full data.
+/// Aggregates engagement across the user's last 20 posts by summing the
+/// per-post counts embedded in `socialDetail.totalSocialActivityCounts` on
+/// the `identity/profileUpdatesV2?q=memberShareFeed` response.
+///
+/// The legacy `identity/socialUpdateAnalytics{,Header}` endpoints return
+/// HTTP 400 and are not used -- see `re/my_posts.md` for details.
 async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
+    const POST_COUNT: u32 = 20;
+
     let (client, _path) = load_session_client()?;
 
-    // Try the analytics endpoint. It may return 403/404 without Premium.
-    let header_result = client.get_post_analytics_header().await;
-    let analytics_result = client.get_post_analytics().await;
+    let value = client
+        .get_my_posts(0, POST_COUNT)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    let elements = value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let posts: Vec<PostStat> = elements.iter().map(extract_post_stat).collect();
+    let totals = PostStat::sum(&posts);
+    let n = posts.len() as u64;
 
     if raw_json {
-        let combined = serde_json::json!({
-            "header": header_result.as_ref().ok(),
-            "analytics": analytics_result.as_ref().ok(),
+        let averages = if n > 0 {
+            serde_json::json!({
+                "views": totals.views / n,
+                "likes": totals.likes / n,
+                "comments": totals.comments / n,
+                "shares": totals.shares / n,
+            })
+        } else {
+            serde_json::json!({})
+        };
+        let out = serde_json::json!({
+            "post_count": n,
+            "totals": {
+                "views": totals.views,
+                "likes": totals.likes,
+                "comments": totals.comments,
+                "shares": totals.shares,
+            },
+            "averages": averages,
+            "posts": posts.iter().map(PostStat::to_json).collect::<Vec<_>>(),
         });
-        let pretty = serde_json::to_string_pretty(&combined)
-            .map_err(|e| format!("JSON format error: {e}"))?;
+        let pretty =
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?;
         println!("{}", pretty);
         return Ok(());
     }
 
-    // Print header summary if available.
-    match header_result {
-        Ok(header) => {
-            println!("Post Analytics Summary");
-            println!("---");
-            // Try to extract summary metrics from the header response.
-            if let Some(text) = header
-                .get("headline")
-                .and_then(|h| h.get("text"))
-                .and_then(|t| t.as_str())
-            {
-                println!("{}", text);
-            }
-            if let Some(elements) = header.get("elements").and_then(|e| e.as_array()) {
-                for el in elements {
-                    let title = el
-                        .get("title")
-                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-                        .or_else(|| el.get("title").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let value = el
-                        .get("value")
-                        .and_then(|v| v.get("text").and_then(|t| t.as_str()))
-                        .or_else(|| el.get("value").and_then(|v| v.as_str()))
-                        .or_else(|| el.get("numericValue").and_then(|n| n.as_u64()).map(|_| ""))
-                        .unwrap_or("");
-                    let numeric = el.get("numericValue").and_then(|v| v.as_u64());
-                    if !title.is_empty() {
-                        if let Some(n) = numeric {
-                            println!("  {}: {}", title, n);
-                        } else if !value.is_empty() {
-                            println!("  {}: {}", title, value);
-                        } else {
-                            println!("  {}", title);
-                        }
-                    }
-                }
-            }
-            println!();
-        }
-        Err(e) => {
-            eprintln!(
-                "Analytics header unavailable (may require Premium/Creator): {}",
-                e
-            );
-        }
+    if n == 0 {
+        println!("(no posts found)");
+        return Ok(());
     }
 
-    // Print detailed analytics if available.
-    match analytics_result {
-        Ok(analytics) => {
-            if let Some(elements) = analytics.get("elements").and_then(|e| e.as_array()) {
-                println!("Recent Post Analytics ({} posts)", elements.len());
-                println!("---");
-                for (i, el) in elements.iter().enumerate() {
-                    let views = el
-                        .get("totalShareStatistics")
-                        .and_then(|s| s.get("uniqueImpressionsCount"))
-                        .and_then(|v| v.as_u64())
-                        .or_else(|| el.get("impressionCount").and_then(|v| v.as_u64()))
-                        .unwrap_or(0);
-                    let likes = el
-                        .get("totalShareStatistics")
-                        .and_then(|s| s.get("likeCount"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let comments = el
-                        .get("totalShareStatistics")
-                        .and_then(|s| s.get("commentCount"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    let shares = el
-                        .get("totalShareStatistics")
-                        .and_then(|s| s.get("shareCount"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+    println!("Engagement across last {} posts", n);
+    println!("---");
+    println!("Totals:");
+    println!("  views:    {}", totals.views);
+    println!("  likes:    {}", totals.likes);
+    println!("  comments: {}", totals.comments);
+    println!("  shares:   {}", totals.shares);
+    println!();
+    println!("Averages per post:");
+    println!("  views:    {}", totals.views / n);
+    println!("  likes:    {}", totals.likes / n);
+    println!("  comments: {}", totals.comments / n);
+    println!("  shares:   {}", totals.shares / n);
+    println!();
 
-                    let text_preview = el
-                        .get("commentary")
-                        .and_then(|c| c.get("text"))
-                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-                        .or_else(|| el.get("text").and_then(|v| v.as_str()))
-                        .unwrap_or("(post)");
-
-                    println!(
-                        "[{}] {} views, {} likes, {} comments, {} shares",
-                        i + 1,
-                        views,
-                        likes,
-                        comments,
-                        shares
-                    );
-                    println!("    {}", truncate_with_ellipsis(text_preview, 100));
-                    println!();
-                }
-            } else {
-                println!("(no analytics data in response)");
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "Post analytics unavailable (may require Premium/Creator): {}",
-                e
-            );
+    // Show top 5 posts by views as context.
+    let mut ranked = posts.clone();
+    ranked.sort_by(|a, b| b.views.cmp(&a.views));
+    let top = ranked.iter().take(5);
+    println!("Top posts by views:");
+    for (i, p) in top.enumerate() {
+        println!(
+            "[{}] {} views, {} likes, {} comments, {} shares",
+            i + 1,
+            p.views,
+            p.likes,
+            p.comments,
+            p.shares
+        );
+        if !p.preview.is_empty() {
+            println!("    {}", truncate_with_ellipsis(&p.preview, 100));
         }
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct PostStat {
+    views: u64,
+    likes: u64,
+    comments: u64,
+    shares: u64,
+    preview: String,
+}
+
+impl PostStat {
+    fn sum(posts: &[PostStat]) -> PostStat {
+        posts.iter().fold(
+            PostStat {
+                views: 0,
+                likes: 0,
+                comments: 0,
+                shares: 0,
+                preview: String::new(),
+            },
+            |mut acc, p| {
+                acc.views += p.views;
+                acc.likes += p.likes;
+                acc.comments += p.comments;
+                acc.shares += p.shares;
+                acc
+            },
+        )
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "views": self.views,
+            "likes": self.likes,
+            "comments": self.comments,
+            "shares": self.shares,
+            "preview": self.preview,
+        })
+    }
+}
+
+fn extract_post_stat(item: &serde_json::Value) -> PostStat {
+    let update = item
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(item);
+
+    let counts = update
+        .get("socialDetail")
+        .and_then(|s| s.get("totalSocialActivityCounts"));
+
+    let get_u64 = |key: &str| -> u64 {
+        counts
+            .and_then(|c| c.get(key))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0)
+    };
+
+    let preview = update
+        .get("commentary")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    PostStat {
+        views: get_u64("numViews"),
+        likes: get_u64("numLikes"),
+        comments: get_u64("numComments"),
+        shares: get_u64("numShares"),
+        preview,
+    }
 }
 
 /// Handle `feed post <text> [--visibility ANYONE] [--yes] [--json]`.

@@ -1830,25 +1830,6 @@ impl LinkedInClient {
         self.post(&path, &body).await
     }
 
-    /// Fetch content analytics for the authenticated user's posts.
-    ///
-    /// Uses the `identity/socialUpdateAnalytics` Voyager REST endpoint
-    /// discovered in the API catalog section 18 (`ME_CONTENT_ANALYTICS_HIGHLIGHTS`).
-    ///
-    /// Returns analytics data including impressions, views, and engagement
-    /// metrics for the user's recent posts.
-    pub async fn get_post_analytics(&self) -> Result<Value, Error> {
-        self.get("identity/socialUpdateAnalytics").await
-    }
-
-    /// Fetch the content analytics summary header.
-    ///
-    /// Uses `identity/socialUpdateAnalyticsHeader` from the API catalog.
-    /// Returns high-level analytics summary (total views, etc.).
-    pub async fn get_post_analytics_header(&self) -> Result<Value, Error> {
-        self.get("identity/socialUpdateAnalyticsHeader").await
-    }
-
     /// Fetch followers of a company page.
     ///
     /// Tries multiple endpoint patterns since LinkedIn's follower list
