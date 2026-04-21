@@ -23,7 +23,7 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | **Feed** | |
 | `feed list` | List feed updates (paginated) |
 | `feed read <n>` | Show full post details for item N from the last `feed list` |
-| `feed view <urn>` | Fetch and display a single post by activity URN |
+| `feed view <urn>` | Display a post from your current top-50 feed window by activity URN (for out-of-window posts, use `feed read N` after `feed list`) |
 | `feed comments <n>` | Show comments on post N from the last `feed list` |
 | `feed react <urn>` | React to a post (LIKE, PRAISE, EMPATHY, etc.) |
 | `feed unreact <urn>` | Remove a reaction from a post |
@@ -150,7 +150,7 @@ li feed list --count 20
 # Read full details of post #3 from the last feed list
 li feed read 3
 
-# View a specific post by URN
+# View a specific post by URN (only works if it's in your current top-50 feed)
 li feed view urn:li:activity:7312345678901234567
 
 # Show comments on post #5 from the last feed list
