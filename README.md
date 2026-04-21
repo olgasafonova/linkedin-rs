@@ -34,7 +34,7 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | `feed post <text>` | Create a new text post (public or connections-only) |
 | **Messages** | |
 | `messages list` | List conversations (cursor-based pagination) |
-| `messages read <id>` | Read messages in a conversation |
+| `messages read <id>` | Read messages in a conversation (cursor-paginated via `--before`; no `--count`) |
 | `messages send <recipient> <text>` | Send a message to a connection (new conversation) |
 | `messages reply <id> <text>` | Reply to an existing conversation thread |
 | **Connections** | |
@@ -62,7 +62,7 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | **Shell** | |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell, elvish) |
 
-All list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
+Most list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Exception: `messages read <id>` returns the whole conversation window LinkedIn hands back and paginates only via `--before <epoch_ms>`; it doesn't take `--count`. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
 
 ## Installation
 
