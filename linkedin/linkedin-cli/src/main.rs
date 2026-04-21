@@ -3056,15 +3056,19 @@ async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
     let n = posts.len() as u64;
 
     if raw_json {
-        let averages = if n > 0 {
-            serde_json::json!({
-                "views": totals.views / n,
-                "likes": totals.likes / n,
-                "comments": totals.comments / n,
-                "shares": totals.shares / n,
-            })
-        } else {
-            serde_json::json!({})
+        let averages = match (
+            totals.views.checked_div(n),
+            totals.likes.checked_div(n),
+            totals.comments.checked_div(n),
+            totals.shares.checked_div(n),
+        ) {
+            (Some(v), Some(l), Some(c), Some(s)) => serde_json::json!({
+                "views": v,
+                "likes": l,
+                "comments": c,
+                "shares": s,
+            }),
+            _ => serde_json::json!({}),
         };
         let out = serde_json::json!({
             "post_count": n,
@@ -3105,7 +3109,7 @@ async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
 
     // Show top 5 posts by views as context.
     let mut ranked = posts.clone();
-    ranked.sort_by(|a, b| b.views.cmp(&a.views));
+    ranked.sort_by_key(|p| std::cmp::Reverse(p.views));
     let top = ranked.iter().take(5);
     println!("Top posts by views:");
     for (i, p) in top.enumerate() {
