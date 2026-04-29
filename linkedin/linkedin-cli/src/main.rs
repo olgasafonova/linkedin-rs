@@ -54,6 +54,35 @@ fn classify_error(msg: &str) -> i32 {
     }
 }
 
+/// Suggest a one-line next step the user can take, based on the shape of
+/// an error message. Returns `None` if no specific hint applies.
+///
+/// Pattern matching is intentionally string-based so it works on errors
+/// surfaced through `format!("…: {e}")` chains where the original
+/// `Error` variant is already lost. Each branch picks the most actionable
+/// next move first; ordering matters when multiple substrings match.
+fn error_hint(msg: &str) -> Option<&'static str> {
+    if msg.contains("HTTP 401") || msg.contains("session expired") || msg.contains("li_at") {
+        Some("Hint: session looks stale. Refresh with: li auth login <li_at_cookie>")
+    } else if msg.contains("HTTP 301") {
+        Some("Hint: HTTP 301 from a Voyager endpoint usually means LinkedIn retired it. Check re/ docs for the modern path; if the path is still listed there, file an issue.")
+    } else if msg.contains("HTTP 429") {
+        Some("Hint: rate limited. Wait a few minutes; consider lowering --pacing-ms below 2000 only if you've checked your quota.")
+    } else if msg.contains("Internal error fetching data from downstream")
+        || msg.contains("Failed to get response from server")
+    {
+        Some("Hint: transient GraphQL error. The client already retried up to MAX_RETRIES times — if you see this often, LinkedIn's mesh is degraded. Try again in a minute.")
+    } else if msg.contains("failed to resolve profile") {
+        Some("Hint: the slug→URN resolver flaked. Pass the fsd_profile URN directly if you have it, or use 'li search invite N' once the person is in your last search results.")
+    } else if msg.contains("HTTP 403") {
+        Some("Hint: LinkedIn blocked the request. This often means a captcha challenge — open the site in a browser and complete any pending verification.")
+    } else if msg.contains("out of range") {
+        Some("Hint: rerun the parent command (e.g. 'li search people \"…\"' or 'li feed list') first to populate the cache.")
+    } else {
+        None
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "li")]
 #[command(about = "LinkedIn in the terminal", version)]
@@ -714,6 +743,9 @@ fn exit_on_err(result: Result<(), String>) {
     if let Err(e) = result {
         let code = classify_error(&e);
         eprintln!("error: {e}");
+        if let Some(hint) = error_hint(&e) {
+            eprintln!("{hint}");
+        }
         process::exit(code);
     }
 }
@@ -6648,6 +6680,41 @@ mod tests {
         let s = extract_profile_summary(&profile);
         assert_eq!(s["relationshipState"], "noConnection");
         assert_eq!(s["name"], "S T");
+    }
+
+    #[test]
+    fn hint_for_401_suggests_relogin() {
+        let hint = error_hint("API call failed: API error (HTTP 401): session expired");
+        assert!(hint.unwrap().contains("li auth login"));
+    }
+
+    #[test]
+    fn hint_for_301_suggests_re_doc_check() {
+        let hint = error_hint("API call failed: API error (HTTP 301): {\"status\":301}");
+        assert!(hint.unwrap().contains("retired"));
+    }
+
+    #[test]
+    fn hint_for_429_suggests_backoff() {
+        let hint = error_hint("API call failed: API error (HTTP 429): too many requests");
+        assert!(hint.unwrap().contains("rate limited"));
+    }
+
+    #[test]
+    fn hint_for_resolver_failure_suggests_alternatives() {
+        let hint = error_hint("failed to resolve profile: API error (HTTP 200): GraphQL errors: ...");
+        assert!(hint.unwrap().contains("URN") || hint.unwrap().contains("search invite"));
+    }
+
+    #[test]
+    fn hint_for_index_out_of_range_suggests_repopulating_cache() {
+        let hint = error_hint("index 5 out of range (search has 3 results)");
+        assert!(hint.unwrap().contains("cache"));
+    }
+
+    #[test]
+    fn hint_for_unknown_error_returns_none() {
+        assert!(error_hint("some random unrecognised error").is_none());
     }
 
     #[test]
