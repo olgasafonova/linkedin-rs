@@ -1232,18 +1232,81 @@ impl LinkedInClient {
         }
 
         // Fall back to GraphQL profile endpoint.
-        let profile = self.get_profile(public_id).await?;
-        profile
-            .get("entityUrn")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::Api {
-                status: 0,
+        if let Ok(profile) = self.get_profile(public_id).await {
+            if let Some(urn) = profile.get("entityUrn").and_then(|v| v.as_str()) {
+                return Ok(urn.to_string());
+            }
+        }
+
+        // Final fallback: scrape the URN out of the public preload/custom-invite
+        // page. This is the same server-side resolver the modern web client
+        // uses when navigating to a Connect link from a profile, on a separate
+        // transport from REST/GraphQL — it works when those paths are
+        // degraded. See `resolve_profile_urn_via_preload`.
+        if let Ok(urn) = self.resolve_profile_urn_via_preload(public_id).await {
+            return Ok(urn);
+        }
+
+        Err(Error::Api {
+            status: 0,
+            body: format!(
+                "could not extract entityUrn from any profile endpoint for '{}'",
+                public_id
+            ),
+        })
+    }
+
+    /// Resolve a slug → fsd_profile URN by scraping the
+    /// `/preload/custom-invite/?vanityName=<slug>` page.
+    ///
+    /// LinkedIn's modern web client uses this preload page as a server-side
+    /// slug resolver: navigating to it from a profile loads a Connect dialog
+    /// pre-populated with the target's URN. The HTML embeds JSON state (with
+    /// `&quot;`-encoded quotes) including a block where the target's
+    /// `entityUrn` and `publicIdentifier` are adjacent.
+    ///
+    /// The page also embeds the *viewer's* URN elsewhere (in the me-menu, the
+    /// global nav state, etc.), so an unanchored URN search would pick the
+    /// wrong identity. The disambiguator is the slug: find the URN that sits
+    /// in the same JSON object as `publicIdentifier:<slug>`.
+    ///
+    /// Used as a fallback after REST/GraphQL paths exhaust their retries.
+    pub async fn resolve_profile_urn_via_preload(
+        &self,
+        public_id: &str,
+    ) -> Result<String, Error> {
+        let encoded_slug =
+            url::form_urlencoded::byte_serialize(public_id.as_bytes()).collect::<String>();
+        let url = format!(
+            "{}/preload/custom-invite/?vanityName={}",
+            BASE_URL, encoded_slug
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(Error::Api {
+                status: resp.status().as_u16(),
                 body: format!(
-                    "could not extract entityUrn from any profile endpoint for '{}'",
+                    "preload page returned non-success for vanityName={}",
                     public_id
                 ),
-            })
+            });
+        }
+
+        let html = resp.text().await?;
+        extract_profile_urn_from_preload_html(&html, public_id).ok_or_else(|| Error::Api {
+            status: 200,
+            body: format!(
+                "preload page did not contain an fsd_profile URN paired with publicIdentifier={}",
+                public_id
+            ),
+        })
     }
 
     /// React to a post or activity with a specific reaction type.
@@ -2088,6 +2151,43 @@ fn is_retriable_graphql_error(err: &Error) -> bool {
     }
 }
 
+/// Extract the fsd_profile URN paired with a given slug from the preload
+/// custom-invite page's embedded JSON state.
+///
+/// The page is a 1MB+ HTML document; the relevant JSON is doubly encoded
+/// (an HTML-escaped `&quot;` string inside an `<code>` block) so quote
+/// characters are looked for as `&quot;`. The pattern we anchor on is:
+///
+/// ```text
+/// "entityUrn":"urn:li:fsd_profile:<id>" ... "publicIdentifier":"<slug>"
+/// ```
+///
+/// (with each `"` replaced by `&quot;` in the actual bytes).
+///
+/// Strategy: locate the `publicIdentifier:<slug>` marker, then walk back
+/// up to ~500 bytes looking for the nearest preceding `entityUrn` value.
+/// The 500-byte window is empirical and matches the JSON-record size for
+/// the embedded profile entity at the time of capture (29-04-2026).
+fn extract_profile_urn_from_preload_html(html: &str, slug: &str) -> Option<String> {
+    let slug_marker = format!("publicIdentifier&quot;:&quot;{}&quot;", slug);
+    let slug_pos = html.find(&slug_marker)?;
+    let window_start = slug_pos.saturating_sub(500);
+    let window = &html[window_start..slug_pos];
+
+    let urn_key = "entityUrn&quot;:&quot;urn:li:fsd_profile:";
+    let urn_key_pos = window.rfind(urn_key)?;
+    let urn_start = window_start + urn_key_pos + "entityUrn&quot;:&quot;".len();
+    let urn_end_marker = "&quot;";
+    let rel_end = html[urn_start..].find(urn_end_marker)?;
+    let urn = &html[urn_start..urn_start + rel_end];
+
+    if urn.starts_with("urn:li:fsd_profile:") {
+        Some(urn.to_string())
+    } else {
+        None
+    }
+}
+
 /// Compute the backoff delay for the Nth GraphQL retry attempt.
 ///
 /// Reuses [`BASE_BACKOFF_MS`] / [`MAX_BACKOFF_MS`] from the HTTP retry layer
@@ -2439,6 +2539,58 @@ mod tests {
     #[test]
     fn restli_encode_empty_string() {
         assert_eq!(restli_encode_string(""), "''");
+    }
+
+    #[test]
+    fn preload_extractor_finds_target_urn() {
+        // Mimic the preload-page shape: HTML-escaped JSON with a target
+        // entity and an unrelated viewer entity also present.
+        let html = r#"
+        <code>
+        {&quot;data&quot;:{&quot;identityProfile&quot;:[{
+        &quot;firstName&quot;:&quot;Olga&quot;,
+        &quot;lastName&quot;:&quot;Safonova&quot;,
+        &quot;dashEntityUrn&quot;:&quot;urn:li:fsd_profile:ACoAAA111VIEWER&quot;,
+        &quot;publicIdentifier&quot;:&quot;olgasafonova&quot;
+        }]}}
+        ...lots of unrelated bytes...
+        {&quot;target&quot;:{
+        &quot;entityUrn&quot;:&quot;urn:li:fsd_profile:ACoAAA222TARGET&quot;,
+        &quot;emailRequired&quot;:false,
+        &quot;publicIdentifier&quot;:&quot;jomar&quot;
+        }}
+        </code>"#;
+
+        let urn = extract_profile_urn_from_preload_html(html, "jomar").unwrap();
+        assert_eq!(urn, "urn:li:fsd_profile:ACoAAA222TARGET");
+    }
+
+    #[test]
+    fn preload_extractor_picks_correct_urn_when_viewer_listed_first() {
+        // The viewer's URN appears earlier in the document (in the me-menu /
+        // global nav state). We must pick the URN paired with the target
+        // slug, not the viewer's. This is the disambiguation case.
+        let html = r#"&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:VIEWER&quot;,&quot;publicIdentifier&quot;:&quot;me&quot;,...later...&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:TARGET&quot;,&quot;publicIdentifier&quot;:&quot;target-slug&quot;"#;
+        let urn = extract_profile_urn_from_preload_html(html, "target-slug").unwrap();
+        assert_eq!(urn, "urn:li:fsd_profile:TARGET");
+    }
+
+    #[test]
+    fn preload_extractor_returns_none_when_slug_absent() {
+        let html = r#"&quot;publicIdentifier&quot;:&quot;someone-else&quot;"#;
+        assert!(extract_profile_urn_from_preload_html(html, "missing").is_none());
+    }
+
+    #[test]
+    fn preload_extractor_returns_none_when_no_urn_in_window() {
+        // Slug is present but no entityUrn marker appears within the lookback
+        // window before it.
+        let big_padding = "x".repeat(2000);
+        let html = format!(
+            "&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:TARGET&quot; {} &quot;publicIdentifier&quot;:&quot;jomar&quot;",
+            big_padding
+        );
+        assert!(extract_profile_urn_from_preload_html(&html, "jomar").is_none());
     }
 
     #[test]
