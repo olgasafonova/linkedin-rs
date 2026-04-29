@@ -6,7 +6,7 @@ This project is for personal and educational use only.
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
+The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
 
 | Command | Description |
 |---------|-------------|
@@ -23,7 +23,7 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | **Feed** | |
 | `feed list` | List feed updates (paginated) |
 | `feed read <n>` | Show full post details for item N from the last `feed list` |
-| `feed view <urn>` | Display a post from your current top-50 feed window by activity URN (for out-of-window posts, use `feed read N` after `feed list`) |
+| `feed view <urn>` | Display a post by activity URN; scans your top-50 feed first and falls back to LinkedIn's `highlightedFeed` finder for out-of-window posts |
 | `feed comments <n>` | Show comments on post N from the last `feed list` |
 | `feed react <urn>` | React to a post (LIKE, PRAISE, EMPATHY, etc.) |
 | `feed unreact <urn>` | Remove a reaction from a post |
@@ -40,14 +40,17 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | **Connections** | |
 | `connections list` | List your connections (paginated) |
 | `connections invite <id>` | Send a connection request with optional message |
+| `connections invite-batch --from-file <path>` | Send invitations to multiple members from a list (file or stdin) |
 | `connections invitations` | List pending received invitations |
 | `connections accept <id>` | Accept a pending invitation |
+| `connections withdraw <id>` | Withdraw a sent (pending) invitation |
 | **Search** | |
 | `search people <keywords>` | Search for people by keywords |
 | `search jobs <keywords>` | Search for jobs by keywords |
 | `search posts <keywords>` | Search for posts/content by keywords |
 | `search react <n>` | React to a post from the last search results |
 | `search view <n>` | View a profile from the last people search results |
+| `search invite <n>` | Send a connection request to a profile from the last people search |
 | **Company** | |
 | `company view <slug>` | View company info by URL slug |
 | `company followers <slug>` | List company page followers (requires admin access) |
@@ -56,6 +59,7 @@ The CLI (`linkedin-cli`) exposes 36 subcommands across 11 domains:
 | `events attendees <id>` | List event attendees (paginated) |
 | **Notifications** | |
 | `notifications list` | List notification cards (paginated) |
+| `notifications mentions <n>` | Show everyone @-mentioned in the post behind notification N |
 | **Composite** | |
 | `inbox` | Daily inbox: unread messages, pending invitations, recent notifications |
 | `who <company>` | Who do you know at a company? Network overlap in one command |
@@ -150,7 +154,8 @@ li feed list --count 20
 # Read full details of post #3 from the last feed list
 li feed read 3
 
-# View a specific post by URN (only works if it's in your current top-50 feed)
+# View a specific post by URN (cache-warm in your top-50 feed,
+# or via the highlightedFeed fallback for older posts)
 li feed view urn:li:activity:7312345678901234567
 
 # Show comments on post #5 from the last feed list
@@ -214,11 +219,18 @@ li connections list --count 50
 li connections invite john-doe-123
 li connections invite john-doe-123 --message "Met you at the conference"
 
-# List pending invitations
+# Batch invitations from a file (one public ID or fsd_profile URN per line;
+# also accepts stdin via --from-file -)
+li connections invite-batch --from-file invites.txt --message "Hi from the meetup"
+
+# List pending received invitations
 li connections invitations
 
 # Accept an invitation (get ID and secret from invitations --json)
 li connections accept 7312345678901234567 --secret abc123
+
+# Withdraw a sent invitation that hasn't been accepted yet
+li connections withdraw 7312345678901234567 --secret abc123
 ```
 
 ### Search
@@ -238,6 +250,9 @@ li search react 2
 
 # View profile #3 from the last people search
 li search view 3
+
+# Invite profile #4 from the last people search to connect
+li search invite 4 --message "Saw your post on observability"
 ```
 
 ### Company
@@ -265,6 +280,9 @@ li events attendees 7447661801514938369 --count 50
 ```bash
 # List notifications
 li notifications list --count 20
+
+# Show everyone @-mentioned alongside you in the post behind notification #3
+li notifications mentions 3
 ```
 
 ### Composite Commands

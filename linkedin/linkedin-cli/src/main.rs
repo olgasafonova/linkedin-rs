@@ -230,12 +230,13 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
-    /// Display a post by activity URN if it's in your current top-50 feed
+    /// Display a post by activity URN
     ///
-    /// LinkedIn's Voyager API doesn't expose arbitrary-post fetch, so this
-    /// scans the top 50 items of your feed for a match. For out-of-window
-    /// posts use `feed read N` after `feed list` instead — it pulls from
-    /// the already-cached listing without a network call.
+    /// First scans the top 50 items of your feed for a match (cache-warm
+    /// path, no extra network call). On miss, falls back to LinkedIn's
+    /// `highlightedFeed` finder, which fetches by URN. For posts that are
+    /// already in your last `feed list`, `feed read N` is faster — it
+    /// pulls from the cached listing without any network call.
     View {
         /// Activity URN (urn:li:activity:1234...) or just the numeric ID
         activity_urn: String,
