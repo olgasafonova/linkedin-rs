@@ -1660,42 +1660,53 @@ impl LinkedInClient {
 
     /// Send a connection request (invitation) to another LinkedIn member.
     ///
-    /// Uses the Voyager `normInvitations` REST endpoint discovered in the
-    /// decompiled China APK's `InvitationNetworkUtil.sendInvite()` method.
-    /// The route is `Routes.NORM_INVITATIONS` which maps to
-    /// `voyagerGrowthNormInvitations` (see `MyNetworkRoutesUtil.makeSendGrowthInvitationRoute()`).
+    /// Uses the Voyager Dash `MemberRelationships` endpoint with the
+    /// `verifyQuotaAndCreateV2` action. The legacy
+    /// `voyagerGrowthNormInvitations` endpoint started returning HTTP 301
+    /// on 29-04-2026 and is treated as retired; the Dash relationships
+    /// endpoint is what the live linkedin.com web client uses.
     ///
-    /// The international APK uses the Dash variant at
-    /// `voyagerRelationshipsDashInvitations?action=create`, but the legacy
-    /// `normInvitations` endpoint is confirmed to still work on production.
+    /// The contract was captured from the live web flow at
+    /// `/preload/custom-invite/?vanityName=<vanity>` (Send without a note).
+    /// The action name signals that LinkedIn enforces the weekly invitation
+    /// quota at the same call.
     ///
-    /// The request body is a `NormInvitation` model (see
-    /// `MyNetworkRequestUtil.buildInvitation()` in the decompiled code):
+    /// ```text
+    /// POST /voyager/api/voyagerRelationshipsDashMemberRelationships
+    ///   ?action=verifyQuotaAndCreateV2
+    ///   &decorationId=com.linkedin.voyager.dash.deco.relationships.InvitationCreationResultWithInvitee-2
+    /// ```
+    ///
+    /// Body shape:
+    ///
     /// ```json
     /// {
     ///   "invitee": {
-    ///     "com.linkedin.voyager.growth.invitation.InviteeProfile": {
-    ///       "profileId": "<member_id>"
+    ///     "inviteeUnion": {
+    ///       "memberProfile": "urn:li:fsd_profile:ACoAAA..."
     ///     }
-    ///   },
-    ///   "trackingId": "<base64-encoded-16-random-bytes>",
-    ///   "message": "optional custom message"
+    ///   }
     /// }
     /// ```
+    ///
+    /// The modern endpoint takes the *full* fsd_profile URN, not the bare
+    /// member ID required by the retired norm endpoint. No `trackingId` is
+    /// sent.
     ///
     /// # Parameters
     ///
     /// - `profile_urn`: The target member's profile URN
-    ///   (e.g. `urn:li:fsd_profile:ACoAAA...`). The member ID is extracted
-    ///   from the URN automatically.
-    /// - `message`: Optional custom message to include with the invitation.
-    ///   LinkedIn limits this to ~300 characters; we do not enforce that here
-    ///   (the server will reject messages that are too long).
+    ///   (e.g. `urn:li:fsd_profile:ACoAAA...`).
+    /// - `message`: Optional custom message. The placement of this field on
+    ///   the new endpoint is unverified — the smoke capture was a "Send
+    ///   without a note" flow. For now the message is attached at the top
+    ///   level as a best-effort carry-over from the legacy contract; treat
+    ///   with-note sends as untested until a separate capture is added.
     ///
     /// # Returns
     ///
-    /// The raw JSON response from the API. On success LinkedIn returns the
-    /// created invitation entity.
+    /// The raw JSON response. On success LinkedIn returns an
+    /// `InvitationCreationResultWithInvitee` entity (per the decoration).
     ///
     /// See `re/connection_request.md` for the full endpoint analysis.
     pub async fn send_connection_request(
@@ -1703,31 +1714,14 @@ impl LinkedInClient {
         profile_urn: &str,
         message: Option<&str>,
     ) -> Result<Value, Error> {
-        // Extract the member ID from the URN. The NormInvitation model uses
-        // a bare profileId (the part after the last colon in the URN), not
-        // the full URN.
-        let member_id = profile_urn.rsplit(':').next().unwrap_or(profile_urn);
-
-        // Generate a tracking ID: 16 random bytes, base64-encoded.
-        // This matches TrackingUtils.generateBase64EncodedTrackingId() in the
-        // decompiled code.
-        use base64::Engine;
-        let tracking_bytes: [u8; 16] = rand::random();
-        let tracking_id = base64::engine::general_purpose::STANDARD.encode(tracking_bytes);
-
-        // Build the NormInvitation payload matching the model from
-        // com.linkedin.android.pegasus.gen.voyager.growth.invitation.NormInvitation.
-        // The invitee is a Rest.li union, requiring the fully-qualified type key.
         let mut payload = serde_json::json!({
-            "trackingId": tracking_id,
             "invitee": {
-                "com.linkedin.voyager.growth.invitation.InviteeProfile": {
-                    "profileId": member_id
+                "inviteeUnion": {
+                    "memberProfile": profile_urn
                 }
             }
         });
 
-        // Add optional custom message.
         if let Some(msg) = message {
             payload.as_object_mut().unwrap().insert(
                 "message".to_string(),
@@ -1735,7 +1729,11 @@ impl LinkedInClient {
             );
         }
 
-        self.post("voyagerGrowthNormInvitations", &payload).await
+        let path = "voyagerRelationshipsDashMemberRelationships\
+                    ?action=verifyQuotaAndCreateV2\
+                    &decorationId=com.linkedin.voyager.dash.deco.relationships.InvitationCreationResultWithInvitee-2";
+
+        self.post(path, &payload).await
     }
 
     /// Fetch pending (received) connection invitations.

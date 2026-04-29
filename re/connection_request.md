@@ -2,9 +2,62 @@
 
 ## Summary
 
-LinkedIn's Android app sends connection invitations via a REST POST to the
-`normInvitations` endpoint. The international (Dash) variant uses a newer
-`voyagerRelationshipsDashInvitations` endpoint with `?action=create`.
+As of **29-04-2026** LinkedIn's live web client sends connection invitations
+through the Dash `MemberRelationships` endpoint with action
+`verifyQuotaAndCreateV2`. The legacy `voyagerGrowthNormInvitations`
+endpoint (used by older Android builds and the previous version of this
+crate) now returns HTTP 301 — treat it as retired.
+
+The Dash *invitations* endpoint anticipated by the international APK
+(`voyagerRelationshipsDashInvitations?action=create`) is *not* what the
+modern web client uses. The contract below was captured from the live
+flow at `linkedin.com/preload/custom-invite/?vanityName=<vanity>` (Send
+without a note → POST observed in browser network capture).
+
+## Modern endpoint (live, used by this crate)
+
+```text
+POST /voyager/api/voyagerRelationshipsDashMemberRelationships
+  ?action=verifyQuotaAndCreateV2
+  &decorationId=com.linkedin.voyager.dash.deco.relationships.InvitationCreationResultWithInvitee-2
+```
+
+The action name suggests LinkedIn enforces the weekly invitation quota at
+the same call (the V2 suffix indicates this is the second iteration of the
+combined verify + create flow).
+
+### Request body
+
+```json
+{
+  "invitee": {
+    "inviteeUnion": {
+      "memberProfile": "urn:li:fsd_profile:ACoAAA..."
+    }
+  }
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `invitee.inviteeUnion.memberProfile` | string (full URN) | Yes | Full `urn:li:fsd_profile:` URN — *not* the bare member ID the legacy endpoint required |
+| `message` | string | No | Placement on the modern endpoint is **unverified** — the smoke capture was a "Send without a note" flow. The crate currently attaches the field at the top level as a best-effort carry-over from the legacy contract |
+
+No `trackingId` is sent. No fully-qualified Java type key is needed in the
+inner union (the legacy endpoint required `com.linkedin.voyager.growth.invitation.InviteeProfile`).
+
+### Response
+
+LinkedIn returns an `InvitationCreationResultWithInvitee-2` decorated
+entity (per the `decorationId` query parameter).
+
+## Retired endpoints (historical)
+
+### Legacy (Growth / normInvitations) — retired 29-04-2026
+
+```text
+POST /voyager/api/voyagerGrowthNormInvitations
+```
 
 ## Endpoints
 
@@ -123,9 +176,23 @@ From `Routes.java` in the decompiled code:
 
 ## Implementation
 
-We use the legacy `voyagerGrowthNormInvitations` endpoint because:
-1. It is simpler (no Dash decoration/recipe parameters needed)
-2. It is confirmed to still work on production
-3. The `NormInvitation` model structure is fully visible in the decompiled code
-4. The Dash endpoint requires additional recipe parameters and uses a different
-   model structure that is harder to reconstruct from obfuscated code
+We use `voyagerRelationshipsDashMemberRelationships?action=verifyQuotaAndCreateV2`
+(see `linkedin-api/src/client.rs::send_connection_request`). The legacy
+`normInvitations` endpoint stopped working on 29-04-2026; the Dash
+`Invitations?action=create` route from the international APK was *not* the
+replacement LinkedIn picked — the modern web client targets the
+`MemberRelationships` resource directly.
+
+### Open follow-ups
+
+1. **With-message capture.** The smoke flow used "Send without a note", so
+   the placement of the `message` field on the new endpoint is unverified.
+   Capture an "Add a note" flow and either confirm the top-level placement
+   or correct the body shape.
+2. **Email invitee variant.** The legacy contract supported `InviteeEmail`
+   for email-verified invitations. The Dash endpoint may use a different
+   union member name (e.g. `emailContact` or similar). Out of scope for the
+   current fix.
+3. **Withdraw / cancel.** Likely also moved to the `MemberRelationships`
+   resource (different action on the same path). Worth a separate capture
+   when the withdraw flow is needed.
