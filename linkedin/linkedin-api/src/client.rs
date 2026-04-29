@@ -2620,20 +2620,20 @@ mod tests {
         let html = r#"
         <code>
         {&quot;data&quot;:{&quot;identityProfile&quot;:[{
-        &quot;firstName&quot;:&quot;Olga&quot;,
-        &quot;lastName&quot;:&quot;Safonova&quot;,
+        &quot;firstName&quot;:&quot;Test&quot;,
+        &quot;lastName&quot;:&quot;Viewer&quot;,
         &quot;dashEntityUrn&quot;:&quot;urn:li:fsd_profile:ACoAAA111VIEWER&quot;,
-        &quot;publicIdentifier&quot;:&quot;olgasafonova&quot;
+        &quot;publicIdentifier&quot;:&quot;test-viewer&quot;
         }]}}
         ...lots of unrelated bytes...
         {&quot;target&quot;:{
         &quot;entityUrn&quot;:&quot;urn:li:fsd_profile:ACoAAA222TARGET&quot;,
         &quot;emailRequired&quot;:false,
-        &quot;publicIdentifier&quot;:&quot;jomar&quot;
+        &quot;publicIdentifier&quot;:&quot;target-user&quot;
         }}
         </code>"#;
 
-        let urn = extract_profile_urn_from_preload_html(html, "jomar").unwrap();
+        let urn = extract_profile_urn_from_preload_html(html, "target-user").unwrap();
         assert_eq!(urn, "urn:li:fsd_profile:ACoAAA222TARGET");
     }
 

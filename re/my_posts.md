@@ -42,7 +42,7 @@ Standard Rest.li collection response with `UpdateV2` elements -- same format as 
       "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7447168805107032064,MEMBER_SHARES,DEBUG_REASON,DEFAULT,false)",
       "value": {
         "com.linkedin.voyager.feed.render.UpdateV2": {
-          "actor": { "name": { "text": "Olga Safonova" }, ... },
+          "actor": { "name": { "text": "<redacted>" }, ... },
           "commentary": { "text": { "text": "Post content here..." } },
           "socialDetail": {
             "totalSocialActivityCounts": {
