@@ -1923,6 +1923,52 @@ impl LinkedInClient {
         self.post(&path, &body).await
     }
 
+    /// Withdraw a sent (pending) connection invitation.
+    ///
+    /// Uses the same Dash REST endpoint as `accept_invitation`, with
+    /// `action=withdraw`. Discovered in
+    /// `InvitationActionsRepository.Companion.buildInvitationActionRoute()`,
+    /// where `WITHDRAW` is one of the documented action values alongside
+    /// `accept`, `ignore`, and `reportSpam`.
+    ///
+    /// ```text
+    /// POST /voyager/api/voyagerRelationshipsDashInvitations/{invitation_urn}?action=withdraw
+    /// ```
+    ///
+    /// The body shape mirrors the accept action: `invitationUrn` and
+    /// `sharedSecret`. The `sharedSecret` is taken from the sent-invitation
+    /// list response (CSRF protection, same as accept).
+    ///
+    /// # Parameters
+    ///
+    /// - `invitation_urn`: The full invitation URN
+    ///   (e.g. `urn:li:fsd_invitation:7...`).
+    /// - `shared_secret`: The `sharedSecret` string paired with the invitation.
+    ///
+    /// # Returns
+    ///
+    /// The raw JSON response. On success LinkedIn typically returns an
+    /// empty body or a confirmation entity.
+    ///
+    /// See `re/invitations.md` for the action enum and body shape.
+    pub async fn withdraw_invitation(
+        &self,
+        invitation_urn: &str,
+        shared_secret: &str,
+    ) -> Result<Value, Error> {
+        let path = format!(
+            "voyagerRelationshipsDashInvitations/{}?action=withdraw",
+            invitation_urn
+        );
+
+        let body = serde_json::json!({
+            "invitationUrn": invitation_urn,
+            "sharedSecret": shared_secret
+        });
+
+        self.post(&path, &body).await
+    }
+
     /// Fetch followers of a company page.
     ///
     /// Tries multiple endpoint patterns since LinkedIn's follower list

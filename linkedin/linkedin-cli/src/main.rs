@@ -503,6 +503,24 @@ enum ConnectionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Withdraw a sent (pending) connection invitation
+    ///
+    /// Cancels an outgoing invitation that hasn't been accepted yet. Pairs
+    /// with `connections invite` to undo invites you sent. The invitation
+    /// URN and shared secret come from the sent-invitations list (capture
+    /// from devtools or a future `connections sent` command).
+    Withdraw {
+        /// Invitation ID (numeric portion of the invitation URN, e.g. 7312345678901234567)
+        invitation_id: String,
+
+        /// Shared secret from the invitation (required for CSRF protection).
+        #[arg(long)]
+        secret: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -888,6 +906,11 @@ async fn main() {
                 secret,
                 json,
             } => exit_on_err(cmd_connections_accept(&invitation_id, &secret, json).await),
+            ConnectionsAction::Withdraw {
+                invitation_id,
+                secret,
+                json,
+            } => exit_on_err(cmd_connections_withdraw(&invitation_id, &secret, json).await),
         },
         Commands::Search { action } => match action {
             SearchAction::People {
@@ -4173,6 +4196,35 @@ async fn cmd_connections_accept(
         println!("{}", pretty);
     } else {
         println!("Invitation accepted: {}", invitation_urn);
+    }
+
+    Ok(())
+}
+
+async fn cmd_connections_withdraw(
+    invitation_id: &str,
+    shared_secret: &str,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+
+    let invitation_urn = if invitation_id.starts_with("urn:li:") {
+        invitation_id.to_string()
+    } else {
+        format!("urn:li:fsd_invitation:{}", invitation_id)
+    };
+
+    let value = client
+        .withdraw_invitation(&invitation_urn, shared_secret)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Invitation withdrawn: {}", invitation_urn);
     }
 
     Ok(())
