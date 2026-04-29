@@ -1271,10 +1271,7 @@ impl LinkedInClient {
     /// in the same JSON object as `publicIdentifier:<slug>`.
     ///
     /// Used as a fallback after REST/GraphQL paths exhaust their retries.
-    pub async fn resolve_profile_urn_via_preload(
-        &self,
-        public_id: &str,
-    ) -> Result<String, Error> {
+    pub async fn resolve_profile_urn_via_preload(&self, public_id: &str) -> Result<String, Error> {
         let encoded_slug =
             url::form_urlencoded::byte_serialize(public_id.as_bytes()).collect::<String>();
         let url = format!(

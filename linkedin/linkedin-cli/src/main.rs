@@ -1831,11 +1831,7 @@ async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
 ///
 /// Loads the session, creates a client, calls the identity/profiles endpoint
 /// with decoration for full field projection, and prints the result.
-async fn cmd_profile_view(
-    public_id: &str,
-    raw_json: bool,
-    summary: bool,
-) -> Result<(), String> {
+async fn cmd_profile_view(public_id: &str, raw_json: bool, summary: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let profile = client
@@ -6702,7 +6698,8 @@ mod tests {
 
     #[test]
     fn hint_for_resolver_failure_suggests_alternatives() {
-        let hint = error_hint("failed to resolve profile: API error (HTTP 200): GraphQL errors: ...");
+        let hint =
+            error_hint("failed to resolve profile: API error (HTTP 200): GraphQL errors: ...");
         assert!(hint.unwrap().contains("URN") || hint.unwrap().contains("search invite"));
     }
 
