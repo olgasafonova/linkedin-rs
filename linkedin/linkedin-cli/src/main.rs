@@ -354,8 +354,14 @@ enum ProfileAction {
         public_id: String,
 
         /// Output raw JSON instead of human-readable format
-        #[arg(long)]
+        #[arg(long, conflicts_with = "summary")]
         json: bool,
+
+        /// Output a compact JSON summary (URN, public ID, name, headline,
+        /// location, relationship state, follower count). Useful for scripting
+        /// and batch flows. Suppresses the full ~150KB profile dump.
+        #[arg(long)]
+        summary: bool,
     },
     /// Visit a profile (registers you in "who viewed my profile")
     Visit {
@@ -416,6 +422,29 @@ enum ConnectionsAction {
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
+    },
+    /// Send connection invitations to multiple members from a list
+    ///
+    /// Reads slugs/URNs (one per line) from --from-file or stdin and sends
+    /// each. Lines starting with `#` and blank lines are ignored. The
+    /// command keeps going on per-line failures and reports a tab-separated
+    /// status line per input. Sleeps between calls to respect rate limits.
+    InviteBatch {
+        /// Path to a file with one slug or URN per line. Use `-` for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
+
+        /// Optional custom message included with every invitation
+        #[arg(long)]
+        message: Option<String>,
+
+        /// Milliseconds to sleep between calls (default 2000)
+        #[arg(long, default_value = "2000")]
+        pacing_ms: u64,
+
+        /// Stop on the first failure instead of continuing through the list
+        #[arg(long)]
+        stop_on_error: bool,
     },
     /// List pending (received) connection invitations
     Invitations {
@@ -517,6 +546,22 @@ enum SearchAction {
     View {
         /// 1-based index from the most recent `search people` results
         index: usize,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a connection invitation to a profile from the last people
+    /// search results, by index. Uses the cached entity URN directly,
+    /// bypassing the slug-resolver path that depends on the GraphQL profile
+    /// endpoint.
+    Invite {
+        /// 1-based index from the most recent `search people` results
+        index: usize,
+
+        /// Optional custom message to include with the invitation
+        #[arg(long)]
+        message: Option<String>,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -685,9 +730,11 @@ async fn main() {
         },
         Commands::Profile { action } => match action {
             ProfileAction::Me { json } => exit_on_err(cmd_profile_me(json).await),
-            ProfileAction::View { public_id, json } => {
-                exit_on_err(cmd_profile_view(&public_id, json).await)
-            }
+            ProfileAction::View {
+                public_id,
+                json,
+                summary,
+            } => exit_on_err(cmd_profile_view(&public_id, json, summary).await),
             ProfileAction::Visit { public_id, json } => {
                 exit_on_err(cmd_profile_visit(&public_id, json).await)
             }
@@ -787,6 +834,20 @@ async fn main() {
             } => exit_on_err(
                 cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await,
             ),
+            ConnectionsAction::InviteBatch {
+                from_file,
+                message,
+                pacing_ms,
+                stop_on_error,
+            } => exit_on_err(
+                cmd_connections_invite_batch(
+                    &from_file,
+                    message.as_deref(),
+                    pacing_ms,
+                    stop_on_error,
+                )
+                .await,
+            ),
             ConnectionsAction::Invitations { count, start, json } => {
                 exit_on_err(cmd_connections_invitations(start, count, json).await)
             }
@@ -821,6 +882,11 @@ async fn main() {
                 json,
             } => exit_on_err(cmd_search_react(index, &reaction_type, json).await),
             SearchAction::View { index, json } => exit_on_err(cmd_search_view(index, json).await),
+            SearchAction::Invite {
+                index,
+                message,
+                json,
+            } => exit_on_err(cmd_search_invite(index, message.as_deref(), json).await),
         },
         Commands::Events { action } => match action {
             EventsAction::View { event_id, json } => {
@@ -1729,11 +1795,15 @@ async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Handle `profile view <public_id> [--json]`.
+/// Handle `profile view <public_id> [--json|--summary]`.
 ///
 /// Loads the session, creates a client, calls the identity/profiles endpoint
 /// with decoration for full field projection, and prints the result.
-async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_profile_view(
+    public_id: &str,
+    raw_json: bool,
+    summary: bool,
+) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let profile = client
@@ -1741,7 +1811,12 @@ async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String>
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
-    if raw_json {
+    if summary {
+        let summary_value = extract_profile_summary(&profile);
+        let pretty = serde_json::to_string_pretty(&summary_value)
+            .map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else if raw_json {
         let pretty = serde_json::to_string_pretty(&profile)
             .map_err(|e| format!("JSON format error: {e}"))?;
         println!("{}", pretty);
@@ -1750,6 +1825,69 @@ async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String>
     }
 
     Ok(())
+}
+
+/// Extract the high-signal fields from a `profile view` response.
+///
+/// Targets: machine-readable scripting (`--summary` flag) where the caller
+/// only needs the identity + the connection-degree state. Returns a stable
+/// shape regardless of which optional sub-objects are missing in the raw
+/// response.
+///
+/// The relationship state is the key inside
+/// `memberRelationship.memberRelationship` (typically `connection`,
+/// `noConnection`, `invitationPending`, etc.). When the field is absent it
+/// is reported as `null`.
+fn extract_profile_summary(profile: &serde_json::Value) -> serde_json::Value {
+    let first = profile
+        .get("firstName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let last = profile
+        .get("lastName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let full_name = match (first.is_empty(), last.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => first.to_string(),
+        (true, false) => last.to_string(),
+        (false, false) => format!("{} {}", first, last),
+    };
+
+    let relationship_state = profile
+        .get("memberRelationship")
+        .and_then(|v| v.get("memberRelationship"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.keys().next().map(|s| s.as_str()))
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .unwrap_or(serde_json::Value::Null);
+
+    let follower_count = profile
+        .get("profileProfileActions")
+        .and_then(|v| v.get("overflowActionsResolutionResults"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("followingState"))
+                .filter_map(|fs| fs.get("followerCount"))
+                .next()
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "publicIdentifier": profile.get("publicIdentifier").cloned().unwrap_or(serde_json::Value::Null),
+        "entityUrn": profile.get("entityUrn").cloned().unwrap_or(serde_json::Value::Null),
+        "objectUrn": profile.get("objectUrn").cloned().unwrap_or(serde_json::Value::Null),
+        "name": full_name,
+        "firstName": first,
+        "lastName": last,
+        "headline": profile.get("headline").cloned().unwrap_or(serde_json::Value::Null),
+        "location": profile.get("locationName").cloned().unwrap_or(serde_json::Value::Null),
+        "industry": profile.get("industry").cloned().unwrap_or(serde_json::Value::Null),
+        "relationshipState": relationship_state,
+        "followerCount": follower_count,
+    })
 }
 
 /// Handle `profile visit <public_id> [--json]`.
@@ -3830,6 +3968,103 @@ async fn cmd_connections_invite(
         }
     }
 
+    Ok(())
+}
+
+/// Parse a batch input list (one slug/URN per line).
+///
+/// Strips surrounding whitespace from each line and drops blank lines and
+/// comments (lines starting with `#`). Inline trailing comments are kept
+/// as-is — only full-line comments are filtered, since slugs never start
+/// with `#` and a strict parser surprises less than a clever one.
+fn parse_batch_targets(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Handle `connections invite-batch --from-file <path|->`.
+///
+/// Sends a connection invitation to each line of the input list with a
+/// configurable pacing delay between calls. Tab-separated status lines on
+/// stdout, errors on stderr. Returns Err only when stop_on_error is set
+/// and a per-line failure occurs; otherwise summarises with a final
+/// success/fail count.
+async fn cmd_connections_invite_batch(
+    from_file: &str,
+    message: Option<&str>,
+    pacing_ms: u64,
+    stop_on_error: bool,
+) -> Result<(), String> {
+    let raw = if from_file == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| format!("failed to read stdin: {e}"))?;
+        buf
+    } else {
+        std::fs::read_to_string(from_file)
+            .map_err(|e| format!("failed to read {}: {}", from_file, e))?
+    };
+
+    let targets = parse_batch_targets(&raw);
+    if targets.is_empty() {
+        return Err("no targets in input (every line was blank or a comment)".to_string());
+    }
+
+    let (client, _path) = load_session_client()?;
+
+    let total = targets.len();
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+
+    for (i, target) in targets.iter().enumerate() {
+        if i > 0 && pacing_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
+        }
+
+        let profile_urn = if target.starts_with("urn:li:") {
+            target.clone()
+        } else {
+            match client.resolve_profile_urn(target).await {
+                Ok(u) => u,
+                Err(e) => {
+                    fail_count += 1;
+                    println!("{}\tFAIL\tresolve: {}", target, e);
+                    if stop_on_error {
+                        return Err(format!("stopped at #{} ({}): {}", i + 1, target, e));
+                    }
+                    continue;
+                }
+            }
+        };
+
+        match client.send_connection_request(&profile_urn, message).await {
+            Ok(value) => {
+                let invitation = value
+                    .get("value")
+                    .and_then(|v| v.get("invitationUrn"))
+                    .or_else(|| value.get("invitationUrn"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no invitation urn)");
+                ok_count += 1;
+                println!("{}\tOK\t{}", target, invitation);
+            }
+            Err(e) => {
+                fail_count += 1;
+                println!("{}\tFAIL\tsend: {}", target, e);
+                if stop_on_error {
+                    return Err(format!("stopped at #{} ({}): {}", i + 1, target, e));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "Batch complete: {} ok, {} failed (of {} total)",
+        ok_count, fail_count, total
+    );
     Ok(())
 }
 
@@ -5957,7 +6192,137 @@ async fn cmd_search_view(index: usize, raw_json: bool) -> Result<(), String> {
 
     let slug = resolve_search_person_slug(index)?;
     eprintln!("Loading profile '{}'...", slug);
-    cmd_profile_view(&slug, raw_json).await
+    cmd_profile_view(&slug, raw_json, false).await
+}
+
+/// Handle `search invite <index> [--message ...] [--json]`.
+///
+/// Sends a connection invitation to the Nth person in the most recent
+/// `search people` results. Pulls the entity URN out of the cached search
+/// response so the request never has to resolve a slug — bypasses the
+/// flaky GraphQL profile resolver entirely. Falls back to slug-based
+/// invite if the cached entry doesn't carry a usable URN (older cache
+/// shapes, or LinkedIn omitting the field for a particular result).
+async fn cmd_search_invite(
+    index: usize,
+    message: Option<&str>,
+    raw_json: bool,
+) -> Result<(), String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+
+    let target = resolve_search_person_target(index)?;
+    eprintln!(
+        "Inviting {} via cached search result #{}",
+        target.label(),
+        index
+    );
+    cmd_connections_invite(&target.invite_arg(), message, raw_json).await
+}
+
+/// Resolved target for a cached search result.
+///
+/// Carries both the URN (preferred for invites) and the slug (fallback +
+/// human-readable label). One of these is always present; the other may
+/// be absent depending on the cached payload shape.
+struct SearchPersonTarget {
+    urn: Option<String>,
+    slug: Option<String>,
+    name: Option<String>,
+}
+
+impl SearchPersonTarget {
+    /// Pick the best argument to pass to `cmd_connections_invite`. Prefers
+    /// URN (skips the resolver) but falls through to slug when needed.
+    fn invite_arg(&self) -> String {
+        self.urn
+            .clone()
+            .or_else(|| self.slug.clone())
+            .expect("SearchPersonTarget must have either urn or slug")
+    }
+
+    fn label(&self) -> String {
+        match (&self.name, &self.slug) {
+            (Some(n), Some(s)) => format!("{} ({})", n, s),
+            (Some(n), None) => n.clone(),
+            (None, Some(s)) => s.clone(),
+            (None, None) => self.urn.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// Resolve a target struct from the cached people-search response by index.
+///
+/// The cache mirrors the GraphQL `searchDashClustersByAll` envelope:
+/// each cluster has an `items` array; entries with an `item.entityResult`
+/// represent a person hit. Sponsored, query-clarification, and feedback
+/// cards are skipped so the index lines up with what the user sees in the
+/// printed list.
+fn resolve_search_person_target(index: usize) -> Result<SearchPersonTarget, String> {
+    let cache = load_search_cache("people")?;
+    let resp: SearchResponse =
+        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
+
+    let mut result_idx = 0usize;
+    for cluster in &resp.elements {
+        let items = cluster
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for item_wrapper in items {
+            let entity = match item_wrapper.get("item").and_then(|i| i.get("entityResult")) {
+                Some(e) => e,
+                None => continue,
+            };
+            result_idx += 1;
+            if result_idx != index {
+                continue;
+            }
+
+            let urn = entity
+                .get("entityUrn")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("urn:li:fsd_profile:"))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    entity
+                        .get("trackingUrn")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| s.starts_with("urn:li:fsd_profile:"))
+                        .map(|s| s.to_string())
+                });
+
+            let slug = entity
+                .get("navigationUrl")
+                .and_then(|v| v.as_str())
+                .and_then(|url| {
+                    url.strip_prefix("https://www.linkedin.com/in/")
+                        .map(|rest| rest.split('?').next().unwrap_or(rest).to_string())
+                });
+
+            let name = entity
+                .get("title")
+                .and_then(|t| t.get("text"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if urn.is_none() && slug.is_none() {
+                return Err(format!(
+                    "search result {} has neither entityUrn nor navigationUrl",
+                    index
+                ));
+            }
+
+            return Ok(SearchPersonTarget { urn, slug, name });
+        }
+    }
+
+    Err(format!(
+        "index {} out of range (search has {} results)",
+        index, result_idx
+    ))
 }
 
 /// Print a human-readable summary of a content search result.
@@ -6232,6 +6597,133 @@ mod tests {
             normalize_reactions_urn("urn:li:ugcPost:7450808001881534464"),
             "urn:li:ugcPost:7450808001881534464"
         );
+    }
+
+    #[test]
+    fn profile_summary_extracts_first_degree_connection() {
+        let profile = json!({
+            "publicIdentifier": "jane-doe",
+            "entityUrn": "urn:li:fsd_profile:ACoAAA111",
+            "objectUrn": "urn:li:member:1",
+            "firstName": "Jane",
+            "lastName": "Doe",
+            "headline": "Engineer",
+            "locationName": "Copenhagen",
+            "industry": "Software",
+            "memberRelationship": {
+                "memberRelationship": {
+                    "connection": {"foo": "bar"}
+                }
+            },
+            "profileProfileActions": {
+                "overflowActionsResolutionResults": [
+                    {"shareProfileUrl": "..."},
+                    {"followingState": {"followerCount": 1234}}
+                ]
+            }
+        });
+
+        let s = extract_profile_summary(&profile);
+        assert_eq!(s["name"], "Jane Doe");
+        assert_eq!(s["firstName"], "Jane");
+        assert_eq!(s["headline"], "Engineer");
+        assert_eq!(s["location"], "Copenhagen");
+        assert_eq!(s["relationshipState"], "connection");
+        assert_eq!(s["followerCount"], 1234);
+        assert_eq!(s["publicIdentifier"], "jane-doe");
+    }
+
+    #[test]
+    fn profile_summary_handles_no_connection() {
+        let profile = json!({
+            "publicIdentifier": "stranger",
+            "firstName": "S",
+            "lastName": "T",
+            "memberRelationship": {
+                "memberRelationship": {
+                    "noConnection": {}
+                }
+            }
+        });
+        let s = extract_profile_summary(&profile);
+        assert_eq!(s["relationshipState"], "noConnection");
+        assert_eq!(s["name"], "S T");
+    }
+
+    #[test]
+    fn batch_parser_strips_blanks_and_comments() {
+        let raw = "\
+# This is a comment
+slug-one
+   slug-two
+
+# another comment
+urn:li:fsd_profile:ACoAAA111
+\t
+
+slug-three
+";
+        let parsed = parse_batch_targets(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "slug-one".to_string(),
+                "slug-two".to_string(),
+                "urn:li:fsd_profile:ACoAAA111".to_string(),
+                "slug-three".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_parser_returns_empty_for_all_comments() {
+        let raw = "# only comments\n# and blanks\n\n   \n";
+        assert!(parse_batch_targets(raw).is_empty());
+    }
+
+    #[test]
+    fn search_target_prefers_entity_urn() {
+        let target = SearchPersonTarget {
+            urn: Some("urn:li:fsd_profile:ACoAAA111".to_string()),
+            slug: Some("jane-doe".to_string()),
+            name: Some("Jane Doe".to_string()),
+        };
+        assert_eq!(target.invite_arg(), "urn:li:fsd_profile:ACoAAA111");
+        assert_eq!(target.label(), "Jane Doe (jane-doe)");
+    }
+
+    #[test]
+    fn search_target_falls_back_to_slug() {
+        let target = SearchPersonTarget {
+            urn: None,
+            slug: Some("jane-doe".to_string()),
+            name: Some("Jane Doe".to_string()),
+        };
+        assert_eq!(target.invite_arg(), "jane-doe");
+    }
+
+    #[test]
+    fn search_target_label_with_only_slug() {
+        let target = SearchPersonTarget {
+            urn: None,
+            slug: Some("jane-doe".to_string()),
+            name: None,
+        };
+        assert_eq!(target.label(), "jane-doe");
+    }
+
+    #[test]
+    fn profile_summary_tolerates_missing_fields() {
+        // Minimal response with only firstName -- nothing should panic; missing
+        // fields should serialize as JSON null, not be silently dropped.
+        let profile = json!({
+            "firstName": "Solo"
+        });
+        let s = extract_profile_summary(&profile);
+        assert_eq!(s["name"], "Solo");
+        assert_eq!(s["headline"], serde_json::Value::Null);
+        assert_eq!(s["relationshipState"], serde_json::Value::Null);
+        assert_eq!(s["followerCount"], serde_json::Value::Null);
     }
 
     #[test]
