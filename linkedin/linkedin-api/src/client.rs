@@ -505,14 +505,15 @@ impl LinkedInClient {
     /// Accepts either a full URN (`urn:li:activity:1234567890`) or just the
     /// numeric activity ID (`1234567890`).
     ///
-    /// # Limitation
+    /// # Resolution order
     ///
-    /// LinkedIn's Voyager API does not expose a REST endpoint that returns
-    /// an arbitrary post by activity URN. This method fetches the first 50
-    /// items from `feed/updates?q=findFeed` and scans them for a matching
-    /// activity ID. Posts outside that window return a 404. The CLI layer
-    /// should prefer `feed read N` / `feed reactions --from-list N` which
-    /// index into the already-cached listing and don't need this scan.
+    /// 1. Scan the top 50 items of `feed/updates?q=findFeed` (cache-warm path).
+    /// 2. On miss, request the post by URN via the `highlightedFeed` finder
+    ///    (`feed/updates?q=highlightedFeed&highlightedUpdateUrns=List(...)
+    ///    &highlightedUpdateTypes=List(SHARE)`), which is documented in
+    ///    `re/api_endpoint_catalog.md` and accepts a URN list parameter.
+    /// 3. If the highlighted-feed call returns no matching element, surface
+    ///    a 404 with a hint to capture the post via devtools.
     pub async fn get_post(&self, activity_urn: &str) -> Result<Value, Error> {
         let urn = if activity_urn.starts_with("urn:li:activity:") {
             activity_urn.to_string()
@@ -532,14 +533,42 @@ impl LinkedInClient {
                 }
             }
         }
+
+        // Fallback: highlightedFeed finder, which Rest.li-decodes a List of
+        // URNs. The path uses Rest.li percent-encoded list syntax:
+        //   List(urn:li:activity:N) → List(urn%3Ali%3Aactivity%3AN)
+        // We try a few common update type values since the response is
+        // type-discriminated and posts can land under SHARE, ARTICLE, or
+        // VIDEO depending on attachment shape.
+        let urn_encoded = urn.replace(':', "%3A");
+        for update_type in ["SHARE", "ARTICLE", "VIDEO", "IMAGE"] {
+            let path = format!(
+                "feed/updates?q=highlightedFeed\
+                 &highlightedUpdateUrns=List({})\
+                 &highlightedUpdateTypes=List({})",
+                urn_encoded, update_type
+            );
+            if let Ok(resp) = self.get(&path).await {
+                if let Some(elements) = resp.get("elements").and_then(|e| e.as_array()) {
+                    for element in elements {
+                        let element_str = serde_json::to_string(element).unwrap_or_default();
+                        if element_str.contains(activity_id) {
+                            return Ok(element.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         Err(Error::Api {
             status: 404,
             body: format!(
-                "post {} not in the top-50 feed window. `feed view` can only \
-                 display posts currently visible in your feed — use \
-                 `feed read N` after `feed list` to pull a specific item by \
-                 index without re-fetching.",
-                urn
+                "post {} not in the top-50 feed window and the highlightedFeed \
+                 fallback returned no match. The permalink endpoint shape is \
+                 unverified; capture the request from \
+                 https://www.linkedin.com/feed/update/{} in browser devtools \
+                 and update get_post() with the captured path.",
+                urn, urn
             ),
         })
     }
