@@ -246,6 +246,9 @@ enum FeedAction {
         json: bool,
     },
     /// React to a post (like, celebrate, etc.)
+    ///
+    /// WARNING: This places a REAL reaction visible to the post's author
+    /// and their network. Use --yes to skip the confirmation prompt.
     React {
         /// Post/activity URN or 1-based index from last `feed list`
         post_urn: String,
@@ -253,6 +256,10 @@ enum FeedAction {
         /// Reaction type: LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION
         #[arg(long = "type", default_value = "LIKE")]
         reaction_type: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -739,12 +746,19 @@ enum MessagesAction {
         json: bool,
     },
     /// Send a message to a connection (new conversation)
+    ///
+    /// WARNING: This sends a REAL DIRECT MESSAGE that the recipient will
+    /// see in their LinkedIn inbox. Use --yes to skip the confirmation prompt.
     Send {
         /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
         recipient: String,
 
         /// Message text to send
         message: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON response instead of human-readable format
         #[arg(long)]
@@ -820,8 +834,9 @@ async fn main() {
             MessagesAction::Send {
                 recipient,
                 message,
+                yes,
                 json,
-            } => exit_on_err(cmd_messages_send(&recipient, &message, json).await),
+            } => exit_on_err(cmd_messages_send(&recipient, &message, yes, json).await),
             MessagesAction::Reply {
                 conversation_id,
                 message,
@@ -849,8 +864,9 @@ async fn main() {
             FeedAction::React {
                 post_urn,
                 reaction_type,
+                yes,
                 json,
-            } => exit_on_err(cmd_feed_react(&post_urn, &reaction_type, json).await),
+            } => exit_on_err(cmd_feed_react(&post_urn, &reaction_type, yes, json).await),
             FeedAction::Unreact {
                 post_urn,
                 reaction_type,
@@ -3147,7 +3163,20 @@ async fn cmd_feed_reactions(
 ///
 /// Reacts to a feed post with the specified reaction type.
 /// Reaction type validation is handled by the API layer.
-async fn cmd_feed_react(post_urn: &str, reaction_type: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_feed_react(
+    post_urn: &str,
+    reaction_type: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        return Err(format!(
+            "this will place a REAL {} reaction visible to the post's author. \
+             Pass --yes to confirm.",
+            reaction_type.to_uppercase()
+        ));
+    }
+
     let resolved_urn = resolve_post_urn(post_urn)?;
     let rt_upper = reaction_type.to_uppercase();
     let (client, _path) = load_session_client()?;
@@ -3564,11 +3593,30 @@ async fn cmd_messages_read(
     Ok(())
 }
 
-/// Handle `messages send <recipient> <message> [--json]`.
+/// Handle `messages send <recipient> <message> [--yes] [--json]`.
 ///
 /// Resolves the recipient's public identifier to an fsd_profile URN, then
 /// sends a message via the REST messaging/conversations?action=create endpoint.
-async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_messages_send(
+    recipient: &str,
+    message: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    if !confirmed {
+        let preview = if message.chars().count() > 80 {
+            let truncated: String = message.chars().take(80).collect();
+            format!("{}…", truncated)
+        } else {
+            message.to_string()
+        };
+        return Err(format!(
+            "this will send a REAL DIRECT MESSAGE to {} that they will see in \
+             their inbox: \"{}\". Pass --yes to confirm.",
+            recipient, preview
+        ));
+    }
+
     let (client, _path) = load_session_client()?;
 
     // Resolve recipient to fsd_profile URN. Accepts:

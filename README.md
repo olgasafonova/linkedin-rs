@@ -66,7 +66,7 @@ The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
 | **Shell** | |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell, elvish) |
 
-Most list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Exception: `messages read <id>` returns the whole conversation window LinkedIn hands back and paginates only via `--before <epoch_ms>`; it doesn't take `--count`. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
+Most list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Exception: `messages read <id>` returns the whole conversation window LinkedIn hands back and paginates only via `--before <epoch_ms>`; it doesn't take `--count`. Write commands that have a visible side effect on others (`feed react`, `feed comment`, `feed post`, `messages send`, `messages reply`) require `--yes` to confirm.
 
 ## Installation
 
@@ -177,10 +177,10 @@ li feed reactions urn:li:activity:7312345678901234567
 li feed stats
 
 # Like a post
-li feed react urn:li:activity:7312345678901234567
+li feed react urn:li:activity:7312345678901234567 --yes
 
 # Celebrate a post
-li feed react urn:li:activity:7312345678901234567 --type CELEBRATION
+li feed react urn:li:activity:7312345678901234567 --type CELEBRATION --yes
 
 # Remove a reaction
 li feed unreact urn:li:activity:7312345678901234567
@@ -203,7 +203,7 @@ li messages list --count 20
 li messages read 2-abc123
 
 # Send a message (new conversation)
-li messages send john-doe-123 "Hey, wanted to connect about..."
+li messages send john-doe-123 "Hey, wanted to connect about..." --yes
 
 # Reply to an existing conversation
 li messages reply 2-abc123 "Thanks for getting back to me" --yes
