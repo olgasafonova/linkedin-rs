@@ -632,6 +632,20 @@ enum NotificationsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show everyone @-mentioned in the post behind notification N
+    ///
+    /// Indexes into the most recent `notifications list` output, extracts
+    /// the underlying post URN, fetches the post body, and prints the
+    /// fsd_profile URNs of every member mentioned (yourself plus anyone
+    /// else tagged in the same post).
+    Mentions {
+        /// 1-based index from the most recent `notifications list` output
+        index: usize,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -966,6 +980,9 @@ async fn main() {
         Commands::Notifications { action } => match action {
             NotificationsAction::List { count, start, json } => {
                 exit_on_err(cmd_notifications_list(start, count, json).await)
+            }
+            NotificationsAction::Mentions { index, json } => {
+                exit_on_err(cmd_notifications_mentions(index, json).await)
             }
         },
         Commands::Inbox { json, all } => exit_on_err(cmd_inbox(json, all).await),
@@ -4899,6 +4916,8 @@ async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Resul
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
+    save_notifications_cache(&value)?;
+
     if raw_json {
         let pretty =
             serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
@@ -4926,6 +4945,170 @@ async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Resul
     }
 
     Ok(())
+}
+
+/// Handle `notifications mentions <index> [--json]`.
+///
+/// Indexes into the most recent `notifications list` cache, extracts the
+/// underlying activity URN from `cardAction.actionTarget`, fetches the post
+/// body, and walks the commentary's `attributesV2` array for entries whose
+/// type carries an `fsd_profile` URN. The shape mirrors LinkedIn's Pemberly
+/// attributed-text format used elsewhere in the API: each attribute has a
+/// `start`, `length`, and a discriminator under `type` containing the
+/// mentioned member's URN. The exact discriminator key is unverified
+/// against a captured response, so the handler walks all entries
+/// permissively and surfaces any URN it finds.
+async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<(), String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+
+    let cache = load_notifications_cache()?;
+    let elements = cache
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "cached notifications response has no elements array".to_string())?;
+    let card = elements.get(index - 1).ok_or_else(|| {
+        format!(
+            "index {} out of range (cached notifications has {} items)",
+            index,
+            elements.len()
+        )
+    })?;
+
+    let action_target = card
+        .get("cardAction")
+        .and_then(|a| a.get("actionTarget"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let activity_urn = extract_activity_urn_from_url(action_target).ok_or_else(|| {
+        format!(
+            "notification {} has no activity URN in cardAction.actionTarget ({})",
+            index, action_target
+        )
+    })?;
+
+    let (client, _path) = load_session_client()?;
+    let post = client
+        .get_post(&activity_urn)
+        .await
+        .map_err(|e| format!("failed to fetch post {}: {e}", activity_urn))?;
+
+    let mentions = collect_post_mentions(&post);
+
+    if raw_json {
+        let payload = serde_json::json!({
+            "activityUrn": activity_urn,
+            "mentions": mentions,
+        });
+        let pretty = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+        return Ok(());
+    }
+
+    if mentions.is_empty() {
+        println!("(no mentions found in {})", activity_urn);
+        return Ok(());
+    }
+
+    println!("Mentions in {}:", activity_urn);
+    for m in &mentions {
+        let urn = m.get("urn").and_then(|u| u.as_str()).unwrap_or("(no urn)");
+        let name = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if name.is_empty() {
+            println!("  {}", urn);
+        } else {
+            println!("  {}  ({})", name, urn);
+        }
+    }
+
+    Ok(())
+}
+
+/// Pull the activity URN out of a notification cardAction URL like
+/// `/feed/update/urn:li:activity:7312345/?...` (URL- or percent-encoded).
+fn extract_activity_urn_from_url(url: &str) -> Option<String> {
+    let decoded = url.replace("%3A", ":").replace("%2F", "/");
+    let prefix = "urn:li:activity:";
+    let start = decoded.find(prefix)?;
+    let tail = &decoded[start..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit() && c != ':' && !c.is_ascii_alphabetic())
+        .unwrap_or(tail.len());
+    let urn = &tail[..end];
+    if urn.len() > prefix.len() {
+        Some(urn.to_string())
+    } else {
+        None
+    }
+}
+
+/// Walk a post's commentary attributes and pull any fsd_profile URNs out
+/// of the structured mention data. The Pemberly attributed-text format
+/// puts mentions under `commentary.text.attributesV2[].type.*.urn`; we
+/// scan permissively because the discriminator key (e.g.
+/// `com.linkedin.pemberly.text.Profile`, `MEMBER_MENTION`) varies by
+/// payload version. Returns one JSON object per mention with `urn` and
+/// optional `text` (the @mention literal as it appears in the post).
+fn collect_post_mentions(post: &serde_json::Value) -> Vec<serde_json::Value> {
+    let update = post
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(post);
+
+    let commentary = match update.get("commentary").and_then(|c| c.get("text")) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    let body_text = commentary
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+
+    let attrs = commentary
+        .get("attributesV2")
+        .or_else(|| commentary.get("attributes"))
+        .and_then(|a| a.as_array());
+    let attrs = match attrs {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for attr in attrs {
+        // Walk every leaf string under this attribute looking for an
+        // fsd_profile URN. The exact key path varies; this catches:
+        //   type.com.linkedin.pemberly.text.Profile.urn
+        //   type.MEMBER_MENTION.profileUrn
+        //   miniProfile.entityUrn
+        let urn = find_fsd_profile_urn(attr);
+        if let Some(urn) = urn {
+            // Try to splice the mention text out of the body using start+length.
+            let start = attr.get("start").and_then(|s| s.as_u64()).unwrap_or(0) as usize;
+            let length = attr.get("length").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+            let snippet = body_text
+                .get(start..start.saturating_add(length))
+                .unwrap_or("");
+            out.push(serde_json::json!({
+                "urn": urn,
+                "text": snippet,
+            }));
+        }
+    }
+    out
+}
+
+/// Recursively search a JSON value for a string that starts with
+/// `urn:li:fsd_profile:`. Returns the first match.
+fn find_fsd_profile_urn(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) if s.starts_with("urn:li:fsd_profile:") => Some(s.clone()),
+        serde_json::Value::Object(map) => map.values().find_map(find_fsd_profile_urn),
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_fsd_profile_urn),
+        _ => None,
+    }
 }
 
 /// Print a brief human-readable summary of a single notification card.
@@ -5390,6 +5573,30 @@ fn load_feed_cache() -> Result<serde_json::Value, String> {
     let data = std::fs::read_to_string(&path)
         .map_err(|_| "no cached feed. Run `feed list` or `feed my-posts` first.".to_string())?;
     serde_json::from_str(&data).map_err(|e| format!("failed to parse feed cache: {e}"))
+}
+
+fn notifications_cache_path() -> Result<std::path::PathBuf, String> {
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| "could not determine data directory".to_string())?;
+    Ok(data_dir.join("linkedin").join("last_notifications.json"))
+}
+
+fn save_notifications_cache(value: &serde_json::Value) -> Result<(), String> {
+    let path = notifications_cache_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
+    }
+    let json = serde_json::to_string(value)
+        .map_err(|e| format!("failed to serialize notifications cache: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("failed to write notifications cache: {e}"))?;
+    Ok(())
+}
+
+fn load_notifications_cache() -> Result<serde_json::Value, String> {
+    let path = notifications_cache_path()?;
+    let data = std::fs::read_to_string(&path)
+        .map_err(|_| "no cached notifications. Run `notifications list` first.".to_string())?;
+    serde_json::from_str(&data).map_err(|e| format!("failed to parse notifications cache: {e}"))
 }
 
 /// Normalize a user-supplied reactions URN. Accepts full URNs (any type) or a
@@ -6677,6 +6884,82 @@ mod tests {
             normalize_reactions_urn("urn:li:ugcPost:7450808001881534464"),
             "urn:li:ugcPost:7450808001881534464"
         );
+    }
+
+    #[test]
+    fn extract_activity_urn_from_url_handles_plain_path() {
+        assert_eq!(
+            extract_activity_urn_from_url("/feed/update/urn:li:activity:7312345/"),
+            Some("urn:li:activity:7312345".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_activity_urn_from_url_handles_percent_encoded() {
+        assert_eq!(
+            extract_activity_urn_from_url(
+                "/feed/update/urn%3Ali%3Aactivity%3A7312345/?trackingId=foo"
+            ),
+            Some("urn:li:activity:7312345".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_activity_urn_from_url_returns_none_for_unrelated() {
+        assert_eq!(extract_activity_urn_from_url("/in/some-profile/"), None);
+    }
+
+    #[test]
+    fn collect_post_mentions_walks_attributesv2_for_fsd_profile_urns() {
+        let post = json!({
+            "commentary": {
+                "text": {
+                    "text": "Great work @Alice and @Bob!",
+                    "attributesV2": [
+                        {
+                            "start": 11,
+                            "length": 6,
+                            "type": {
+                                "com.linkedin.pemberly.text.Profile": {
+                                    "urn": "urn:li:fsd_profile:ACoAAAAAAAAAAA"
+                                }
+                            }
+                        },
+                        {
+                            "start": 22,
+                            "length": 4,
+                            "type": {
+                                "com.linkedin.pemberly.text.Profile": {
+                                    "urn": "urn:li:fsd_profile:ACoAAABBBBBBBB"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let mentions = collect_post_mentions(&post);
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(
+            mentions[0].get("urn").and_then(|v| v.as_str()),
+            Some("urn:li:fsd_profile:ACoAAAAAAAAAAA")
+        );
+        assert_eq!(
+            mentions[0].get("text").and_then(|v| v.as_str()),
+            Some("@Alice")
+        );
+        assert_eq!(
+            mentions[1].get("text").and_then(|v| v.as_str()),
+            Some("@Bob")
+        );
+    }
+
+    #[test]
+    fn collect_post_mentions_returns_empty_when_no_attributes() {
+        let post = json!({
+            "commentary": { "text": { "text": "Plain post, no mentions" } }
+        });
+        assert!(collect_post_mentions(&post).is_empty());
     }
 
     #[test]
