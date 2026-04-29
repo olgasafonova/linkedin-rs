@@ -1154,19 +1154,19 @@ fn is_spam_invitation(inv: &serde_json::Value) -> bool {
 async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
-    // Fetch all three in sequence (rate limiter handles throttling).
-    let conversations = client
-        .get_conversations(10, None)
-        .await
-        .map_err(|e| format!("failed to fetch messages: {e}"))?;
-    let invitations = client
-        .get_invitations(0, 10)
-        .await
-        .map_err(|e| format!("failed to fetch invitations: {e}"))?;
-    let notifications = client
-        .get_notifications(0, 10)
-        .await
-        .map_err(|e| format!("failed to fetch notifications: {e}"))?;
+    // Fetch all three concurrently. The client's request throttle still
+    // serialises the actual sends, but tokio::join! lets each response
+    // parse while the next request is queued, saving the gap between
+    // sequential awaits.
+    let (conversations_res, invitations_res, notifications_res) = tokio::join!(
+        client.get_conversations(10, None),
+        client.get_invitations(0, 10),
+        client.get_notifications(0, 10),
+    );
+    let conversations = conversations_res.map_err(|e| format!("failed to fetch messages: {e}"))?;
+    let invitations = invitations_res.map_err(|e| format!("failed to fetch invitations: {e}"))?;
+    let notifications =
+        notifications_res.map_err(|e| format!("failed to fetch notifications: {e}"))?;
 
     if raw_json {
         let combined = serde_json::json!({

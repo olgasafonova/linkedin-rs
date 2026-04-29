@@ -525,10 +525,7 @@ impl LinkedInClient {
         let feed = self.get("feed/updates?q=findFeed&start=0&count=50").await?;
         if let Some(elements) = feed.get("elements").and_then(|e| e.as_array()) {
             for element in elements {
-                // Match on the activity ID portion, since the feed uses various
-                // URN prefixes (V2, V2&FOLLOW_FEED, SU&V2, etc.).
-                let element_str = serde_json::to_string(element).unwrap_or_default();
-                if element_str.contains(activity_id) {
+                if element_matches_activity_id(element, activity_id) {
                     return Ok(element.clone());
                 }
             }
@@ -551,8 +548,7 @@ impl LinkedInClient {
             if let Ok(resp) = self.get(&path).await {
                 if let Some(elements) = resp.get("elements").and_then(|e| e.as_array()) {
                     for element in elements {
-                        let element_str = serde_json::to_string(element).unwrap_or_default();
-                        if element_str.contains(activity_id) {
+                        if element_matches_activity_id(element, activity_id) {
                             return Ok(element.clone());
                         }
                     }
@@ -2236,6 +2232,35 @@ fn is_retriable_graphql_error(err: &Error) -> bool {
 ///
 /// (with each `"` replaced by `&quot;` in the actual bytes).
 ///
+/// Check whether a feed element carries the given activity ID. The feed
+/// uses several URN prefixes for the same post (`fs_updateV2:(urn:li:activity:N,...)`,
+/// `fs_updateV2:(urn:li:activity:N&FOLLOW_FEED,...)`, `urn:li:activity:N`)
+/// so we look in the predictable carrier slots rather than serialising the
+/// whole element to a string for substring matching.
+fn element_matches_activity_id(element: &Value, activity_id: &str) -> bool {
+    if let Some(s) = element.get("entityUrn").and_then(Value::as_str) {
+        if s.contains(activity_id) {
+            return true;
+        }
+    }
+    let metadata = element
+        .pointer("/value/com.linkedin.voyager.feed.render.UpdateV2/updateMetadata")
+        .or_else(|| element.pointer("/updateMetadata"));
+    if let Some(metadata) = metadata {
+        if let Some(s) = metadata.get("urn").and_then(Value::as_str) {
+            if s.contains(activity_id) {
+                return true;
+            }
+        }
+        if let Some(s) = metadata.get("shareUrn").and_then(Value::as_str) {
+            if s.contains(activity_id) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Strategy: locate the `publicIdentifier:<slug>` marker, then walk back
 /// up to ~500 bytes looking for the nearest preceding `entityUrn` value.
 /// The 500-byte window is empirical and matches the JSON-record size for
@@ -2532,6 +2557,56 @@ async fn check_response(resp: reqwest::Response) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn element_matches_activity_id_via_entity_urn() {
+        let element = json!({
+            "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7447168805107032064,MEMBER_SHARES,DEBUG_REASON,DEFAULT,false)",
+            "value": {}
+        });
+        assert!(element_matches_activity_id(&element, "7447168805107032064"));
+        assert!(!element_matches_activity_id(
+            &element,
+            "9999999999999999999"
+        ));
+    }
+
+    #[test]
+    fn element_matches_activity_id_via_update_metadata_urn() {
+        let element = json!({
+            "value": {
+                "com.linkedin.voyager.feed.render.UpdateV2": {
+                    "updateMetadata": { "urn": "urn:li:activity:7312345678901234567" }
+                }
+            }
+        });
+        assert!(element_matches_activity_id(&element, "7312345678901234567"));
+    }
+
+    #[test]
+    fn element_matches_activity_id_via_share_urn() {
+        let element = json!({
+            "value": {
+                "com.linkedin.voyager.feed.render.UpdateV2": {
+                    "updateMetadata": {
+                        "urn": "urn:li:activity:7312345678901234567",
+                        "shareUrn": "urn:li:ugcPost:7312345678901234560"
+                    }
+                }
+            }
+        });
+        assert!(element_matches_activity_id(&element, "7312345678901234560"));
+    }
+
+    #[test]
+    fn element_matches_activity_id_returns_false_when_absent() {
+        let element = json!({ "value": { "unrelated": true } });
+        assert!(!element_matches_activity_id(
+            &element,
+            "7312345678901234567"
+        ));
+    }
 
     #[test]
     fn jsessionid_format() {
