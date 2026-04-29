@@ -332,16 +332,33 @@ impl LinkedInClient {
     /// returns [`Error::Api`] if present.
     pub async fn graphql_get(&self, query_params: &str) -> Result<Value, Error> {
         let url = format!("{}{}graphql?{}", BASE_URL, API_PREFIX, query_params);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Csrf-Token", &self.jsessionid)
-            .header("x-li-graphql-pegasus-client", "true")
-            .send()
-            .await?;
-        let json = check_response(resp).await?;
-        check_graphql_errors(&json)?;
-        Ok(json)
+        let mut attempt = 0u32;
+        loop {
+            self.throttle().await;
+            let resp = self
+                .http
+                .get(&url)
+                .header("Csrf-Token", &self.jsessionid)
+                .header("x-li-graphql-pegasus-client", "true")
+                .send()
+                .await?;
+            let json = check_response(resp).await?;
+            match check_graphql_errors(&json) {
+                Ok(()) => return Ok(json),
+                Err(e) if is_retriable_graphql_error(&e) && attempt < MAX_RETRIES => {
+                    let delay = graphql_retry_delay(attempt);
+                    eprintln!(
+                        "GraphQL transient error -- retrying in {:.1}s (attempt {}/{})",
+                        delay.as_secs_f64(),
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Send a POST request to the Voyager GraphQL endpoint (mutation).
@@ -380,39 +397,57 @@ impl LinkedInClient {
             body["variables"] = variables.clone();
         }
 
-        let resp = self
-            .http
-            .post(&url)
-            .header("Csrf-Token", &self.jsessionid)
-            .header("x-li-graphql-pegasus-client", "true")
-            .json(&body)
-            .send()
-            .await?;
+        let mut attempt = 0u32;
+        loop {
+            self.throttle().await;
+            let resp = self
+                .http
+                .post(&url)
+                .header("Csrf-Token", &self.jsessionid)
+                .header("x-li-graphql-pegasus-client", "true")
+                .json(&body)
+                .send()
+                .await?;
 
-        let status = resp.status();
-        if status.is_success() {
-            let text = resp.text().await?;
-            if text.is_empty() {
-                return Ok(Value::Null);
+            let status = resp.status();
+            if status.is_success() {
+                let text = resp.text().await?;
+                if text.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let json: Value = serde_json::from_str(&text)?;
+                match check_graphql_errors(&json) {
+                    Ok(()) => return Ok(json),
+                    Err(e) if is_retriable_graphql_error(&e) && attempt < MAX_RETRIES => {
+                        let delay = graphql_retry_delay(attempt);
+                        eprintln!(
+                            "GraphQL transient error -- retrying in {:.1}s (attempt {}/{})",
+                            delay.as_secs_f64(),
+                            attempt + 1,
+                            MAX_RETRIES
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            let json: Value = serde_json::from_str(&text)?;
-            check_graphql_errors(&json)?;
-            return Ok(json);
+
+            let status_code = status.as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+
+            if status_code == 401 {
+                return Err(Error::Auth(format!(
+                    "session expired or invalid (HTTP 401): {body_text}"
+                )));
+            }
+
+            return Err(Error::Api {
+                status: status_code,
+                body: body_text,
+            });
         }
-
-        let status_code = status.as_u16();
-        let body_text = resp.text().await.unwrap_or_default();
-
-        if status_code == 401 {
-            return Err(Error::Auth(format!(
-                "session expired or invalid (HTTP 401): {body_text}"
-            )));
-        }
-
-        Err(Error::Api {
-            status: status_code,
-            body: body_text,
-        })
     }
 
     /// Send a GET request to an arbitrary path on the LinkedIn host.
@@ -2031,6 +2066,37 @@ fn check_graphql_errors(json: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+/// Decide whether a GraphQL-shaped error is worth retrying.
+///
+/// LinkedIn's GraphQL mesh returns transient downstream errors as HTTP 200
+/// responses whose body contains an `errors` array. The most common phrases
+/// observed in the wild (29-04-2026) are:
+///
+/// - `Internal error fetching data from downstream.`
+/// - `Failed to get response from server for URI ...`
+///
+/// These are recoverable on a subsequent request and should be retried.
+/// Other GraphQL error shapes (missing field, unauthorized, etc.) must not
+/// be retried because they are deterministic for a given request.
+fn is_retriable_graphql_error(err: &Error) -> bool {
+    match err {
+        Error::Api { status: 200, body } => {
+            body.contains("Internal error fetching data from downstream")
+                || body.contains("Failed to get response from server")
+        }
+        _ => false,
+    }
+}
+
+/// Compute the backoff delay for the Nth GraphQL retry attempt.
+///
+/// Reuses [`BASE_BACKOFF_MS`] / [`MAX_BACKOFF_MS`] from the HTTP retry layer
+/// so transient GraphQL and transient HTTP failures see the same envelope.
+fn graphql_retry_delay(attempt: u32) -> Duration {
+    let ms = BASE_BACKOFF_MS * 2u64.pow(attempt);
+    Duration::from_millis(ms.min(MAX_BACKOFF_MS))
+}
+
 /// Build a GraphQL query parameter string for the Voyager GraphQL endpoint.
 ///
 /// Combines the `variables` (Rest.li parenthesized record), `query_id`, and
@@ -2373,6 +2439,58 @@ mod tests {
     #[test]
     fn restli_encode_empty_string() {
         assert_eq!(restli_encode_string(""), "''");
+    }
+
+    #[test]
+    fn graphql_retry_classifies_internal_downstream_error() {
+        let err = Error::Api {
+            status: 200,
+            body: "GraphQL errors: Internal error fetching data from downstream.".to_string(),
+        };
+        assert!(is_retriable_graphql_error(&err));
+    }
+
+    #[test]
+    fn graphql_retry_classifies_failed_to_get_response() {
+        let err = Error::Api {
+            status: 200,
+            body: "GraphQL errors: Failed to get response from server for URI https://[2a04:f547:93:21b::86e1]:5485/voyager/api/voyagerStoriesDashProfileVideoPreviews".to_string(),
+        };
+        assert!(is_retriable_graphql_error(&err));
+    }
+
+    #[test]
+    fn graphql_retry_does_not_classify_field_error() {
+        let err = Error::Api {
+            status: 200,
+            body: "GraphQL errors: Cannot query field 'foo' on type 'Bar'".to_string(),
+        };
+        assert!(!is_retriable_graphql_error(&err));
+    }
+
+    #[test]
+    fn graphql_retry_does_not_classify_http_500() {
+        let err = Error::Api {
+            status: 500,
+            body: "Internal Server Error".to_string(),
+        };
+        assert!(!is_retriable_graphql_error(&err));
+    }
+
+    #[test]
+    fn graphql_retry_does_not_classify_auth_error() {
+        let err = Error::Auth("session expired".to_string());
+        assert!(!is_retriable_graphql_error(&err));
+    }
+
+    #[test]
+    fn graphql_retry_delay_is_bounded() {
+        // Backoff doubles: 1s, 2s, 4s, then capped at MAX_BACKOFF_MS.
+        assert_eq!(graphql_retry_delay(0), Duration::from_millis(1000));
+        assert_eq!(graphql_retry_delay(1), Duration::from_millis(2000));
+        assert_eq!(graphql_retry_delay(2), Duration::from_millis(4000));
+        // Very large attempt counts never exceed the cap.
+        assert!(graphql_retry_delay(20) <= Duration::from_millis(MAX_BACKOFF_MS));
     }
 
     #[test]
