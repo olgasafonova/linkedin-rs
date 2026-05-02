@@ -91,6 +91,9 @@ enum FeedAction {
         json: bool,
     },
     /// React to a post (like, celebrate, etc.)
+    ///
+    /// WARNING: This creates a REAL reaction on a LinkedIn post.
+    /// Use --yes to confirm.
     React {
         /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
         post_urn: String,
@@ -99,11 +102,18 @@ enum FeedAction {
         #[arg(long = "type", default_value = "LIKE")]
         reaction_type: String,
 
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
     },
     /// Remove a reaction from a post
+    ///
+    /// WARNING: This removes a REAL reaction from a LinkedIn post.
+    /// Use --yes to confirm.
     Unreact {
         /// Post/activity URN (e.g. urn:li:activity:7312345678901234567)
         post_urn: String,
@@ -111,6 +121,10 @@ enum FeedAction {
         /// Reaction type to remove: LIKE, PRAISE, EMPATHY, INTEREST, APPRECIATION, ENTERTAINMENT, CELEBRATION
         #[arg(long = "type", default_value = "LIKE")]
         reaction_type: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -175,9 +189,16 @@ enum ProfileAction {
         json: bool,
     },
     /// Visit a profile (registers you in "who viewed my profile")
+    ///
+    /// WARNING: This registers a REAL profile visit.
+    /// Use --yes to confirm.
     Visit {
         /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
         public_id: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -208,6 +229,9 @@ enum ConnectionsAction {
         json: bool,
     },
     /// Send a connection request (invitation) to another member
+    ///
+    /// WARNING: This sends a REAL connection request.
+    /// Use --yes to confirm.
     Invite {
         /// LinkedIn public identifier (vanity URL slug) or fsd_profile URN
         public_id_or_urn: String,
@@ -215,6 +239,10 @@ enum ConnectionsAction {
         /// Optional custom message to include with the invitation
         #[arg(long)]
         message: Option<String>,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -235,6 +263,9 @@ enum ConnectionsAction {
         json: bool,
     },
     /// Accept a pending connection invitation
+    ///
+    /// WARNING: This accepts a REAL connection invitation.
+    /// Use --yes to confirm.
     Accept {
         /// Invitation ID (numeric portion of the invitation URN, e.g. 7312345678901234567)
         invitation_id: String,
@@ -243,6 +274,10 @@ enum ConnectionsAction {
         /// Obtain from `connections invitations --json`.
         #[arg(long)]
         secret: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -348,12 +383,19 @@ enum MessagesAction {
         json: bool,
     },
     /// Send a message to a connection
+    ///
+    /// WARNING: This sends a REAL LinkedIn message.
+    /// Use --yes to confirm.
     Send {
         /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
         recipient: String,
 
         /// Message text to send
         message: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
 
         /// Output raw JSON response instead of human-readable format
         #[arg(long)]
@@ -399,8 +441,12 @@ async fn main() {
                     process::exit(1);
                 }
             }
-            ProfileAction::Visit { public_id, json } => {
-                if let Err(e) = cmd_profile_visit(&public_id, json).await {
+            ProfileAction::Visit {
+                public_id,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_profile_visit(&public_id, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -443,9 +489,10 @@ async fn main() {
             MessagesAction::Send {
                 recipient,
                 message,
+                yes,
                 json,
             } => {
-                if let Err(e) = cmd_messages_send(&recipient, &message, json).await {
+                if let Err(e) = cmd_messages_send(&recipient, &message, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -461,9 +508,10 @@ async fn main() {
             FeedAction::React {
                 post_urn,
                 reaction_type,
+                yes,
                 json,
             } => {
-                if let Err(e) = cmd_feed_react(&post_urn, &reaction_type, json).await {
+                if let Err(e) = cmd_feed_react(&post_urn, &reaction_type, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -471,9 +519,10 @@ async fn main() {
             FeedAction::Unreact {
                 post_urn,
                 reaction_type,
+                yes,
                 json,
             } => {
-                if let Err(e) = cmd_feed_unreact(&post_urn, &reaction_type, json).await {
+                if let Err(e) = cmd_feed_unreact(&post_urn, &reaction_type, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -511,10 +560,11 @@ async fn main() {
             ConnectionsAction::Invite {
                 public_id_or_urn,
                 message,
+                yes,
                 json,
             } => {
                 if let Err(e) =
-                    cmd_connections_invite(&public_id_or_urn, message.as_deref(), json).await
+                    cmd_connections_invite(&public_id_or_urn, message.as_deref(), yes, json).await
                 {
                     eprintln!("error: {e}");
                     process::exit(1);
@@ -529,9 +579,10 @@ async fn main() {
             ConnectionsAction::Accept {
                 invitation_id,
                 secret,
+                yes,
                 json,
             } => {
-                if let Err(e) = cmd_connections_accept(&invitation_id, &secret, json).await {
+                if let Err(e) = cmd_connections_accept(&invitation_id, &secret, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -732,7 +783,9 @@ async fn cmd_profile_view(public_id: &str, raw_json: bool) -> Result<(), String>
 /// Visits a profile so the target sees you in "who viewed my profile".
 /// Uses the web client's GraphQL query ID which registers the view as a
 /// side effect. See `re/profile_visit.md` for the mechanism.
-async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_profile_visit(public_id: &str, confirmed: bool, raw_json: bool) -> Result<(), String> {
+    require_confirmation(confirmed, "register a REAL profile visit")?;
+
     let (client, _path) = load_session_client()?;
 
     eprintln!("Visiting profile '{}'...", public_id);
@@ -1309,7 +1362,14 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
 ///
 /// Reacts to a feed post with the specified reaction type.
 /// Reaction type validation is handled by the API layer.
-async fn cmd_feed_react(post_urn: &str, reaction_type: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_feed_react(
+    post_urn: &str,
+    reaction_type: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    require_confirmation(confirmed, "create a REAL reaction on a LinkedIn post")?;
+
     let rt_upper = reaction_type.to_uppercase();
     let (client, _path) = load_session_client()?;
 
@@ -1336,8 +1396,11 @@ async fn cmd_feed_react(post_urn: &str, reaction_type: &str, raw_json: bool) -> 
 async fn cmd_feed_unreact(
     post_urn: &str,
     reaction_type: &str,
+    confirmed: bool,
     raw_json: bool,
 ) -> Result<(), String> {
+    require_confirmation(confirmed, "remove a REAL reaction from a LinkedIn post")?;
+
     let rt_upper = reaction_type.to_uppercase();
     let (client, _path) = load_session_client()?;
 
@@ -1368,11 +1431,7 @@ async fn cmd_feed_comment(
     confirmed: bool,
     raw_json: bool,
 ) -> Result<(), String> {
-    if !confirmed {
-        return Err("this will create a REAL COMMENT on a LinkedIn post. \
-             Pass --yes to confirm."
-            .to_string());
-    }
+    require_confirmation(confirmed, "create a REAL COMMENT on a LinkedIn post")?;
 
     let (client, _path) = load_session_client()?;
 
@@ -1563,7 +1622,14 @@ async fn cmd_messages_read(
 ///
 /// Resolves the recipient's public identifier to an fsd_profile URN, then
 /// sends a message via the REST messaging/conversations?action=create endpoint.
-async fn cmd_messages_send(recipient: &str, message: &str, raw_json: bool) -> Result<(), String> {
+async fn cmd_messages_send(
+    recipient: &str,
+    message: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    require_confirmation(confirmed, "send a REAL LinkedIn message")?;
+
     let (client, _path) = load_session_client()?;
 
     // Resolve public identifier to fsd_profile URN.
@@ -1650,8 +1716,11 @@ async fn cmd_connections_list(start: u32, count: u32, raw_json: bool) -> Result<
 async fn cmd_connections_invite(
     public_id_or_urn: &str,
     message: Option<&str>,
+    confirmed: bool,
     raw_json: bool,
 ) -> Result<(), String> {
+    require_confirmation(confirmed, "send a REAL connection request")?;
+
     let (client, _path) = load_session_client()?;
 
     // Resolve to a profile URN if needed.
@@ -1742,8 +1811,11 @@ async fn cmd_connections_invitations(start: u32, count: u32, raw_json: bool) -> 
 async fn cmd_connections_accept(
     invitation_id: &str,
     shared_secret: &str,
+    confirmed: bool,
     raw_json: bool,
 ) -> Result<(), String> {
+    require_confirmation(confirmed, "accept a REAL connection invitation")?;
+
     let (client, _path) = load_session_client()?;
 
     // Build the full invitation URN if only the ID portion was given.
@@ -2454,6 +2526,14 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn require_confirmation(confirmed: bool, action: &str) -> Result<(), String> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(format!("this will {action}. Pass --yes to confirm."))
+    }
+}
+
 /// Print a paging header line in the format:
 /// `{label} (offset {start}, showing {count}, total {total})`
 fn print_paging_header(label: &str, paging: &Paging) {
@@ -2465,6 +2545,65 @@ fn print_paging_header(label: &str, paging: &Paging) {
         "{} (offset {}, showing {}, total {})",
         label, paging.start, paging.count, total_str
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn side_effectful_feed_reactions_parse_confirmation_flag() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "react",
+            "urn:li:activity:123",
+            "--yes",
+        ])
+        .expect("feed react --yes should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action: FeedAction::React { yes, .. },
+            } => assert!(yes),
+            _ => panic!("expected feed react command"),
+        }
+    }
+
+    #[test]
+    fn side_effectful_messages_send_requires_explicit_confirmation_shape() {
+        let cli = Cli::try_parse_from(["linkedin-cli", "messages", "send", "someone", "hello"])
+            .expect("messages send should parse");
+
+        match cli.command {
+            Commands::Messages {
+                action: MessagesAction::Send { yes, .. },
+            } => assert!(!yes),
+            _ => panic!("expected messages send command"),
+        }
+    }
+
+    #[test]
+    fn confirmation_guard_blocks_unconfirmed_side_effects() {
+        let err = require_confirmation(false, "send a LinkedIn message").unwrap_err();
+        assert!(err.contains("send a LinkedIn message"));
+
+        assert!(require_confirmation(true, "send a LinkedIn message").is_ok());
+    }
+
+    #[test]
+    fn profile_visit_parses_confirmation_flag() {
+        let cli = Cli::try_parse_from(["linkedin-cli", "profile", "visit", "sivasub987", "--yes"])
+            .expect("profile visit --yes should parse");
+
+        match cli.command {
+            Commands::Profile {
+                action: ProfileAction::Visit { yes, .. },
+            } => assert!(yes),
+            _ => panic!("expected profile visit command"),
+        }
+    }
 }
 
 // NOTE: The old REST-based print_conversation, extract_participant_names,
