@@ -40,8 +40,6 @@ const CLIENT_MINOR_VERSION: i64 = 562100;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationCategory {
     PrimaryInbox,
-    Other,
-    Archived,
     Spam,
 }
 
@@ -49,8 +47,6 @@ impl ConversationCategory {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PrimaryInbox => "PRIMARY_INBOX",
-            Self::Other => "OTHER",
-            Self::Archived => "ARCHIVED",
             Self::Spam => "SPAM",
         }
     }
@@ -68,11 +64,9 @@ impl FromStr for ConversationCategory {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_uppercase().replace('-', "_").as_str() {
             "PRIMARY" | "PRIMARY_INBOX" | "INBOX" => Ok(Self::PrimaryInbox),
-            "OTHER" => Ok(Self::Other),
-            "ARCHIVED" | "ARCHIVE" => Ok(Self::Archived),
             "SPAM" => Ok(Self::Spam),
             other => Err(format!(
-                "unknown conversation category '{other}' (expected primary, other, archived, or spam)"
+                "unknown conversation category '{other}' (expected primary or spam)"
             )),
         }
     }
@@ -715,7 +709,7 @@ impl LinkedInClient {
         //
         // Required variables:
         //   mailboxUrn: urn:li:fsd_profile:{member_id}
-        //   category: PRIMARY_INBOX, OTHER, ARCHIVED, SPAM
+        //   category: PRIMARY_INBOX or SPAM
         //   count: number of conversations
         // Optional:
         //   lastActivityBefore: epoch-millis cursor for pagination
@@ -1935,15 +1929,13 @@ mod tests {
     }
 
     #[test]
-    fn conversation_category_wire_values_match_linkedin_graphql() {
+    fn conversation_category_wire_values_match_live_linkedin_graphql() {
         assert_eq!(ConversationCategory::PrimaryInbox.as_str(), "PRIMARY_INBOX");
-        assert_eq!(ConversationCategory::Other.as_str(), "OTHER");
-        assert_eq!(ConversationCategory::Archived.as_str(), "ARCHIVED");
         assert_eq!(ConversationCategory::Spam.as_str(), "SPAM");
     }
 
     #[test]
-    fn conversation_category_parses_cli_aliases() {
+    fn conversation_category_parses_verified_cli_aliases() {
         assert_eq!(
             "primary".parse::<ConversationCategory>().unwrap(),
             ConversationCategory::PrimaryInbox
@@ -1953,17 +1945,11 @@ mod tests {
             ConversationCategory::PrimaryInbox
         );
         assert_eq!(
-            "other".parse::<ConversationCategory>().unwrap(),
-            ConversationCategory::Other
-        );
-        assert_eq!(
-            "archived".parse::<ConversationCategory>().unwrap(),
-            ConversationCategory::Archived
-        );
-        assert_eq!(
             "spam".parse::<ConversationCategory>().unwrap(),
             ConversationCategory::Spam
         );
+        assert!("other".parse::<ConversationCategory>().is_err());
+        assert!("archived".parse::<ConversationCategory>().is_err());
         assert!("sent".parse::<ConversationCategory>().is_err());
     }
 
@@ -1971,12 +1957,12 @@ mod tests {
     fn conversation_variables_include_requested_category_and_cursor() {
         let vars = build_conversations_graphql_vars(
             "urn:li:fsd_profile:abc123",
-            ConversationCategory::Other,
+            ConversationCategory::Spam,
             25,
             Some(1714280000000),
         );
         assert!(vars.contains("mailboxUrn:urn%3Ali%3Afsd_profile%3Aabc123"));
-        assert!(vars.contains("category:OTHER"));
+        assert!(vars.contains("category:SPAM"));
         assert!(vars.contains("count:25"));
         assert!(vars.contains("lastActivityBefore:1714280000000"));
     }

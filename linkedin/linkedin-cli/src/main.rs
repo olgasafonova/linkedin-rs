@@ -318,7 +318,7 @@ enum MessagesAction {
         #[arg(long)]
         before: Option<u64>,
 
-        /// Inbox category: primary, other, archived, or spam
+        /// Inbox category: primary or spam
         #[arg(long, default_value = "primary")]
         category: String,
 
@@ -620,10 +620,11 @@ async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    // Hit the live API to verify the session is actually valid.
+    // Hit the live API to verify the session is actually valid. Use the shared
+    // session loader so auth status follows the same browser-cookie fallback as
+    // profile, feed, and messaging commands.
     println!("Checking session against LinkedIn API...");
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let (client, _) = load_session_client()?;
 
     match client.get_me().await {
         Ok(me) => {

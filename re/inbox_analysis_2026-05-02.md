@@ -172,16 +172,17 @@ These may be separate GraphQL finder variables, not category enums. They need on
 
 ## Implemented in `feat/linkedin-proxy-inbox-categories`
 
-1. Added `ConversationCategory` support for `PRIMARY_INBOX`, `OTHER`, `ARCHIVED`, and `SPAM`.
+1. Added `ConversationCategory` support for the live-verified `PRIMARY_INBOX` and `SPAM` categories. Live probes showed `OTHER` and `ARCHIVED` return GraphQL errors: `Conversation category ... is not supported`, so they are intentionally not exposed.
 2. Added `LinkedInClient::get_conversations_by_category(...)` while preserving `get_conversations(...)` as the primary-inbox default.
 3. Added `LINKEDIN_PROXY_URL` / `HTTPS_PROXY` / `HTTP_PROXY` support to the API client.
 4. Added CLI support:
 
 ```bash
-LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category other --count 20 --json
+LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category spam --count 20 --json
 ```
 
 5. Corrected README session path to `/home/ubuntu/.local/share/linkedin/session.json` and documented browser cookie map usage.
+6. Updated `auth status` so the live API check uses the same browser-cookie fallback as profile/feed/messaging commands.
 
 Verified:
 
@@ -200,7 +201,7 @@ Remaining:
 ```bash
 LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli auth status
 LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category primary --count 20 --json
-LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category other --count 20 --json
+LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category spam --count 20 --json
 ```
 
 3. Capture live GraphQL request payloads for Jobs, Unread, Connections, InMail, and Starred before adding them as `--filter` values.
