@@ -1157,12 +1157,7 @@ impl LinkedInClient {
     ) -> Result<Value, Error> {
         let rt = validate_reaction_type(reaction_type)?;
 
-        // Normalize the thread URN: if just an activity ID, wrap it.
-        let thread = if thread_urn.starts_with("urn:li:") {
-            thread_urn.to_string()
-        } else {
-            format!("urn:li:activity:{}", thread_urn)
-        };
+        let thread = normalize_social_thread_urn(thread_urn);
 
         // Use the GraphQL mutation endpoint discovered in
         // FeedFrameworkGraphQLClient.java (createSocialDashReactions).
@@ -1218,11 +1213,7 @@ impl LinkedInClient {
     ) -> Result<Value, Error> {
         let rt = validate_reaction_type(reaction_type)?;
 
-        let thread = if thread_urn.starts_with("urn:li:") {
-            thread_urn.to_string()
-        } else {
-            format!("urn:li:activity:{}", thread_urn)
-        };
+        let thread = normalize_social_thread_urn(thread_urn);
 
         // Use the GraphQL mutation endpoint for deleting reactions.
         // queryId: voyagerSocialDashReactions.315cef4773de8e3a0ddad7655cc1685f
@@ -1272,12 +1263,7 @@ impl LinkedInClient {
     ///
     /// See `re/comments.md` for the full analysis.
     pub async fn comment_on_post(&self, post_urn: &str, text: &str) -> Result<Value, Error> {
-        // Normalize the post URN: if just an activity ID, wrap it.
-        let thread = if post_urn.starts_with("urn:li:") {
-            post_urn.to_string()
-        } else {
-            format!("urn:li:activity:{}", post_urn)
-        };
+        let thread = normalize_social_thread_urn(post_urn);
 
         let variables = build_create_comment_graphql_body(&thread, text);
 
@@ -1295,7 +1281,8 @@ impl LinkedInClient {
     /// comments, but sets `entity.threadUrn` to the parent comment URN.
     /// This creates a **real public LinkedIn comment reply**.
     pub async fn reply_to_comment(&self, comment_urn: &str, text: &str) -> Result<Value, Error> {
-        let variables = build_create_comment_graphql_body(comment_urn, text);
+        let thread = normalize_social_thread_urn(comment_urn);
+        let variables = build_create_comment_graphql_body(&thread, text);
 
         self.graphql_post(
             &variables,
@@ -1677,6 +1664,31 @@ fn validate_reaction_type(reaction_type: &str) -> Result<String, Error> {
             reaction_type,
             VALID_REACTION_TYPES.join(", ")
         )))
+    }
+}
+
+/// Normalize social thread targets for comments and reactions.
+///
+/// LinkedIn accepts backend comment URNs such as
+/// `urn:li:comment:(activity:<activityId>,<commentId>)` for comment replies and
+/// comment reactions. The Dash `urn:li:fsd_comment:(<commentId>,urn:li:activity:<activityId>)`
+/// shape is returned by comment reads but can fail for reply creation. Convert it
+/// before sending mutations while preserving all other URNs.
+fn normalize_social_thread_urn(thread_urn: &str) -> String {
+    if let Some(rest) = thread_urn.strip_prefix("urn:li:fsd_comment:(") {
+        if let Some(inner) = rest.strip_suffix(')') {
+            if let Some((comment_id, activity_urn)) = inner.split_once(',') {
+                if let Some(activity_id) = activity_urn.strip_prefix("urn:li:activity:") {
+                    return format!("urn:li:comment:(activity:{activity_id},{comment_id})");
+                }
+            }
+        }
+    }
+
+    if thread_urn.starts_with("urn:li:") {
+        thread_urn.to_string()
+    } else {
+        format!("urn:li:activity:{thread_urn}")
     }
 }
 
@@ -2201,16 +2213,26 @@ mod tests {
     }
 
     #[test]
-    fn create_comment_body_can_target_parent_comment_urn_for_nested_reply() {
-        let body = build_create_comment_graphql_body(
-            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)",
-            "nested reply text",
+    fn fsd_comment_urn_normalizes_to_backend_comment_urn_for_mutations() {
+        assert_eq!(
+            normalize_social_thread_urn(
+                "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)"
+            ),
+            "urn:li:comment:(activity:7456131258478276609,7456166291515662336)"
         );
+    }
+
+    #[test]
+    fn create_comment_body_can_target_backend_parent_comment_urn_for_nested_reply() {
+        let parent = normalize_social_thread_urn(
+            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)",
+        );
+        let body = build_create_comment_graphql_body(&parent, "nested reply text");
 
         assert_eq!(body["entity"]["commentary"]["text"], "nested reply text");
         assert_eq!(
             body["entity"]["threadUrn"],
-            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)"
+            "urn:li:comment:(activity:7456131258478276609,7456166291515662336)"
         );
         assert_eq!(body["entity"]["origin"], "FEED");
     }
