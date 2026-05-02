@@ -10,6 +10,8 @@
 //! Reference: `re/architecture_overview.md`, `re/device_fingerprinting.md`,
 //! `re/restli_protocol.md`, `re/auth_flow.md`.
 
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -32,6 +34,73 @@ const CLIENT_VERSION: &str = "4.2.1058";
 
 /// Numeric build/version code corresponding to CLIENT_VERSION.
 const CLIENT_MINOR_VERSION: i64 = 562100;
+
+/// Messaging conversation category accepted by LinkedIn's
+/// `messengerConversationsByCategory` GraphQL query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationCategory {
+    PrimaryInbox,
+    Other,
+    Archived,
+    Spam,
+}
+
+impl ConversationCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryInbox => "PRIMARY_INBOX",
+            Self::Other => "OTHER",
+            Self::Archived => "ARCHIVED",
+            Self::Spam => "SPAM",
+        }
+    }
+}
+
+impl Default for ConversationCategory {
+    fn default() -> Self {
+        Self::PrimaryInbox
+    }
+}
+
+impl FromStr for ConversationCategory {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_uppercase().replace('-', "_").as_str() {
+            "PRIMARY" | "PRIMARY_INBOX" | "INBOX" => Ok(Self::PrimaryInbox),
+            "OTHER" => Ok(Self::Other),
+            "ARCHIVED" | "ARCHIVE" => Ok(Self::Archived),
+            "SPAM" => Ok(Self::Spam),
+            other => Err(format!(
+                "unknown conversation category '{other}' (expected primary, other, archived, or spam)"
+            )),
+        }
+    }
+}
+
+/// Optional runtime configuration for the HTTP client.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientOptions {
+    /// Optional HTTP(S)/SOCKS proxy URL, e.g. `http://127.0.0.1:8888`.
+    pub proxy_url: Option<String>,
+}
+
+impl ClientOptions {
+    pub fn from_env() -> Self {
+        Self::from_env_map(&std::env::vars().collect::<HashMap<_, _>>())
+    }
+
+    pub fn from_env_map(env: &HashMap<String, String>) -> Self {
+        let proxy_url = env
+            .get("LINKEDIN_PROXY_URL")
+            .or_else(|| env.get("HTTPS_PROXY"))
+            .or_else(|| env.get("HTTP_PROXY"))
+            .filter(|value| !value.trim().is_empty())
+            .cloned();
+
+        Self { proxy_url }
+    }
+}
 
 /// HTTP client configured to impersonate the LinkedIn Android app.
 ///
@@ -88,7 +157,14 @@ impl LinkedInClient {
     pub fn new() -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
         let jsessionid = generate_jsessionid();
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
+    }
+
+    /// Create a new client with explicit runtime options.
+    pub fn with_options(options: ClientOptions) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let jsessionid = generate_jsessionid();
+        Self::build(&device_id, &jsessionid, None, options)
     }
 
     /// Create a client with a specific device ID and JSESSIONID (for testing or persistence).
@@ -96,7 +172,7 @@ impl LinkedInClient {
     /// Use this when you want to restore a previous session's device identity
     /// rather than generating a new one.
     pub fn with_identity(device_id: String, jsessionid: String) -> Result<Self, Error> {
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
     }
 
     /// Create a client from a persisted [`Session`].
@@ -106,7 +182,26 @@ impl LinkedInClient {
     /// (the session doesn't persist device identity -- that's a separate concern).
     pub fn with_session(session: &Session) -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
-        Self::build(&device_id, &session.jsessionid, Some(&session.li_at))
+        Self::build(
+            &device_id,
+            &session.jsessionid,
+            Some(&session.li_at),
+            ClientOptions::from_env(),
+        )
+    }
+
+    /// Create a client from a persisted [`Session`] and explicit options.
+    pub fn with_session_and_options(
+        session: &Session,
+        options: ClientOptions,
+    ) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        Self::build(
+            &device_id,
+            &session.jsessionid,
+            Some(&session.li_at),
+            options,
+        )
     }
 
     /// Create a client using full browser cookies (from a cookies JSON file).
@@ -123,7 +218,7 @@ impl LinkedInClient {
             .unwrap_or_else(generate_jsessionid);
 
         let li_at = cookies.get("li_at").map(|s| s.as_str());
-        let client = Self::build(&device_id, &jsessionid, li_at)?;
+        let client = Self::build(&device_id, &jsessionid, li_at, ClientOptions::from_env())?;
 
         // Inject all remaining cookies into the jar.
         let base_url: url::Url = BASE_URL.parse().unwrap();
@@ -151,7 +246,12 @@ impl LinkedInClient {
     /// Builds the reqwest client with cookie jar, default headers matching
     /// the LinkedIn Android app, and seeds the JSESSIONID cookie (plus
     /// optionally the `li_at` session cookie).
-    fn build(device_id: &str, jsessionid: &str, li_at: Option<&str>) -> Result<Self, Error> {
+    fn build(
+        device_id: &str,
+        jsessionid: &str,
+        li_at: Option<&str>,
+        options: ClientOptions,
+    ) -> Result<Self, Error> {
         let x_li_track = build_x_li_track(device_id);
 
         // Build default headers applied to every request.
@@ -209,10 +309,19 @@ impl LinkedInClient {
             );
         }
 
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .cookie_provider(jar.clone())
-            .default_headers(default_headers)
-            .build()?;
+            .default_headers(default_headers);
+
+        if let Some(proxy_url) = options.proxy_url.as_deref() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy_url).map_err(|e| {
+                Error::Auth(format!(
+                    "invalid LINKEDIN_PROXY_URL/proxy URL '{proxy_url}': {e}"
+                ))
+            })?);
+        }
+
+        let http = builder.build()?;
 
         Ok(Self {
             cookie_jar: jar,
@@ -582,6 +691,21 @@ impl LinkedInClient {
         count: u32,
         created_before: Option<u64>,
     ) -> Result<Value, Error> {
+        self.get_conversations_by_category(
+            count,
+            created_before,
+            ConversationCategory::PrimaryInbox,
+        )
+        .await
+    }
+
+    /// Fetch messaging conversations from a specific inbox category.
+    pub async fn get_conversations_by_category(
+        &self,
+        count: u32,
+        created_before: Option<u64>,
+        category: ConversationCategory,
+    ) -> Result<Value, Error> {
         // The REST endpoint messaging/conversations returns HTTP 500
         // (deprecated server-side for the international build).
         //
@@ -591,7 +715,7 @@ impl LinkedInClient {
         //
         // Required variables:
         //   mailboxUrn: urn:li:fsd_profile:{member_id}
-        //   category: PRIMARY_INBOX (or other category)
+        //   category: PRIMARY_INBOX, OTHER, ARCHIVED, SPAM
         //   count: number of conversations
         // Optional:
         //   lastActivityBefore: epoch-millis cursor for pagination
@@ -599,19 +723,7 @@ impl LinkedInClient {
         // Get the user's fsd_profile URN (cached after first /me call).
         let mailbox_urn = self.my_profile_urn().await?;
 
-        // Rest.li AsciiHex-encode the URN (colons are Rest.li reserved).
-        let encoded_urn = restli_encode_string(mailbox_urn);
-        let vars = if let Some(ts) = created_before {
-            format!(
-                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{},lastActivityBefore:{})",
-                encoded_urn, count, ts
-            )
-        } else {
-            format!(
-                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{})",
-                encoded_urn, count
-            )
-        };
+        let vars = build_conversations_graphql_vars(mailbox_urn, category, count, created_before);
         let params = graphql_params(
             &vars,
             "voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6",
@@ -1521,6 +1633,31 @@ fn graphql_params(variables: &str, query_id: &str, query_name: &str) -> String {
     )
 }
 
+fn build_conversations_graphql_vars(
+    mailbox_urn: &str,
+    category: ConversationCategory,
+    count: u32,
+    created_before: Option<u64>,
+) -> String {
+    let encoded_urn = restli_encode_string(mailbox_urn);
+    if let Some(ts) = created_before {
+        format!(
+            "(mailboxUrn:{},category:{},count:{},lastActivityBefore:{})",
+            encoded_urn,
+            category.as_str(),
+            count,
+            ts
+        )
+    } else {
+        format!(
+            "(mailboxUrn:{},category:{},count:{})",
+            encoded_urn,
+            category.as_str(),
+            count
+        )
+    }
+}
+
 /// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
 /// parenthesized record variables within a URL query parameter.
 ///
@@ -1795,6 +1932,64 @@ mod tests {
         // Mixed content: keyword with apostrophe.
         let encoded = restli_encode_string("O'Brien");
         assert_eq!(encoded, "O%27Brien");
+    }
+
+    #[test]
+    fn conversation_category_wire_values_match_linkedin_graphql() {
+        assert_eq!(ConversationCategory::PrimaryInbox.as_str(), "PRIMARY_INBOX");
+        assert_eq!(ConversationCategory::Other.as_str(), "OTHER");
+        assert_eq!(ConversationCategory::Archived.as_str(), "ARCHIVED");
+        assert_eq!(ConversationCategory::Spam.as_str(), "SPAM");
+    }
+
+    #[test]
+    fn conversation_category_parses_cli_aliases() {
+        assert_eq!(
+            "primary".parse::<ConversationCategory>().unwrap(),
+            ConversationCategory::PrimaryInbox
+        );
+        assert_eq!(
+            "primary_inbox".parse::<ConversationCategory>().unwrap(),
+            ConversationCategory::PrimaryInbox
+        );
+        assert_eq!(
+            "other".parse::<ConversationCategory>().unwrap(),
+            ConversationCategory::Other
+        );
+        assert_eq!(
+            "archived".parse::<ConversationCategory>().unwrap(),
+            ConversationCategory::Archived
+        );
+        assert_eq!(
+            "spam".parse::<ConversationCategory>().unwrap(),
+            ConversationCategory::Spam
+        );
+        assert!("sent".parse::<ConversationCategory>().is_err());
+    }
+
+    #[test]
+    fn conversation_variables_include_requested_category_and_cursor() {
+        let vars = build_conversations_graphql_vars(
+            "urn:li:fsd_profile:abc123",
+            ConversationCategory::Other,
+            25,
+            Some(1714280000000),
+        );
+        assert!(vars.contains("mailboxUrn:urn%3Ali%3Afsd_profile%3Aabc123"));
+        assert!(vars.contains("category:OTHER"));
+        assert!(vars.contains("count:25"));
+        assert!(vars.contains("lastActivityBefore:1714280000000"));
+    }
+
+    #[test]
+    fn client_options_read_proxy_from_environment() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "LINKEDIN_PROXY_URL".to_string(),
+            "http://127.0.0.1:8888".to_string(),
+        );
+        let options = ClientOptions::from_env_map(&env);
+        assert_eq!(options.proxy_url.as_deref(), Some("http://127.0.0.1:8888"));
     }
 
     #[test]

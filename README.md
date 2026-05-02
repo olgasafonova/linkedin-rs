@@ -89,7 +89,18 @@ linkedin-cli auth login
 linkedin-cli auth status
 ```
 
-The session is stored locally at `~/.config/linkedin-cli/session.json`.
+The session is stored locally at `~/.local/share/linkedin/session.json`.
+
+### Proxy / regional routing
+
+Set `LINKEDIN_PROXY_URL` when LinkedIn traffic needs to exit from a specific region:
+
+```bash
+export LINKEDIN_PROXY_URL="http://127.0.0.1:3128"
+linkedin-cli auth status
+```
+
+The client falls back to `HTTPS_PROXY` or `HTTP_PROXY` if `LINKEDIN_PROXY_URL` is unset. For authenticated browser sessions, place a cookie map at `secrets/browser_cookies.json` with at least `li_at` and `JSESSIONID`; this is useful when importing cookies from a managed browser profile.
 
 ## Usage
 
@@ -137,6 +148,10 @@ linkedin-cli feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
 ```bash
 # List conversations
 linkedin-cli messages list --count 20
+
+# List Other inbox / spam / archived conversations
+linkedin-cli messages list --category other --count 20 --json
+linkedin-cli messages list --category spam --count 20
 
 # Read a conversation
 linkedin-cli messages read 2-abc123

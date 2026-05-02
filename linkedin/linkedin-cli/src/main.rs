@@ -3,7 +3,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use linkedin_api::auth::Session;
-use linkedin_api::client::LinkedInClient;
+use linkedin_api::client::{ConversationCategory, LinkedInClient};
 use linkedin_api::models::{
     ConnectionsResponse, FeedResponse, NotificationCardsResponse, Paging, SearchResponse,
 };
@@ -318,6 +318,10 @@ enum MessagesAction {
         #[arg(long)]
         before: Option<u64>,
 
+        /// Inbox category: primary, other, archived, or spam
+        #[arg(long, default_value = "primary")]
+        category: String,
+
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
@@ -404,9 +408,10 @@ async fn main() {
             MessagesAction::List {
                 count,
                 before,
+                category,
                 json,
             } => {
-                if let Err(e) = cmd_messages_list(count, before, json).await {
+                if let Err(e) = cmd_messages_list(count, before, &category, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1439,12 +1444,14 @@ async fn cmd_feed_post(
 async fn cmd_messages_list(
     count: u32,
     created_before: Option<u64>,
+    category: &str,
     raw_json: bool,
 ) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
+    let category = category.parse::<ConversationCategory>()?;
 
     let value = client
-        .get_conversations(count, created_before)
+        .get_conversations_by_category(count, created_before, category)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
