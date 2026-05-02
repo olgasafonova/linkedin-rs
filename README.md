@@ -134,9 +134,9 @@ linkedin-cli analytics summary --days 14 --count 20 --json
 # Rank your own posts by impressions and engagement
 linkedin-cli analytics content --days 14 --count 20 --json
 
-# Inspect one post, optionally using an item from the latest own-post listing
+# Inspect one post, optionally by rank from the top 50 own posts fetched by analytics post
 linkedin-cli analytics post urn:li:activity:7312345678901234567 --days 7 --include-reactors --json
-linkedin-cli analytics post --from-list 1 --days 7 --json
+linkedin-cli analytics post --from-list 1 --days 7 --include-reactors --json
 
 # Profile/audience signals
 linkedin-cli analytics audience --days 28 --interesting-viewers --json

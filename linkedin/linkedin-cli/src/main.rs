@@ -450,7 +450,7 @@ enum AnalyticsAction {
         /// Post/share/activity URN. Omit when using --from-list.
         post_urn: Option<String>,
 
-        /// Use item N from the last analytics content/feed listing
+        /// Use rank N from ranked own-post analytics (top 50 fetched for this command)
         #[arg(long, conflicts_with = "post_urn")]
         from_list: Option<usize>,
 
