@@ -143,7 +143,7 @@ linkedin-cli analytics audience --days 28 --interesting-viewers --json
 linkedin-cli analytics profile-viewers --days 7 --interesting-viewers --json
 ```
 
-`analytics content` uses your own member-share feed and extracts `socialDetail.totalSocialActivityCounts` where LinkedIn exposes views, reactions, comments, shares/reposts, and saves. Engagement rate is computed as `(reactions + comments + shares + saves) / impressions`.
+`analytics content` uses your own member-share feed and extracts `socialDetail.totalSocialActivityCounts` where LinkedIn exposes views, reactions, comments, shares/reposts, and saves. Engagement rate is computed as `(reactions + comments + shares + saves) / impressions`. This endpoint is a web Voyager surface, so the client uses browser-style headers and a quote-stripped `JSESSIONID` CSRF token when loading cookies exported from a browser session.
 
 ### Feed
 

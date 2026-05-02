@@ -210,7 +210,7 @@ impl LinkedInClient {
         let device_id = uuid::Uuid::new_v4().to_string();
         let jsessionid = cookies
             .get("JSESSIONID")
-            .cloned()
+            .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_else(generate_jsessionid);
 
         let li_at = cookies.get("li_at").map(|s| s.as_str());
@@ -1335,12 +1335,52 @@ impl LinkedInClient {
     /// now return 400/redirects for this account.
     pub async fn get_my_posts(&self, start: u32, count: u32) -> Result<Value, Error> {
         let profile_urn = self.my_profile_urn().await?;
+        // `profileUrn` must be Rest.li encoded once (`:` -> `%3A`).
+        // LinkedIn's current `profileUpdatesV2` finder returns HTTP 400 when
+        // the URN is double-encoded (`%3A` -> `%253A`).
         let encoded_urn = restli_encode_string(profile_urn);
-        let path = format!(
-            "identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
-            encoded_urn, start, count
+        let url = format!(
+            "{}{}identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
+            BASE_URL, API_PREFIX, encoded_urn, start, count
         );
-        self.get(&path).await
+        // This feed finder is a web Voyager surface. With the Android default
+        // headers used by most low-level API methods it can return HTTP 500,
+        // while the same request from the logged-in CloakBrowser web context
+        // succeeds. Use a clean web-like client sharing the same cookie jar,
+        // rather than `self.http`, which has Android app default headers.
+        let mut builder = reqwest::Client::builder().cookie_provider(self.cookie_jar.clone());
+        if let Some(proxy_url) = ClientOptions::from_env().proxy_url {
+            builder = builder.proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| {
+                Error::Auth(format!(
+                    "invalid LINKEDIN_PROXY_URL/proxy URL '{proxy_url}': {e}"
+                ))
+            })?);
+        }
+        let web_http = builder.build()?;
+        let resp = web_http
+            .get(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-SG,en;q=0.9,en-US;q=0.8")
+            .header(reqwest::header::REFERER, "https://www.linkedin.com/feed/")
+            .header("Origin", "https://www.linkedin.com")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("sec-ch-ua", r#""Chromium";v="146", "Google Chrome";v="146", "Not_A Brand";v="99""#)
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", r#""Windows""#)
+            .header(
+                "X-LI-Track",
+                r#"{"clientVersion":"1.13.10443","mpVersion":"1.13.10443","osName":"web","timezoneOffset":8,"timezone":"Asia/Singapore","deviceFormFactor":"DESKTOP","mpName":"voyager-web"}"#,
+            )
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            .send()
+            .await?;
+        check_response(resp).await
     }
 
     /// Fetch search-appearance analytics when LinkedIn exposes it for the account.
