@@ -312,6 +312,98 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// Replace a scheduled post by deleting the old share and creating a new scheduled share
+    #[command(name = "schedule-update")]
+    ScheduleUpdate {
+        /// Existing scheduled share URN to cancel before creating the replacement
+        share_urn: String,
+
+        /// Inline replacement text. Use --caption-file for longer posts.
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Read replacement post text from a file
+        #[arg(long = "caption-file")]
+        caption_file: Option<PathBuf>,
+
+        /// Optional replacement media file: png/jpg/webp/gif/mp4/mov/pdf
+        #[arg(long)]
+        media: Option<PathBuf>,
+
+        /// Document title for PDF/native document replacement posts
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Replacement schedule time in 'YYYY-MM-DD HH:MM'
+        #[arg(long)]
+        schedule: String,
+
+        /// Timezone for --schedule. Supports Asia/Singapore and UTC.
+        #[arg(long, default_value = "Asia/Singapore")]
+        timezone: String,
+
+        /// Post visibility: ANYONE (public) or CONNECTIONS_ONLY
+        #[arg(long, default_value = "ANYONE")]
+        visibility: String,
+
+        /// Seconds to poll LinkedIn media READY after upload
+        #[arg(long = "media-ready-timeout", default_value = "240")]
+        media_ready_timeout: u64,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Alias for schedule-update. Replaces a scheduled post via delete + recreate.
+    #[command(name = "schedule-edit")]
+    ScheduleEdit {
+        /// Existing scheduled share URN to cancel before creating the replacement
+        share_urn: String,
+
+        /// Inline replacement text. Use --caption-file for longer posts.
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Read replacement post text from a file
+        #[arg(long = "caption-file")]
+        caption_file: Option<PathBuf>,
+
+        /// Optional replacement media file: png/jpg/webp/gif/mp4/mov/pdf
+        #[arg(long)]
+        media: Option<PathBuf>,
+
+        /// Document title for PDF/native document replacement posts
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Replacement schedule time in 'YYYY-MM-DD HH:MM'
+        #[arg(long)]
+        schedule: String,
+
+        /// Timezone for --schedule. Supports Asia/Singapore and UTC.
+        #[arg(long, default_value = "Asia/Singapore")]
+        timezone: String,
+
+        /// Post visibility: ANYONE (public) or CONNECTIONS_ONLY
+        #[arg(long, default_value = "ANYONE")]
+        visibility: String,
+
+        /// Seconds to poll LinkedIn media READY after upload
+        #[arg(long = "media-ready-timeout", default_value = "240")]
+        media_ready_timeout: u64,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -782,6 +874,51 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_feed_schedule_delete(&share_urn, yes, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::ScheduleUpdate {
+                share_urn,
+                text,
+                caption_file,
+                media,
+                title,
+                schedule,
+                timezone,
+                visibility,
+                media_ready_timeout,
+                yes,
+                json,
+            }
+            | FeedAction::ScheduleEdit {
+                share_urn,
+                text,
+                caption_file,
+                media,
+                title,
+                schedule,
+                timezone,
+                visibility,
+                media_ready_timeout,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_schedule_replace(
+                    &share_urn,
+                    text.as_deref(),
+                    caption_file.as_ref(),
+                    media.as_ref(),
+                    title.as_deref(),
+                    &schedule,
+                    &timezone,
+                    &visibility,
+                    media_ready_timeout,
+                    yes,
+                    json,
+                )
+                .await
+                {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -2070,6 +2207,104 @@ async fn cmd_feed_schedule_delete(
     Ok(())
 }
 
+async fn cmd_feed_schedule_replace(
+    share_urn: &str,
+    text: Option<&str>,
+    caption_file: Option<&PathBuf>,
+    media: Option<&PathBuf>,
+    title: Option<&str>,
+    schedule: &str,
+    timezone: &str,
+    visibility: &str,
+    media_ready_timeout: u64,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    let post_text = read_post_text(text, caption_file)?;
+    let vis_upper = visibility.to_uppercase();
+    if vis_upper != "ANYONE" && vis_upper != "CONNECTIONS_ONLY" {
+        return Err(format!(
+            "invalid visibility '{}'. Must be ANYONE or CONNECTIONS_ONLY",
+            visibility
+        ));
+    }
+    let scheduled_at_ms = parse_schedule_ms(schedule, timezone)?;
+    if scheduled_at_ms <= chrono::Utc::now().timestamp_millis() {
+        return Err("scheduled time must be in the future".to_string());
+    }
+
+    if !confirmed {
+        eprintln!("WARNING: This will replace a REAL scheduled LinkedIn post by deleting the old share and creating a new scheduled share.");
+        eprintln!("  Old URN: {}", share_urn);
+        eprintln!("  Replacement schedule: {} {}", schedule, timezone);
+        eprintln!("  Visibility: {}", vis_upper);
+        eprintln!(
+            "  Media: {}",
+            media
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+        eprintln!("  Text: {}", truncate_with_ellipsis(&post_text, 200));
+        eprintln!("Use --yes to confirm this delete + recreate operation.");
+        return Err("schedule replacement not confirmed (use --yes to replace)".to_string());
+    }
+
+    let (client, _path) = load_session_client()?;
+    eprintln!("Deleting old scheduled post...");
+    let deleted = client
+        .delete_share(share_urn)
+        .await
+        .map_err(|e| format!("delete failed before replacement was created: {e}"))?;
+
+    let created = if let Some(media_path) = media {
+        eprintln!("Uploading replacement media and scheduling replacement post...");
+        client
+            .schedule_post_with_media(
+                &post_text,
+                &vis_upper,
+                scheduled_at_ms,
+                media_path,
+                title,
+                media_ready_timeout,
+            )
+            .await
+    } else {
+        eprintln!("Scheduling replacement text-only post...");
+        client
+            .schedule_post(&post_text, &vis_upper, scheduled_at_ms)
+            .await
+    }
+    .map_err(|e| format!("old post was deleted, but replacement create failed: {e}"))?;
+
+    let replacement_urn = extract_share_urn(&created).map(str::to_string);
+    let result = serde_json::json!({
+        "operation": "schedule_replace",
+        "method": "delete_then_recreate",
+        "oldShareUrn": share_urn,
+        "newShareUrn": replacement_urn,
+        "schedule": schedule,
+        "timezone": timezone,
+        "visibility": vis_upper,
+        "deleted": deleted,
+        "created": created,
+    });
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Scheduled post replaced via delete + recreate.");
+        println!("  Old URN: {}", share_urn);
+        if let Some(urn) = replacement_urn {
+            println!("  New URN: {}", urn);
+        }
+        println!("  Schedule: {} {}", schedule, timezone);
+        println!("  Text: {}", truncate_with_ellipsis(&post_text, 100));
+    }
+    Ok(())
+}
+
 fn extract_share_urn(result: &serde_json::Value) -> Option<&str> {
     result
         .pointer("/value/data/createContentcreationDashShares/entity/entityUrn")
@@ -3285,6 +3520,98 @@ mod tests {
         let sgt = parse_schedule_ms("2026-05-03 09:30", "Asia/Singapore").unwrap();
         let utc = chrono::DateTime::from_timestamp_millis(sgt).unwrap();
         assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-05-03 01:30");
+    }
+
+    #[test]
+    fn feed_schedule_update_parses_replacement_options() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "schedule-update",
+            "urn:li:share:123",
+            "--text",
+            "Updated replacement post",
+            "--schedule",
+            "2026-05-03 11:15",
+            "--timezone",
+            "Asia/Singapore",
+            "--yes",
+            "--json",
+        ])
+        .expect("feed schedule-update should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action:
+                    FeedAction::ScheduleUpdate {
+                        share_urn,
+                        text,
+                        schedule,
+                        timezone,
+                        yes,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(share_urn, "urn:li:share:123");
+                assert_eq!(text.as_deref(), Some("Updated replacement post"));
+                assert_eq!(schedule, "2026-05-03 11:15");
+                assert_eq!(timezone, "Asia/Singapore");
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected feed schedule-update command"),
+        }
+    }
+
+    #[test]
+    fn feed_schedule_edit_parses_as_alias_for_update() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "schedule-edit",
+            "urn:li:share:123",
+            "--caption-file",
+            "/tmp/replacement.txt",
+            "--media",
+            "/tmp/replacement.pdf",
+            "--title",
+            "Replacement PDF",
+            "--schedule",
+            "2026-05-03 12:30",
+            "--timezone",
+            "Asia/Singapore",
+            "--yes",
+            "--json",
+        ])
+        .expect("feed schedule-edit should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action:
+                    FeedAction::ScheduleEdit {
+                        share_urn,
+                        caption_file,
+                        media,
+                        title,
+                        schedule,
+                        timezone,
+                        yes,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(share_urn, "urn:li:share:123");
+                assert_eq!(caption_file.unwrap(), PathBuf::from("/tmp/replacement.txt"));
+                assert_eq!(media.unwrap(), PathBuf::from("/tmp/replacement.pdf"));
+                assert_eq!(title.as_deref(), Some("Replacement PDF"));
+                assert_eq!(schedule, "2026-05-03 12:30");
+                assert_eq!(timezone, "Asia/Singapore");
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected feed schedule-edit command"),
+        }
     }
 }
 
