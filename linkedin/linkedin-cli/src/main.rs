@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -234,6 +235,74 @@ enum FeedAction {
         /// Post visibility: ANYONE (public) or CONNECTIONS_ONLY
         #[arg(long, default_value = "ANYONE")]
         visibility: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Schedule a LinkedIn post, optionally with image/GIF/MP4/PDF media
+    ///
+    /// WARNING: This creates a REAL scheduled post. Use --yes to confirm.
+    Schedule {
+        /// Inline text content. Use --caption-file for longer posts.
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Read post text from a file
+        #[arg(long = "caption-file")]
+        caption_file: Option<PathBuf>,
+
+        /// Optional media file: png/jpg/webp/gif/mp4/mov/pdf
+        #[arg(long)]
+        media: Option<PathBuf>,
+
+        /// Document title for PDF/native document posts
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Schedule time in 'YYYY-MM-DD HH:MM'
+        #[arg(long)]
+        schedule: String,
+
+        /// Timezone for --schedule. Supports Asia/Singapore and UTC.
+        #[arg(long, default_value = "Asia/Singapore")]
+        timezone: String,
+
+        /// Post visibility: ANYONE (public) or CONNECTIONS_ONLY
+        #[arg(long, default_value = "ANYONE")]
+        visibility: String,
+
+        /// Seconds to poll LinkedIn media READY after upload
+        #[arg(long = "media-ready-timeout", default_value = "240")]
+        media_ready_timeout: u64,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a scheduled/published share by URN
+    #[command(name = "schedule-get")]
+    ScheduleGet {
+        /// Share URN, e.g. urn:li:share:... or urn:li:ugcPost:...
+        share_urn: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete/cancel a scheduled/published share by URN
+    #[command(name = "schedule-delete")]
+    ScheduleDelete {
+        /// Share URN, e.g. urn:li:share:... or urn:li:ugcPost:...
+        share_urn: String,
 
         /// Skip confirmation prompt (required for non-interactive use)
         #[arg(long)]
@@ -667,6 +736,52 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_feed_post(&text, &visibility, yes, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Schedule {
+                text,
+                caption_file,
+                media,
+                title,
+                schedule,
+                timezone,
+                visibility,
+                media_ready_timeout,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_schedule(
+                    text.as_deref(),
+                    caption_file.as_ref(),
+                    media.as_ref(),
+                    title.as_deref(),
+                    &schedule,
+                    &timezone,
+                    &visibility,
+                    media_ready_timeout,
+                    yes,
+                    json,
+                )
+                .await
+                {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::ScheduleGet { share_urn, json } => {
+                if let Err(e) = cmd_feed_schedule_get(&share_urn, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::ScheduleDelete {
+                share_urn,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_schedule_delete(&share_urn, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1803,6 +1918,170 @@ async fn cmd_feed_post(
 ///
 /// Loads the session, calls GET /voyager/api/messaging/conversations with
 /// pagination params, and prints the results.
+fn parse_schedule_ms(value: &str, timezone: &str) -> Result<i64, String> {
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")
+        .map_err(|e| format!("invalid --schedule '{value}', expected YYYY-MM-DD HH:MM: {e}"))?;
+    let offset_secs = match timezone {
+        "Asia/Singapore" | "Singapore" | "SGT" => 8 * 3600,
+        "UTC" | "Etc/UTC" | "Z" => 0,
+        other => {
+            return Err(format!(
+                "unsupported timezone '{other}'. Currently supported: Asia/Singapore, UTC"
+            ))
+        }
+    };
+    let offset = chrono::FixedOffset::east_opt(offset_secs)
+        .ok_or_else(|| format!("invalid timezone offset for {timezone}"))?;
+    let dt = naive
+        .and_local_timezone(offset)
+        .single()
+        .ok_or_else(|| format!("ambiguous schedule time '{value}' in {timezone}"))?;
+    Ok(dt.timestamp_millis())
+}
+
+fn read_post_text(text: Option<&str>, caption_file: Option<&PathBuf>) -> Result<String, String> {
+    match (text, caption_file) {
+        (Some(text), None) => Ok(text.to_string()),
+        (None, Some(path)) => fs::read_to_string(path)
+            .map_err(|e| format!("failed to read caption file {}: {e}", path.display())),
+        (Some(_), Some(_)) => Err("provide either --text or --caption-file, not both".to_string()),
+        (None, None) => Err("provide --text or --caption-file".to_string()),
+    }
+}
+
+async fn cmd_feed_schedule(
+    text: Option<&str>,
+    caption_file: Option<&PathBuf>,
+    media: Option<&PathBuf>,
+    title: Option<&str>,
+    schedule: &str,
+    timezone: &str,
+    visibility: &str,
+    media_ready_timeout: u64,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    let post_text = read_post_text(text, caption_file)?;
+    let vis_upper = visibility.to_uppercase();
+    if vis_upper != "ANYONE" && vis_upper != "CONNECTIONS_ONLY" {
+        return Err(format!(
+            "invalid visibility '{}'. Must be ANYONE or CONNECTIONS_ONLY",
+            visibility
+        ));
+    }
+    let scheduled_at_ms = parse_schedule_ms(schedule, timezone)?;
+    if scheduled_at_ms <= chrono::Utc::now().timestamp_millis() {
+        return Err("scheduled time must be in the future".to_string());
+    }
+
+    if !confirmed {
+        eprintln!("WARNING: This will create a REAL scheduled LinkedIn post.");
+        eprintln!("  Schedule: {} {}", schedule, timezone);
+        eprintln!("  Visibility: {}", vis_upper);
+        eprintln!(
+            "  Media: {}",
+            media
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+        eprintln!("  Text: {}", truncate_with_ellipsis(&post_text, 200));
+        eprintln!("Use --yes to confirm and schedule this post.");
+        return Err("schedule not confirmed (use --yes to schedule)".to_string());
+    }
+
+    let (client, _path) = load_session_client()?;
+    let result = if let Some(media_path) = media {
+        eprintln!("Uploading media and scheduling post...");
+        client
+            .schedule_post_with_media(
+                &post_text,
+                &vis_upper,
+                scheduled_at_ms,
+                media_path,
+                title,
+                media_ready_timeout,
+            )
+            .await
+    } else {
+        eprintln!("Scheduling text-only post...");
+        client
+            .schedule_post(&post_text, &vis_upper, scheduled_at_ms)
+            .await
+    }
+    .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Post scheduled.");
+        println!("  Schedule: {} {}", schedule, timezone);
+        if let Some(urn) = extract_share_urn(&result) {
+            println!("  URN: {}", urn);
+        }
+        println!("  Text: {}", truncate_with_ellipsis(&post_text, 100));
+    }
+    Ok(())
+}
+
+async fn cmd_feed_schedule_get(share_urn: &str, raw_json: bool) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+    let result = client
+        .get_share(share_urn)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Share fetched: {}", share_urn);
+        if let Some(toast) = result
+            .pointer(
+                "/data/contentcreationDashSharesByIds/0/status/feedbackData/toastComponent/text",
+            )
+            .and_then(|v| v.as_str())
+        {
+            println!("  Status: {}", toast);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_feed_schedule_delete(
+    share_urn: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    require_confirmation(confirmed, "delete/cancel a REAL LinkedIn scheduled post")?;
+    let (client, _path) = load_session_client()?;
+    let result = client
+        .delete_share(share_urn)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Share deleted/cancelled: {}", share_urn);
+    }
+    Ok(())
+}
+
+fn extract_share_urn(result: &serde_json::Value) -> Option<&str> {
+    result
+        .pointer("/value/data/createContentcreationDashShares/entity/entityUrn")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            result
+                .pointer("/data/createContentcreationDashShares/entity/entityUrn")
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| result.get("entityUrn").and_then(|v| v.as_str()))
+}
+
 async fn cmd_messages_list(
     count: u32,
     cursor: Option<&str>,
@@ -2958,6 +3237,54 @@ mod tests {
             }
             _ => panic!("expected feed comments command"),
         }
+    }
+
+    #[test]
+    fn feed_schedule_parses_media_and_confirmation_flag() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "schedule",
+            "--text",
+            "Learn with Siva reference post",
+            "--media",
+            "/tmp/reference.mp4",
+            "--schedule",
+            "2026-05-03 09:30",
+            "--timezone",
+            "Asia/Singapore",
+            "--yes",
+            "--json",
+        ])
+        .expect("feed schedule should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action:
+                    FeedAction::Schedule {
+                        media,
+                        schedule,
+                        timezone,
+                        yes,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(media.unwrap(), PathBuf::from("/tmp/reference.mp4"));
+                assert_eq!(schedule, "2026-05-03 09:30");
+                assert_eq!(timezone, "Asia/Singapore");
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected feed schedule command"),
+        }
+    }
+
+    #[test]
+    fn schedule_parser_treats_asia_singapore_independent_of_vps_timezone() {
+        let sgt = parse_schedule_ms("2026-05-03 09:30", "Asia/Singapore").unwrap();
+        let utc = chrono::DateTime::from_timestamp_millis(sgt).unwrap();
+        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-05-03 01:30");
     }
 }
 

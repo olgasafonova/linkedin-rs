@@ -11,8 +11,10 @@
 //! `re/restli_protocol.md`, `re/auth_flow.md`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
@@ -1343,42 +1345,76 @@ impl LinkedInClient {
     ///
     /// See `re/create_post.md` for the full analysis.
     pub async fn create_post(&self, text: &str, visibility: &str) -> Result<Value, Error> {
-        // Visibility is not validated here -- the server will reject invalid
-        // values. Callers (e.g. the CLI) should validate before calling if
-        // they want a friendlier error message.
-        let vis = visibility.to_uppercase();
+        self.create_share(text, visibility, "PUBLISHED", None, None, None)
+            .await
+    }
 
-        // Build the mutation variables matching the ShareData model structure.
-        // The entity is the "input" parameter for the CREATE mutation.
-        // Captured from live browser traffic via Chrome DevTools MCP.
-        // The web client sends variables + queryId in the POST body (not URL params).
-        // Key differences from the mobile APK:
-        // - Top-level key is "post" (not "entity")
-        // - Uses "attributesV2" (not "attributes")
-        // - visibilityDataUnion wraps "visibilityType" (not "visibilityTypeValue")
-        let body = serde_json::json!({
-            "variables": {
-                "post": {
-                    "allowedCommentersScope": "ALL",
-                    "intendedShareLifeCycleState": "PUBLISHED",
-                    "origin": "FEED",
-                    "visibilityDataUnion": {
-                        "visibilityType": vis
-                    },
-                    "commentary": {
-                        "text": text,
-                        "attributesV2": []
-                    }
-                }
-            },
-            "queryId": "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
-            "includeWebMetadata": true
-        });
+    /// Schedule a text-only post for a future epoch-millis timestamp.
+    pub async fn schedule_post(
+        &self,
+        text: &str,
+        visibility: &str,
+        scheduled_at_ms: i64,
+    ) -> Result<Value, Error> {
+        self.create_share(
+            text,
+            visibility,
+            "SCHEDULED",
+            Some(scheduled_at_ms),
+            None,
+            None,
+        )
+        .await
+    }
 
-        // The web-style mutation format sends variables+queryId in the POST
-        // body (not just URL params). We still include queryId in URL params
-        // as the server uses both. The `x-li-graphql-pegasus-client` header
-        // is required for all GraphQL requests.
+    /// Upload media and schedule a LinkedIn post with a verified native media payload.
+    pub async fn schedule_post_with_media(
+        &self,
+        text: &str,
+        visibility: &str,
+        scheduled_at_ms: i64,
+        media_path: &Path,
+        title: Option<&str>,
+        ready_timeout_secs: u64,
+    ) -> Result<Value, Error> {
+        let media = self.upload_media(media_path).await?;
+        let ready = self
+            .wait_media_ready(&media, Duration::from_secs(ready_timeout_secs.max(1)))
+            .await?;
+        if !ready.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(Error::Api {
+                status: 408,
+                body: format!("media did not become READY: {ready}"),
+            });
+        }
+        self.create_share(
+            text,
+            visibility,
+            "SCHEDULED",
+            Some(scheduled_at_ms),
+            Some(&media),
+            title,
+        )
+        .await
+    }
+
+    async fn create_share(
+        &self,
+        text: &str,
+        visibility: &str,
+        lifecycle_state: &str,
+        scheduled_at_ms: Option<i64>,
+        media: Option<&Value>,
+        title: Option<&str>,
+    ) -> Result<Value, Error> {
+        let body = build_share_mutation_body(
+            text,
+            visibility,
+            lifecycle_state,
+            scheduled_at_ms,
+            media,
+            title,
+        )?;
         let url = format!(
             "{}{}graphql?action=execute&queryId=voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
             BASE_URL, API_PREFIX
@@ -1394,6 +1430,160 @@ impl LinkedInClient {
         let json = check_response(resp).await?;
         check_graphql_errors(&json)?;
         Ok(json)
+    }
+
+    /// Upload an image/GIF/video/PDF to LinkedIn media storage and return upload metadata.
+    pub async fn upload_media(&self, media_path: &Path) -> Result<Value, Error> {
+        if !media_path.is_file() {
+            return Err(Error::InvalidInput(format!(
+                "media file does not exist: {}",
+                media_path.display()
+            )));
+        }
+        let filename = media_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::InvalidInput("media path has no valid filename".to_string()))?;
+        let (upload_type, content_type) = linkedin_media_upload_type(filename)?;
+        let bytes = std::fs::read(media_path)
+            .map_err(|e| Error::InvalidInput(format!("failed to read media file: {e}")))?;
+        let body = serde_json::json!({
+            "mediaUploadType": upload_type,
+            "fileSize": bytes.len(),
+            "hasOverlayImage": false,
+            "uploadMetadataType": "SINGLE",
+            "filename": filename,
+        });
+        let meta = self
+            .post("voyagerMediaUploadMetadata?action=upload", &body)
+            .await?;
+        let value = meta.get("value").cloned().ok_or_else(|| Error::Api {
+            status: 200,
+            body: format!("missing upload metadata value: {meta}"),
+        })?;
+        let upload_url = value
+            .get("singleUploadUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Api {
+                status: 200,
+                body: format!("missing singleUploadUrl: {value}"),
+            })?;
+        let mut req = self
+            .http
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
+            for (name, val) in headers {
+                if let Some(val) = val.as_str() {
+                    req = req.header(name.as_str(), val);
+                }
+            }
+        }
+        let put = req.body(bytes).send().await?;
+        let put_status = put.status().as_u16();
+        if !put.status().is_success() {
+            return Err(Error::Api {
+                status: put_status,
+                body: put.text().await.unwrap_or_default(),
+            });
+        }
+        let mut out = value;
+        out["media_upload_type"] = serde_json::json!(upload_type);
+        out["content_type"] = serde_json::json!(content_type);
+        out["singleUploadStatus"] = serde_json::json!(put_status);
+        out["media_path"] = serde_json::json!(media_path.display().to_string());
+        Ok(out)
+    }
+
+    /// Poll LinkedIn's media status endpoint until the uploaded asset is READY.
+    pub async fn wait_media_ready(&self, media: &Value, timeout: Duration) -> Result<Value, Error> {
+        let urn = media
+            .get("urn")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::InvalidInput("media metadata missing urn".to_string()))?;
+        let upload_type = media
+            .get("media_upload_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::InvalidInput("media metadata missing media_upload_type".to_string())
+            })?;
+        let status_type = linkedin_media_status_type(upload_type);
+        let encoded_urn = restli_encode_string(urn);
+        let path = format!(
+            "/voyager/api/voyagerVideoDashMediaAssetStatus/{encoded_urn}?mediaStatusType={status_type}"
+        );
+        let deadline = Instant::now() + timeout;
+        let mut attempts = Vec::new();
+        while Instant::now() < deadline {
+            match self.api_get(&path).await {
+                Ok(json) => {
+                    attempts.push(json.clone());
+                    if json.get("processingStatus").and_then(|v| v.as_str()) == Some("READY")
+                        || json.get("documentProcessingResult").is_some()
+                    {
+                        return Ok(serde_json::json!({
+                            "ok": true,
+                            "mediaStatusType": status_type,
+                            "last": json,
+                        }));
+                    }
+                    if matches!(
+                        json.get("processingStatus").and_then(|v| v.as_str()),
+                        Some("FAILED") | Some("PROCESSING_FAILED")
+                    ) {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "mediaStatusType": status_type,
+                            "last": json,
+                        }));
+                    }
+                }
+                Err(err) => attempts.push(serde_json::json!({"error": err.to_string()})),
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(serde_json::json!({
+            "ok": false,
+            "mediaStatusType": status_type,
+            "timeout_secs": timeout.as_secs(),
+            "attempts": attempts.into_iter().rev().take(5).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Fetch a scheduled/published share by URN.
+    pub async fn get_share(&self, share_urn: &str) -> Result<Value, Error> {
+        let share_urn = normalize_share_urn(share_urn);
+        let enc = restli_encode_string(&share_urn);
+        let q = format!(
+            "variables=(shareUrns:List({enc}))&queryId=voyagerContentcreationDashShares.b6c8295dc377a63224101ecce6d3c1ca"
+        );
+        self.graphql_get(&q).await
+    }
+
+    /// Delete a scheduled/published share by URN.
+    pub async fn delete_share(&self, share_urn: &str) -> Result<Value, Error> {
+        let share_urn = normalize_share_urn(share_urn);
+        let encoded = restli_encode_string(&share_urn);
+        let url = format!("{BASE_URL}{API_PREFIX}contentcreation/normShares/{encoded}");
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Csrf-Token", &self.jsessionid)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(serde_json::json!({
+            "status_code": status.as_u16(),
+            "share_urn": share_urn,
+            "body": body,
+        }))
     }
 
     /// Fetch events (messages) within a specific conversation.
@@ -1841,6 +2031,135 @@ fn build_create_comment_graphql_body(thread_urn: &str, text: &str) -> Value {
     })
 }
 
+fn build_share_mutation_body(
+    text: &str,
+    visibility: &str,
+    lifecycle_state: &str,
+    scheduled_at_ms: Option<i64>,
+    media: Option<&Value>,
+    title: Option<&str>,
+) -> Result<Value, Error> {
+    let vis = visibility.to_uppercase();
+    if vis != "ANYONE" && vis != "CONNECTIONS_ONLY" {
+        return Err(Error::InvalidInput(format!(
+            "invalid visibility '{visibility}'. Must be ANYONE or CONNECTIONS_ONLY"
+        )));
+    }
+    let lifecycle = lifecycle_state.to_uppercase();
+    if lifecycle != "PUBLISHED" && lifecycle != "SCHEDULED" {
+        return Err(Error::InvalidInput(format!(
+            "invalid lifecycle_state '{lifecycle_state}'. Must be PUBLISHED or SCHEDULED"
+        )));
+    }
+    let mut post = serde_json::json!({
+        "allowedCommentersScope": "ALL",
+        "intendedShareLifeCycleState": lifecycle,
+        "origin": "FEED",
+        "visibilityDataUnion": { "visibilityType": vis },
+        "commentary": { "text": text, "attributesV2": [] }
+    });
+    if lifecycle == "SCHEDULED" {
+        let scheduled_at_ms = scheduled_at_ms.ok_or_else(|| {
+            Error::InvalidInput("scheduled_at_ms is required for SCHEDULED shares".to_string())
+        })?;
+        post["scheduledAt"] = serde_json::json!(scheduled_at_ms);
+    }
+    if let Some(media) = media {
+        post["media"] = media_payload_from_upload(media, title)?;
+    }
+    Ok(serde_json::json!({
+        "variables": { "post": post },
+        "queryId": "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
+        "includeWebMetadata": true
+    }))
+}
+
+fn media_payload_from_upload(media: &Value, title: Option<&str>) -> Result<Value, Error> {
+    let upload_type = media
+        .get("media_upload_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::InvalidInput("media metadata missing media_upload_type".to_string())
+        })?;
+    let urn = media
+        .get("urn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidInput("media metadata missing urn".to_string()))?;
+    let recipes = media.get("recipes").cloned();
+    match upload_type {
+        "VIDEO_SHARING" => Ok(serde_json::json!({
+            "category": "VIDEO",
+            "mediaUrn": urn,
+            "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                "urn:li:digitalmediaRecipe:feedshare-video-captions-thumbnails-ambry",
+                "urn:li:digitalmediaRecipe:feedshare-video-auto-caption-public"
+            ])),
+            "nativeMediaSource": "PRE_RECORDED"
+        })),
+        "DOCUMENT_SHARING" => {
+            let mut payload = serde_json::json!({
+                "category": "NATIVE_DOCUMENT",
+                "mediaUrn": urn,
+                "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                    "urn:li:digitalmediaRecipe:feedshare-document-preview",
+                    "urn:li:digitalmediaRecipe:feedshare-document"
+                ]))
+            });
+            if let Some(title) = title {
+                payload["title"] = serde_json::json!(title);
+            }
+            Ok(payload)
+        }
+        "IMAGE_SHARING" => Ok(serde_json::json!({
+            "category": "IMAGE",
+            "mediaUrn": urn,
+            "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                "urn:li:digitalmediaRecipe:feedshare-image"
+            ]))
+        })),
+        other => Err(Error::InvalidInput(format!(
+            "unsupported media_upload_type '{other}'"
+        ))),
+    }
+}
+
+fn linkedin_media_upload_type(filename: &str) -> Result<(&'static str, &'static str), Error> {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Ok(("IMAGE_SHARING", "image/png")),
+        "jpg" | "jpeg" => Ok(("IMAGE_SHARING", "image/jpeg")),
+        "gif" => Ok(("IMAGE_SHARING", "image/gif")),
+        "webp" => Ok(("IMAGE_SHARING", "image/webp")),
+        "mp4" => Ok(("VIDEO_SHARING", "video/mp4")),
+        "mov" => Ok(("VIDEO_SHARING", "video/quicktime")),
+        "m4v" => Ok(("VIDEO_SHARING", "video/x-m4v")),
+        "webm" => Ok(("VIDEO_SHARING", "video/webm")),
+        "pdf" => Ok(("DOCUMENT_SHARING", "application/pdf")),
+        _ => Err(Error::InvalidInput(format!(
+            "unsupported LinkedIn media type for '{filename}'"
+        ))),
+    }
+}
+
+fn linkedin_media_status_type(upload_type: &str) -> &'static str {
+    match upload_type {
+        "DOCUMENT_SHARING" => "DOCUMENT_PREVIEW",
+        "VIDEO_SHARING" => "VIDEO",
+        _ => "IMAGE",
+    }
+}
+
+fn normalize_share_urn(share_urn: &str) -> String {
+    share_urn
+        .strip_prefix("urn:li:fsd_share:")
+        .unwrap_or(share_urn)
+        .to_string()
+}
+
 /// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
 /// parenthesized record variables within a URL query parameter.
 ///
@@ -2235,6 +2554,65 @@ mod tests {
             "urn:li:comment:(activity:7456131258478276609,7456166291515662336)"
         );
         assert_eq!(body["entity"]["origin"], "FEED");
+    }
+
+    #[test]
+    fn linkedin_media_upload_type_maps_supported_file_extensions() {
+        assert_eq!(
+            linkedin_media_upload_type("anchor.png").unwrap().0,
+            "IMAGE_SHARING"
+        );
+        assert_eq!(
+            linkedin_media_upload_type("motion.gif").unwrap().0,
+            "IMAGE_SHARING"
+        );
+        assert_eq!(
+            linkedin_media_upload_type("clip.mp4").unwrap().0,
+            "VIDEO_SHARING"
+        );
+        assert_eq!(
+            linkedin_media_upload_type("deck.pdf").unwrap().0,
+            "DOCUMENT_SHARING"
+        );
+        assert!(linkedin_media_upload_type("notes.txt").is_err());
+    }
+
+    #[test]
+    fn scheduled_post_body_includes_text_schedule_visibility_and_media_payload() {
+        let media = serde_json::json!({
+            "media_upload_type": "DOCUMENT_SHARING",
+            "urn": "urn:li:digitalmediaAsset:DOC123",
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-document-preview"]
+        });
+        let body = build_share_mutation_body(
+            "Test post",
+            "ANYONE",
+            "SCHEDULED",
+            Some(1777770000000),
+            Some(&media),
+            Some("Deck title"),
+        )
+        .unwrap();
+
+        let post = &body["variables"]["post"];
+        assert_eq!(post["commentary"]["text"], "Test post");
+        assert_eq!(post["visibilityDataUnion"]["visibilityType"], "ANYONE");
+        assert_eq!(post["intendedShareLifeCycleState"], "SCHEDULED");
+        assert_eq!(post["scheduledAt"], 1777770000000_i64);
+        assert_eq!(post["media"]["category"], "NATIVE_DOCUMENT");
+        assert_eq!(post["media"]["title"], "Deck title");
+    }
+
+    #[test]
+    fn normalize_share_urn_accepts_fsd_wrapper_or_backend_urn() {
+        assert_eq!(
+            normalize_share_urn("urn:li:fsd_share:urn:li:share:123"),
+            "urn:li:share:123"
+        );
+        assert_eq!(
+            normalize_share_urn("urn:li:ugcPost:456"),
+            "urn:li:ugcPost:456"
+        );
     }
 
     #[test]
