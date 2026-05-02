@@ -1313,6 +1313,63 @@ impl LinkedInClient {
         self.get("identity/wvmpCards").await
     }
 
+    /// Fetch profile viewers with analytics metadata. LinkedIn's current
+    /// `identity/wvmpCards` endpoint appears to choose the available viewer
+    /// window server-side; the `days` and `interesting_viewers` inputs are kept
+    /// in the returned command-level metadata so reports remain explicit.
+    pub async fn get_profile_viewers_for_period(
+        &self,
+        _days: u32,
+        _interesting_viewers: bool,
+    ) -> Result<Value, Error> {
+        self.get_profile_viewers().await
+    }
+
+    /// Fetch the authenticated user's own posts with engagement metrics.
+    ///
+    /// Uses `identity/profileUpdatesV2?q=memberShareFeed`, which returns own
+    /// posts as standard `UpdateV2` records with `socialDetail` counts including
+    /// views/impressions, reactions, comments, shares/reposts, and sometimes
+    /// saves. This is the most reliable personal-content analytics source found
+    /// in the current Voyager surface; older `socialUpdateAnalytics` endpoints
+    /// now return 400/redirects for this account.
+    pub async fn get_my_posts(&self, start: u32, count: u32) -> Result<Value, Error> {
+        let profile_urn = self.my_profile_urn().await?;
+        let encoded_urn = restli_encode_string(profile_urn);
+        let path = format!(
+            "identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
+            encoded_urn, start, count
+        );
+        self.get(&path).await
+    }
+
+    /// Fetch search-appearance analytics when LinkedIn exposes it for the account.
+    pub async fn get_search_appearances(&self) -> Result<Value, Error> {
+        self.api_get("/voyager/api/voyagerIdentitySearchAppearances")
+            .await
+    }
+
+    /// Fetch profile dashboard analytics when LinkedIn exposes it for the account.
+    pub async fn get_profile_dashboard(&self) -> Result<Value, Error> {
+        self.get("identity/profile/dashboard").await
+    }
+
+    /// Fetch the list of reactors for a specific post/activity/thread URN.
+    pub async fn get_post_reactions(
+        &self,
+        activity_urn: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        let encoded_urn = restli_encode_string(activity_urn);
+        let params = format!(
+            "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
+            count, start, encoded_urn
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashReactionsByReactionType")
+    }
+
     /// Create a new text-only post (share) on the authenticated user's feed.
     ///
     /// Uses the Dash GraphQL CREATE mutation `createContentcreationDashShares`

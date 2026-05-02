@@ -54,6 +54,11 @@ enum Commands {
         #[command(subcommand)]
         action: NotificationsAction,
     },
+    /// Analytics for posts, content, audience, and profile impact
+    Analytics {
+        #[command(subcommand)]
+        action: AnalyticsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -399,6 +404,92 @@ enum FeedAction {
         /// Skip confirmation prompt (required for non-interactive use)
         #[arg(long)]
         yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnalyticsAction {
+    /// Aggregate profile + content impact over a period
+    Summary {
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Number of own posts to inspect when computing content performance
+        #[arg(long, default_value = "20")]
+        count: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// List own posts with impressions, reactions, comments, shares, saves and ranking
+    Content {
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Number of own posts to fetch (default: 20)
+        #[arg(long, default_value = "20")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show analytics for a single post or a cached post from content/feed listing
+    Post {
+        /// Post/share/activity URN. Omit when using --from-list.
+        post_urn: Option<String>,
+
+        /// Use item N from the last analytics content/feed listing
+        #[arg(long, conflicts_with = "post_urn")]
+        from_list: Option<usize>,
+
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Include reactor details for the post
+        #[arg(long)]
+        include_reactors: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show profile impact and audience signals over a period
+    Audience {
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Include interesting/profile-viewer cards when available
+        #[arg(long = "interesting-viewers")]
+        interesting_viewers: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show profile viewers and viewer cards
+    #[command(name = "profile-viewers")]
+    ProfileViewers {
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Include interesting/profile-viewer cards when available
+        #[arg(long = "interesting-viewers")]
+        interesting_viewers: bool,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -981,6 +1072,61 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_search_jobs(&keywords, start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+        },
+        Commands::Analytics { action } => match action {
+            AnalyticsAction::Summary { days, count, json } => {
+                if let Err(e) = cmd_analytics_summary(days, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            AnalyticsAction::Content {
+                days,
+                count,
+                start,
+                json,
+            } => {
+                if let Err(e) = cmd_analytics_content(days, start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            AnalyticsAction::Post {
+                post_urn,
+                from_list,
+                days,
+                include_reactors,
+                json,
+            } => {
+                if let Err(e) =
+                    cmd_analytics_post(post_urn.as_deref(), from_list, days, include_reactors, json)
+                        .await
+                {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            AnalyticsAction::Audience {
+                days,
+                interesting_viewers,
+                json,
+            } => {
+                if let Err(e) = cmd_analytics_audience(days, interesting_viewers, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            AnalyticsAction::ProfileViewers {
+                days,
+                interesting_viewers,
+                json,
+            } => {
+                if let Err(e) = cmd_analytics_profile_viewers(days, interesting_viewers, json).await
+                {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -3008,6 +3154,487 @@ fn print_job_card(index: usize, card: &serde_json::Value) {
     }
 }
 
+fn validate_analytics_days(days: u32) -> Result<u32, String> {
+    match days {
+        7 | 14 | 28 | 30 | 60 | 90 | 365 => Ok(days),
+        _ => Err(format!(
+            "unsupported analytics window '{}'. Use one of: 7, 14, 28, 30, 60, 90, 365",
+            days
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnalyticsPostStat {
+    rank: usize,
+    urn: String,
+    activity_urn: String,
+    social_detail_urn: String,
+    impressions: u64,
+    reactions: u64,
+    comments: u64,
+    shares: u64,
+    saves: u64,
+    preview: String,
+    posted_at: Option<u64>,
+    reaction_breakdown: Vec<(String, u64)>,
+}
+
+impl AnalyticsPostStat {
+    fn from_update(item: &serde_json::Value, rank: usize) -> Self {
+        let update = item
+            .get("value")
+            .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+            .unwrap_or(item);
+
+        let counts = update
+            .get("socialDetail")
+            .and_then(|s| s.get("totalSocialActivityCounts"));
+        let get_u64 = |key: &str| -> u64 {
+            counts
+                .and_then(|c| c.get(key))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0)
+        };
+        let reaction_breakdown = counts
+            .and_then(|c| c.get("reactionTypeCounts"))
+            .or_else(|| {
+                update
+                    .get("socialDetail")
+                    .and_then(|s| s.get("reactionTypeCounts"))
+            })
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let typ = r.get("reactionType").and_then(|v| v.as_str())?;
+                        let count = r.get("count").and_then(|v| v.as_u64())?;
+                        Some((typ.to_string(), count))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let entity_urn = item
+            .get("entityUrn")
+            .or_else(|| update.get("entityUrn"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let activity_urn = extract_activity_urn_from_text(&entity_urn)
+            .or_else(|| {
+                update
+                    .get("updateMetadata")
+                    .and_then(|m| m.get("urn"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| entity_urn.clone());
+        let social_detail_urn = update
+            .get("socialDetail")
+            .and_then(|s| s.get("entityUrn"))
+            .or_else(|| update.get("socialDetailUrn"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let preview = update
+            .get("commentary")
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let posted_at = update
+            .get("updateMetadata")
+            .and_then(|m| m.get("createdTime"))
+            .or_else(|| update.get("createdTime"))
+            .and_then(|v| v.as_u64());
+
+        Self {
+            rank,
+            urn: entity_urn,
+            activity_urn,
+            social_detail_urn,
+            impressions: get_u64("numViews"),
+            reactions: get_u64("numLikes"),
+            comments: get_u64("numComments"),
+            shares: get_u64("numShares"),
+            saves: get_u64("numSaves"),
+            preview,
+            posted_at,
+            reaction_breakdown,
+        }
+    }
+
+    fn engagement_total(&self) -> u64 {
+        self.reactions + self.comments + self.shares + self.saves
+    }
+
+    fn engagement_rate(&self) -> f64 {
+        if self.impressions == 0 {
+            0.0
+        } else {
+            self.engagement_total() as f64 / self.impressions as f64
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rank": self.rank,
+            "urn": self.urn,
+            "activityUrn": self.activity_urn,
+            "socialDetailUrn": self.social_detail_urn,
+            "impressions": self.impressions,
+            "reactions": self.reactions,
+            "comments": self.comments,
+            "shares": self.shares,
+            "saves": self.saves,
+            "engagementTotal": self.engagement_total(),
+            "engagementRate": self.engagement_rate(),
+            "postedAt": self.posted_at,
+            "preview": self.preview,
+            "reactionBreakdown": self.reaction_breakdown.iter().map(|(typ, count)| serde_json::json!({
+                "reactionType": typ,
+                "count": count,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn sum(posts: &[Self]) -> Self {
+        let mut out = Self {
+            rank: 0,
+            urn: String::new(),
+            activity_urn: String::new(),
+            social_detail_urn: String::new(),
+            impressions: 0,
+            reactions: 0,
+            comments: 0,
+            shares: 0,
+            saves: 0,
+            preview: String::new(),
+            posted_at: None,
+            reaction_breakdown: Vec::new(),
+        };
+        for p in posts {
+            out.impressions += p.impressions;
+            out.reactions += p.reactions;
+            out.comments += p.comments;
+            out.shares += p.shares;
+            out.saves += p.saves;
+        }
+        out
+    }
+}
+
+fn extract_activity_urn_from_text(text: &str) -> Option<String> {
+    let marker = "urn:li:activity:";
+    let start = text.find(marker)?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c == ',' || c == ')' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn sort_and_rank_posts_by_impressions(posts: &mut [AnalyticsPostStat]) {
+    posts.sort_by_key(|p| std::cmp::Reverse(p.impressions));
+    for (i, post) in posts.iter_mut().enumerate() {
+        post.rank = i + 1;
+    }
+}
+
+async fn fetch_analytics_posts(
+    client: &LinkedInClient,
+    _days: u32,
+    start: u32,
+    count: u32,
+) -> Result<Vec<AnalyticsPostStat>, String> {
+    let value = client
+        .get_my_posts(start, count)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+    let elements = value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(elements
+        .iter()
+        .enumerate()
+        .map(|(i, item)| AnalyticsPostStat::from_update(item, start as usize + i + 1))
+        .collect())
+}
+
+async fn cmd_analytics_content(
+    days: u32,
+    start: u32,
+    count: u32,
+    raw_json: bool,
+) -> Result<(), String> {
+    validate_analytics_days(days)?;
+    let (client, _path) = load_session_client()?;
+    let mut posts = fetch_analytics_posts(&client, days, start, count).await?;
+    sort_and_rank_posts_by_impressions(&mut posts);
+    let totals = AnalyticsPostStat::sum(&posts);
+
+    if raw_json {
+        let out = serde_json::json!({
+            "days": days,
+            "postCount": posts.len(),
+            "totals": totals.to_json(),
+            "posts": posts.iter().map(AnalyticsPostStat::to_json).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?
+        );
+        return Ok(());
+    }
+
+    println!("Content analytics: last {} days", days);
+    println!("---");
+    println!("Posts inspected: {}", posts.len());
+    println!(
+        "Impressions: {}  Reactions: {}  Comments: {}  Shares: {}  Saves: {}",
+        totals.impressions, totals.reactions, totals.comments, totals.shares, totals.saves
+    );
+    println!();
+    for p in &posts {
+        println!("[{}] {} impressions | {} reactions | {} comments | {} shares | {} saves | {:.2}% engagement", p.rank, p.impressions, p.reactions, p.comments, p.shares, p.saves, p.engagement_rate() * 100.0);
+        if !p.preview.is_empty() {
+            println!("    {}", truncate_with_ellipsis(&p.preview, 120));
+        }
+        if !p.activity_urn.is_empty() {
+            println!("    {}", p.activity_urn);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_analytics_post(
+    post_urn: Option<&str>,
+    from_list: Option<usize>,
+    days: u32,
+    include_reactors: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    validate_analytics_days(days)?;
+    let (client, _path) = load_session_client()?;
+    let mut posts = fetch_analytics_posts(&client, days, 0, 50).await?;
+    sort_and_rank_posts_by_impressions(&mut posts);
+    let selected = if let Some(index) = from_list {
+        posts
+            .iter()
+            .find(|p| p.rank == index)
+            .cloned()
+            .ok_or_else(|| format!("no cached/current own post at index {}", index))?
+    } else if let Some(urn) = post_urn {
+        posts
+            .iter()
+            .find(|p| p.urn.contains(urn) || p.activity_urn == urn || p.urn == urn)
+            .cloned()
+            .unwrap_or_else(|| AnalyticsPostStat {
+                rank: 0,
+                urn: urn.to_string(),
+                activity_urn: urn.to_string(),
+                social_detail_urn: String::new(),
+                impressions: 0,
+                reactions: 0,
+                comments: 0,
+                shares: 0,
+                saves: 0,
+                preview: String::new(),
+                posted_at: None,
+                reaction_breakdown: Vec::new(),
+            })
+    } else {
+        return Err("provide a post URN or --from-list N".to_string());
+    };
+
+    let reactors = if include_reactors && selected.reactions > 0 {
+        client
+            .get_post_reactions(&selected.activity_urn, 0, selected.reactions.min(50) as u32)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    if raw_json {
+        let out = serde_json::json!({
+            "days": days,
+            "post": selected.to_json(),
+            "reactors": reactors,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?
+        );
+        return Ok(());
+    }
+
+    println!("Post analytics: last {} days", days);
+    println!("---");
+    println!("URN: {}", selected.activity_urn);
+    println!("Impressions: {}", selected.impressions);
+    println!("Reactions: {}", selected.reactions);
+    println!("Comments: {}", selected.comments);
+    println!("Shares/reposts: {}", selected.shares);
+    println!("Saves: {}", selected.saves);
+    println!(
+        "Engagement rate: {:.2}%",
+        selected.engagement_rate() * 100.0
+    );
+    if !selected.preview.is_empty() {
+        println!(
+            "Preview: {}",
+            truncate_with_ellipsis(&selected.preview, 160)
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_analytics_profile_viewers(
+    days: u32,
+    interesting_viewers: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    validate_analytics_days(days)?;
+    let (client, _path) = load_session_client()?;
+    let viewers = client
+        .get_profile_viewers_for_period(days, interesting_viewers)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+    if raw_json {
+        let out = serde_json::json!({
+            "days": days,
+            "interestingViewers": interesting_viewers,
+            "profileViewers": viewers,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?
+        );
+    } else {
+        println!("Profile viewers: last {} days", days);
+        println!("Interesting viewers: {}", interesting_viewers);
+        print_profile_viewers(&viewers);
+    }
+    Ok(())
+}
+
+async fn cmd_analytics_audience(
+    days: u32,
+    interesting_viewers: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    validate_analytics_days(days)?;
+    let (client, _path) = load_session_client()?;
+    let viewers = client
+        .get_profile_viewers_for_period(days, interesting_viewers)
+        .await
+        .ok();
+    let search_appearances = client.get_search_appearances().await.ok();
+    let dashboard = client.get_profile_dashboard().await.ok();
+    if raw_json {
+        let out = serde_json::json!({
+            "days": days,
+            "interestingViewers": interesting_viewers,
+            "profileViewers": viewers,
+            "searchAppearances": search_appearances,
+            "profileDashboard": dashboard,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?
+        );
+        return Ok(());
+    }
+    println!("Audience analytics: last {} days", days);
+    println!("---");
+    if let Some(v) = viewers.as_ref() {
+        print_profile_viewers(v);
+    } else {
+        println!("Profile viewers: unavailable");
+    }
+    println!(
+        "Search appearances: {}",
+        if search_appearances.is_some() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "Profile dashboard: {}",
+        if dashboard.is_some() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+    Ok(())
+}
+
+async fn cmd_analytics_summary(days: u32, count: u32, raw_json: bool) -> Result<(), String> {
+    validate_analytics_days(days)?;
+    let (client, _path) = load_session_client()?;
+    let posts = fetch_analytics_posts(&client, days, 0, count)
+        .await
+        .unwrap_or_default();
+    let totals = AnalyticsPostStat::sum(&posts);
+    let viewers = client.get_profile_viewers_for_period(days, true).await.ok();
+    let top_posts = {
+        let mut ranked = posts.clone();
+        sort_and_rank_posts_by_impressions(&mut ranked);
+        ranked.into_iter().take(5).collect::<Vec<_>>()
+    };
+    if raw_json {
+        let out = serde_json::json!({
+            "days": days,
+            "postCount": posts.len(),
+            "totals": totals.to_json(),
+            "topPosts": top_posts.iter().map(AnalyticsPostStat::to_json).collect::<Vec<_>>(),
+            "profileViewers": viewers,
+            "interpretation": {
+                "bestPostBasis": "ranked by impressions, then inspect engagement rate/comments qualitatively",
+                "profileImpactBasis": "profile viewer cards plus search/profile dashboard data when LinkedIn exposes them"
+            }
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?
+        );
+        return Ok(());
+    }
+    println!("LinkedIn analytics summary: last {} days", days);
+    println!("---");
+    println!("Posts inspected: {}", posts.len());
+    println!("Impressions: {}", totals.impressions);
+    println!(
+        "Engagements: {} reactions, {} comments, {} shares, {} saves",
+        totals.reactions, totals.comments, totals.shares, totals.saves
+    );
+    println!(
+        "Aggregate engagement rate: {:.2}%",
+        totals.engagement_rate() * 100.0
+    );
+    println!();
+    println!("Best-performing posts by impressions:");
+    for p in &top_posts {
+        println!(
+            "[{}] {} impressions | {:.2}% engagement",
+            p.rank,
+            p.impressions,
+            p.engagement_rate() * 100.0
+        );
+        if !p.preview.is_empty() {
+            println!("    {}", truncate_with_ellipsis(&p.preview, 110));
+        }
+    }
+    Ok(())
+}
+
 /// Handle `notifications list [--count N] [--start N] [--json]`.
 ///
 /// Loads the session, calls the Voyager GraphQL notifications endpoint
@@ -3472,6 +4099,129 @@ mod tests {
             }
             _ => panic!("expected feed comments command"),
         }
+    }
+
+    #[test]
+    fn analytics_summary_parses_period_count_and_json() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "analytics",
+            "summary",
+            "--days",
+            "14",
+            "--count",
+            "25",
+            "--json",
+        ])
+        .expect("analytics summary should parse");
+
+        match cli.command {
+            Commands::Analytics {
+                action: AnalyticsAction::Summary { days, count, json },
+            } => {
+                assert_eq!(days, 14);
+                assert_eq!(count, 25);
+                assert!(json);
+            }
+            _ => panic!("expected analytics summary command"),
+        }
+    }
+
+    #[test]
+    fn analytics_post_parses_from_list_and_reactor_flag() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "analytics",
+            "post",
+            "--from-list",
+            "2",
+            "--days",
+            "7",
+            "--include-reactors",
+            "--json",
+        ])
+        .expect("analytics post should parse");
+
+        match cli.command {
+            Commands::Analytics {
+                action:
+                    AnalyticsAction::Post {
+                        from_list,
+                        days,
+                        include_reactors,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(from_list, Some(2));
+                assert_eq!(days, 7);
+                assert!(include_reactors);
+                assert!(json);
+            }
+            _ => panic!("expected analytics post command"),
+        }
+    }
+
+    #[test]
+    fn analytics_profile_viewers_parses_interesting_viewers() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "analytics",
+            "profile-viewers",
+            "--days",
+            "28",
+            "--interesting-viewers",
+            "--json",
+        ])
+        .expect("analytics profile-viewers should parse");
+
+        match cli.command {
+            Commands::Analytics {
+                action:
+                    AnalyticsAction::ProfileViewers {
+                        days,
+                        interesting_viewers,
+                        json,
+                    },
+            } => {
+                assert_eq!(days, 28);
+                assert!(interesting_viewers);
+                assert!(json);
+            }
+            _ => panic!("expected analytics profile-viewers command"),
+        }
+    }
+
+    #[test]
+    fn analytics_days_validation_accepts_common_windows() {
+        for days in [7, 14, 28, 30, 60, 90, 365] {
+            assert_eq!(validate_analytics_days(days).unwrap(), days);
+        }
+        assert!(validate_analytics_days(13).is_err());
+    }
+
+    #[test]
+    fn analytics_post_metrics_extracts_impressions_saves_and_engagement_rate() {
+        let item = serde_json::json!({
+            "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:1,SHARES,DEFAULT,DEFAULT,false)",
+            "value": {"com.linkedin.voyager.feed.render.UpdateV2": {
+                "commentary": {"text": {"text": "Payments post"}},
+                "socialDetail": {"totalSocialActivityCounts": {
+                    "numViews": 100,
+                    "numLikes": 10,
+                    "numComments": 5,
+                    "numShares": 2,
+                    "numSaves": 3
+                }}
+            }}
+        });
+        let stat = AnalyticsPostStat::from_update(&item, 1);
+        assert_eq!(stat.impressions, 100);
+        assert_eq!(stat.reactions, 10);
+        assert_eq!(stat.comments, 5);
+        assert_eq!(stat.shares, 2);
+        assert_eq!(stat.saves, 3);
+        assert!((stat.engagement_rate() - 0.20).abs() < 0.0001);
     }
 
     #[test]

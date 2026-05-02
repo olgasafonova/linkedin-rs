@@ -6,7 +6,7 @@ This project is for personal and educational use only.
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 22 subcommands across 7 domains:
+The CLI (`linkedin-cli`) exposes core subcommands across 8 domains:
 
 | Command | Description |
 |---------|-------------|
@@ -17,6 +17,11 @@ The CLI (`linkedin-cli`) exposes 22 subcommands across 7 domains:
 | `profile view <id>` | View a profile by public identifier (vanity URL slug) |
 | `profile visit <id>` | Visit a profile (registers in "who viewed my profile") |
 | `profile viewers` | Show who viewed your profile |
+| `analytics summary` | Aggregate content + profile impact over a period |
+| `analytics content` | Rank your posts by impressions with reactions, comments, shares, and saves |
+| `analytics post <urn>` | Show per-post analytics and optional reactor details |
+| `analytics audience` | Show profile viewer, search appearance, and profile dashboard signals |
+| `analytics profile-viewers` | Show period-labelled profile viewer cards |
 | `feed list` | List feed updates (paginated) |
 | `feed react <urn>` | React to a post (LIKE, PRAISE, EMPATHY, etc.) |
 | `feed unreact <urn>` | Remove a reaction from a post |
@@ -33,7 +38,7 @@ The CLI (`linkedin-cli`) exposes 22 subcommands across 7 domains:
 | `messages send <recipient> <text>` | Send a message to a connection |
 | `notifications list` | List notification cards (paginated) |
 
-List commands support `--count`, `--start` where applicable, and `--json` for raw JSON output. Messaging pagination uses LinkedIn's opaque `metadata.nextCursor` token via `--cursor`; `--before` is deprecated for messages because the current GraphQL endpoint ignores timestamp cursors. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
+List commands support `--count`, `--start` where applicable, and `--json` for raw JSON output. Messaging pagination uses LinkedIn's opaque `metadata.nextCursor` token via `--cursor`; `--before` is deprecated for messages because the current GraphQL endpoint ignores timestamp cursors. Analytics commands support `--days` windows of `7`, `14`, `28`, `30`, `60`, `90`, and `365` days. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
 
 ## Installation
 
@@ -119,6 +124,26 @@ linkedin-cli profile visit john-doe-123
 # Who viewed your profile
 linkedin-cli profile viewers
 ```
+
+### Analytics
+
+```bash
+# Aggregate profile + content impact over a period
+linkedin-cli analytics summary --days 14 --count 20 --json
+
+# Rank your own posts by impressions and engagement
+linkedin-cli analytics content --days 14 --count 20 --json
+
+# Inspect one post, optionally using an item from the latest own-post listing
+linkedin-cli analytics post urn:li:activity:7312345678901234567 --days 7 --include-reactors --json
+linkedin-cli analytics post --from-list 1 --days 7 --json
+
+# Profile/audience signals
+linkedin-cli analytics audience --days 28 --interesting-viewers --json
+linkedin-cli analytics profile-viewers --days 7 --interesting-viewers --json
+```
+
+`analytics content` uses your own member-share feed and extracts `socialDetail.totalSocialActivityCounts` where LinkedIn exposes views, reactions, comments, shares/reposts, and saves. Engagement rate is computed as `(reactions + comments + shares + saves) / impressions`.
 
 ### Feed
 
