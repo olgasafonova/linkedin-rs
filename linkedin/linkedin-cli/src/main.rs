@@ -314,7 +314,11 @@ enum MessagesAction {
         #[arg(long, default_value = "10")]
         count: u32,
 
-        /// Cursor for pagination: epoch-millis timestamp to fetch conversations created before
+        /// Opaque nextCursor token from response metadata (preferred pagination)
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// Deprecated: ignored by LinkedIn's current GraphQL inbox endpoint
         #[arg(long)]
         before: Option<u64>,
 
@@ -331,7 +335,11 @@ enum MessagesAction {
         /// Conversation ID (thread ID portion of URN, e.g. 2-abc123)
         conversation_id: String,
 
-        /// Cursor for pagination: epoch-millis timestamp to fetch messages created before
+        /// Opaque nextCursor token from response metadata (preferred pagination)
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// Deprecated: ignored by LinkedIn's current GraphQL message endpoint
         #[arg(long)]
         before: Option<u64>,
 
@@ -407,21 +415,27 @@ async fn main() {
         Commands::Messages { action } => match action {
             MessagesAction::List {
                 count,
+                cursor,
                 before,
                 category,
                 json,
             } => {
-                if let Err(e) = cmd_messages_list(count, before, &category, json).await {
+                if let Err(e) =
+                    cmd_messages_list(count, cursor.as_deref(), before, &category, json).await
+                {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
             }
             MessagesAction::Read {
                 conversation_id,
+                cursor,
                 before,
                 json,
             } => {
-                if let Err(e) = cmd_messages_read(&conversation_id, before, json).await {
+                if let Err(e) =
+                    cmd_messages_read(&conversation_id, cursor.as_deref(), before, json).await
+                {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1444,6 +1458,7 @@ async fn cmd_feed_post(
 /// pagination params, and prints the results.
 async fn cmd_messages_list(
     count: u32,
+    cursor: Option<&str>,
     created_before: Option<u64>,
     category: &str,
     raw_json: bool,
@@ -1451,8 +1466,12 @@ async fn cmd_messages_list(
     let (client, _path) = load_session_client()?;
     let category = category.parse::<ConversationCategory>()?;
 
+    if created_before.is_some() {
+        eprintln!("warning: --before is ignored by LinkedIn's current inbox GraphQL endpoint; use --cursor from metadata.nextCursor instead");
+    }
+
     let value = client
-        .get_conversations_by_category(count, created_before, category)
+        .get_conversations_by_category_with_cursor(count, cursor, category)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
@@ -1494,13 +1513,18 @@ async fn cmd_messages_list(
 /// with cursor-based pagination, and prints the messages.
 async fn cmd_messages_read(
     conversation_id: &str,
+    cursor: Option<&str>,
     created_before: Option<u64>,
     raw_json: bool,
 ) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
+    if created_before.is_some() {
+        eprintln!("warning: --before is ignored by LinkedIn's current message GraphQL endpoint; use --cursor from metadata.nextCursor instead");
+    }
+
     let value = client
-        .get_conversation_events(conversation_id, created_before)
+        .get_conversation_events_with_cursor(conversation_id, cursor)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 

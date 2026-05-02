@@ -693,11 +693,39 @@ impl LinkedInClient {
         .await
     }
 
+    /// Fetch messaging conversations from the primary inbox using LinkedIn's
+    /// opaque `metadata.nextCursor` token for pagination.
+    pub async fn get_conversations_with_cursor(
+        &self,
+        count: u32,
+        next_cursor: Option<&str>,
+    ) -> Result<Value, Error> {
+        self.get_conversations_by_category_with_cursor(
+            count,
+            next_cursor,
+            ConversationCategory::PrimaryInbox,
+        )
+        .await
+    }
+
     /// Fetch messaging conversations from a specific inbox category.
     pub async fn get_conversations_by_category(
         &self,
         count: u32,
         created_before: Option<u64>,
+        category: ConversationCategory,
+    ) -> Result<Value, Error> {
+        let _ = created_before;
+        self.get_conversations_by_category_with_cursor(count, None, category)
+            .await
+    }
+
+    /// Fetch messaging conversations from a specific inbox category using the
+    /// opaque `metadata.nextCursor` token returned by LinkedIn.
+    pub async fn get_conversations_by_category_with_cursor(
+        &self,
+        count: u32,
+        next_cursor: Option<&str>,
         category: ConversationCategory,
     ) -> Result<Value, Error> {
         // The REST endpoint messaging/conversations returns HTTP 500
@@ -712,12 +740,12 @@ impl LinkedInClient {
         //   category: PRIMARY_INBOX or SPAM
         //   count: number of conversations
         // Optional:
-        //   lastActivityBefore: epoch-millis cursor for pagination
+        //   nextCursor: opaque cursor from response metadata
 
         // Get the user's fsd_profile URN (cached after first /me call).
         let mailbox_urn = self.my_profile_urn().await?;
 
-        let vars = build_conversations_graphql_vars(mailbox_urn, category, count, created_before);
+        let vars = build_conversations_graphql_vars(mailbox_urn, category, count, next_cursor);
         let params = graphql_params(
             &vars,
             "voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6",
@@ -1332,6 +1360,18 @@ impl LinkedInClient {
         conversation_urn: &str,
         created_before: Option<u64>,
     ) -> Result<Value, Error> {
+        let _ = created_before;
+        self.get_conversation_events_with_cursor(conversation_urn, None)
+            .await
+    }
+
+    /// Fetch events (messages) within a specific conversation using the opaque
+    /// `metadata.nextCursor` token returned by LinkedIn.
+    pub async fn get_conversation_events_with_cursor(
+        &self,
+        conversation_urn: &str,
+        next_cursor: Option<&str>,
+    ) -> Result<Value, Error> {
         // The GraphQL query expects a `msg_conversation` URN format:
         //   urn:li:msg_conversation:(urn:li:fsd_profile:XXXX,<thread_id>)
         // If a plain thread ID or messagingThread URN is provided,
@@ -1355,11 +1395,7 @@ impl LinkedInClient {
         // Use the Messenger GraphQL query `messengerMessagesByConversation`
         // from MessengerGraphQLClient.java.
         // queryId: voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a
-        let variables = if let Some(ts) = created_before {
-            format!("(conversationUrn:{},deliveredBefore:{})", encoded_urn, ts)
-        } else {
-            format!("(conversationUrn:{})", encoded_urn)
-        };
+        let variables = build_conversation_events_graphql_vars(&encoded_urn, next_cursor);
         let params = graphql_params(
             &variables,
             "voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a",
@@ -1631,16 +1667,16 @@ fn build_conversations_graphql_vars(
     mailbox_urn: &str,
     category: ConversationCategory,
     count: u32,
-    created_before: Option<u64>,
+    next_cursor: Option<&str>,
 ) -> String {
     let encoded_urn = restli_encode_string(mailbox_urn);
-    if let Some(ts) = created_before {
+    if let Some(cursor) = next_cursor.filter(|c| !c.is_empty()) {
         format!(
-            "(mailboxUrn:{},category:{},count:{},lastActivityBefore:{})",
+            "(mailboxUrn:{},category:{},count:{},nextCursor:{})",
             encoded_urn,
             category.as_str(),
             count,
-            ts
+            restli_encode_string(cursor)
         )
     } else {
         format!(
@@ -1649,6 +1685,21 @@ fn build_conversations_graphql_vars(
             category.as_str(),
             count
         )
+    }
+}
+
+fn build_conversation_events_graphql_vars(
+    encoded_conversation_urn: &str,
+    next_cursor: Option<&str>,
+) -> String {
+    if let Some(cursor) = next_cursor.filter(|c| !c.is_empty()) {
+        format!(
+            "(conversationUrn:{},nextCursor:{})",
+            encoded_conversation_urn,
+            restli_encode_string(cursor)
+        )
+    } else {
+        format!("(conversationUrn:{})", encoded_conversation_urn)
     }
 }
 
@@ -1954,17 +2005,42 @@ mod tests {
     }
 
     #[test]
-    fn conversation_variables_include_requested_category_and_cursor() {
+    fn conversation_variables_include_requested_category_without_cursor() {
         let vars = build_conversations_graphql_vars(
             "urn:li:fsd_profile:abc123",
             ConversationCategory::Spam,
             25,
-            Some(1714280000000),
+            None,
+        );
+        assert_eq!(
+            vars,
+            "(mailboxUrn:urn%3Ali%3Afsd_profile%3Aabc123,category:SPAM,count:25)"
+        );
+    }
+
+    #[test]
+    fn conversation_variables_include_linkedin_next_cursor() {
+        let vars = build_conversations_graphql_vars(
+            "urn:li:fsd_profile:abc123",
+            ConversationCategory::PrimaryInbox,
+            5,
+            Some("DESCENDING&1776357191118&2-MTll...=="),
         );
         assert!(vars.contains("mailboxUrn:urn%3Ali%3Afsd_profile%3Aabc123"));
-        assert!(vars.contains("category:SPAM"));
-        assert!(vars.contains("count:25"));
-        assert!(vars.contains("lastActivityBefore:1714280000000"));
+        assert!(vars.contains("category:PRIMARY_INBOX"));
+        assert!(vars.contains("count:5"));
+        assert!(vars.contains("nextCursor:DESCENDING%261776357191118%262-MTll...%3D%3D"));
+        assert!(!vars.contains("lastActivityBefore"));
+    }
+
+    #[test]
+    fn message_variables_include_linkedin_next_cursor() {
+        let vars = build_conversation_events_graphql_vars(
+            "urn%3Ali%3Amsg_conversation%3A%28urn%3Ali%3Afsd_profile%3Aabc%2C2-thread%29",
+            Some("ASCENDING&1774929897240&2-MTc3...=="),
+        );
+        assert!(vars.starts_with("(conversationUrn:urn%3Ali%3Amsg_conversation"));
+        assert!(vars.contains("nextCursor:ASCENDING%261774929897240%262-MTc3...%3D%3D"));
     }
 
     #[test]

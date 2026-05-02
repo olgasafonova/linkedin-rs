@@ -33,7 +33,7 @@ The CLI (`linkedin-cli`) exposes 22 subcommands across 7 domains:
 | `messages send <recipient> <text>` | Send a message to a connection |
 | `notifications list` | List notification cards (paginated) |
 
-All list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
+List commands support `--count`, `--start` where applicable, and `--json` for raw JSON output. Messaging pagination uses LinkedIn's opaque `metadata.nextCursor` token via `--cursor`; `--before` is deprecated for messages because the current GraphQL endpoint ignores timestamp cursors. Write commands (`comment`, `post`) require `--yes` to skip the confirmation prompt.
 
 ## Installation
 
@@ -147,13 +147,19 @@ linkedin-cli feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
 
 ```bash
 # List conversations
-linkedin-cli messages list --count 20
+linkedin-cli messages list --count 20 --json
+
+# Fetch the next inbox page with metadata.nextCursor from the previous JSON response
+linkedin-cli messages list --count 20 --cursor 'DESCENDING&...' --json
 
 # List verified spam conversations
 linkedin-cli messages list --category spam --count 20 --json
 
 # Read a conversation
-linkedin-cli messages read 2-abc123
+linkedin-cli messages read 2-abc123 --json
+
+# Fetch the next message page with metadata.nextCursor from the previous JSON response
+linkedin-cli messages read 2-abc123 --cursor 'ASCENDING&...' --json
 
 # Send a message
 linkedin-cli messages send john-doe-123 "Hey, wanted to connect about..."
@@ -253,7 +259,7 @@ Every request includes a set of headers that mimic the Android app: `User-Agent`
 
 - **Tokens and credentials** are stored in `secrets/` which is gitignored. Never commit cookies, session files, or captured API responses.
 - **PII scan** before any push to remote. Captured responses often contain names, emails, profile URLs, and other personal data.
-- **Session files** at `~/.config/linkedin-cli/session.json` contain your `li_at` cookie. Protect this file as you would a password.
+- **Session files** at `~/.local/share/linkedin/session.json` contain your `li_at` cookie. Protect this file as you would a password.
 - **Never commit** APK files, decompiled output, or raw API responses.
 
 ## Project Structure
