@@ -1279,24 +1279,23 @@ impl LinkedInClient {
             format!("urn:li:activity:{}", post_urn)
         };
 
-        // Build the mutation variables matching the NormComment model.
-        // The `entity` field contains the comment data for the CREATE mutation,
-        // structured as a NormCommentForCreate record:
-        // - commentary: TextViewModel with the comment text
-        // - threadUrn: the post being commented on
-        // - origin: FEED (standard origin for feed comments)
-        //
-        // queryId: voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e
-        // from ConversationsGraphQLClient.java static initializer.
-        let variables = serde_json::json!({
-            "entity": {
-                "commentary": {
-                    "text": text
-                },
-                "threadUrn": thread,
-                "origin": "FEED"
-            }
-        });
+        let variables = build_create_comment_graphql_body(&thread, text);
+
+        self.graphql_post(
+            &variables,
+            "voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e",
+            "CreateSocialDashNormComments",
+        )
+        .await
+    }
+
+    /// Reply to a feed comment by creating a nested comment under the parent comment URN.
+    ///
+    /// This uses the same `CreateSocialDashNormComments` mutation as top-level
+    /// comments, but sets `entity.threadUrn` to the parent comment URN.
+    /// This creates a **real public LinkedIn comment reply**.
+    pub async fn reply_to_comment(&self, comment_urn: &str, text: &str) -> Result<Value, Error> {
+        let variables = build_create_comment_graphql_body(comment_urn, text);
 
         self.graphql_post(
             &variables,
@@ -1700,11 +1699,17 @@ fn unwrap_graphql(raw: &Value, data_key: &str) -> Result<Value, Error> {
         })
 }
 
-/// Check a GraphQL JSON response for a top-level `errors` array and return
+/// Check a GraphQL JSON response for an `errors` array and return
 /// an error if any are present. GraphQL can return HTTP 200 with logical
-/// errors in the response body.
+/// errors in the response body. Mutations may wrap errors under `value.errors`.
 fn check_graphql_errors(json: &Value) -> Result<(), Error> {
-    if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
+    let errors = json.get("errors").and_then(|e| e.as_array()).or_else(|| {
+        json.get("value")
+            .and_then(|v| v.get("errors"))
+            .and_then(|e| e.as_array())
+    });
+
+    if let Some(errors) = errors {
         if !errors.is_empty() {
             let messages: Vec<&str> = errors
                 .iter()
@@ -1810,6 +1815,18 @@ fn build_single_comment_graphql_vars(comment_urn: &str, update_thread_urn: &str)
         restli_encode_string(comment_urn),
         restli_encode_string(update_thread_urn)
     )
+}
+
+fn build_create_comment_graphql_body(thread_urn: &str, text: &str) -> Value {
+    serde_json::json!({
+        "entity": {
+            "commentary": {
+                "text": text
+            },
+            "threadUrn": thread_urn,
+            "origin": "FEED"
+        }
+    })
 }
 
 /// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
@@ -2181,6 +2198,37 @@ mod tests {
         ));
         assert!(vars.contains("count:5"));
         assert!(vars.contains("cursor:reply-cursor%3D%3D"));
+    }
+
+    #[test]
+    fn create_comment_body_can_target_parent_comment_urn_for_nested_reply() {
+        let body = build_create_comment_graphql_body(
+            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)",
+            "nested reply text",
+        );
+
+        assert_eq!(body["entity"]["commentary"]["text"], "nested reply text");
+        assert_eq!(
+            body["entity"]["threadUrn"],
+            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)"
+        );
+        assert_eq!(body["entity"]["origin"], "FEED");
+    }
+
+    #[test]
+    fn graphql_error_check_detects_action_response_errors() {
+        let response = serde_json::json!({
+            "$metadata": { "isGraphQLActionResponse": true },
+            "value": {
+                "data": { "createSocialDashNormComments": null },
+                "errors": [
+                    { "message": "Couldn't comment on this post. Please try again." }
+                ]
+            }
+        });
+
+        let err = check_graphql_errors(&response).unwrap_err();
+        assert!(err.to_string().contains("Couldn't comment on this post"));
     }
 
     #[test]

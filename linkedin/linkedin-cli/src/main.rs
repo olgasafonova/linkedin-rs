@@ -204,6 +204,25 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// Reply under a parent feed comment
+    ///
+    /// WARNING: This creates a REAL COMMENT REPLY on LinkedIn.
+    /// Use --yes to skip the confirmation prompt.
+    Reply {
+        /// Parent comment URN (e.g. urn:li:fsd_comment:(...,urn:li:activity:...))
+        comment_urn: String,
+
+        /// The reply text
+        text: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new text post on your LinkedIn feed
     ///
     /// WARNING: This creates a REAL PUBLIC post on your LinkedIn account.
@@ -626,6 +645,17 @@ async fn main() {
                 json,
             } => {
                 if let Err(e) = cmd_feed_comment(&post_urn, &text, yes, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Reply {
+                comment_urn,
+                text,
+                yes,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_reply(&comment_urn, &text, yes, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1674,6 +1704,37 @@ async fn cmd_feed_comment(
         println!("{}", pretty);
     } else {
         println!("Commented on {}", post_urn);
+    }
+
+    Ok(())
+}
+
+/// Handle `feed reply <comment_urn> <text> [--yes] [--json]`.
+///
+/// Creates a nested reply under a parent feed comment. Requires `--yes`
+/// because this creates a REAL COMMENT REPLY on LinkedIn.
+async fn cmd_feed_reply(
+    comment_urn: &str,
+    text: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    require_confirmation(confirmed, "create a REAL COMMENT REPLY on LinkedIn")?;
+
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Replying to {}...", comment_urn);
+    let result = client
+        .reply_to_comment(comment_urn, text)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        println!("Replied to {}", comment_urn);
     }
 
     Ok(())
@@ -2817,6 +2878,38 @@ mod tests {
         assert!(err.contains("send a LinkedIn message"));
 
         assert!(require_confirmation(true, "send a LinkedIn message").is_ok());
+    }
+
+    #[test]
+    fn feed_reply_parses_confirmation_flag_and_parent_comment_urn() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "reply",
+            "urn:li:fsd_comment:(7456166291515662336,urn:li:activity:7456131258478276609)",
+            "nested reply text",
+            "--yes",
+            "--json",
+        ])
+        .expect("feed reply --yes should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action:
+                    FeedAction::Reply {
+                        comment_urn,
+                        text,
+                        yes,
+                        json,
+                    },
+            } => {
+                assert!(comment_urn.starts_with("urn:li:fsd_comment:"));
+                assert_eq!(text, "nested reply text");
+                assert!(yes);
+                assert!(json);
+            }
+            _ => panic!("expected feed reply command"),
+        }
     }
 
     #[test]

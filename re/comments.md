@@ -110,9 +110,12 @@ For a text-only comment, only these fields are needed:
   (PascalCase of the hashMap key `createSocialDashNormComments`).
 - Media attachments on comments use the `mediaUnion` field with either an
   `article` or `vectorUrn` variant.
-- Replying to a comment (nested reply) likely uses the comment's URN as
-  `threadUrn` instead of the post URN, but this is not yet confirmed.
+- Replying to a comment (nested reply) uses the same mutation with the parent
+  comment URN as `entity.threadUrn` instead of the post URN. The CLI exposes
+  this as `linkedin-cli feed reply '<comment_urn>' '<text>' --yes --json`.
 - The `origin` field is optional but the Android app always sends it.
+- GraphQL mutation errors can be returned as HTTP 200 with `value.errors`; the
+  client treats those as API errors so failed comments/replies exit non-zero.
 
 ## Fetch Comments
 
