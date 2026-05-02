@@ -114,14 +114,63 @@ For a text-only comment, only these fields are needed:
   `threadUrn` instead of the post URN, but this is not yet confirmed.
 - The `origin` field is optional but the Android app always sends it.
 
-## Fetch Comments (for reference)
+## Fetch Comments
 
 Comments on a post are fetched via the FINDER query `socialDashCommentsBySocialDetail`:
 
 ```
-GET /voyager/api/graphql?variables=(socialDetailUrn:...,count:10,start:0)&queryId=voyagerSocialDashComments.59bca422f480a4cc0ce56ccd81181488
+GET /voyager/api/graphql?variables=(socialDetailUrn:...,count:10,start:0,sortOrder:RELEVANCE)&queryId=voyagerSocialDashComments.59bca422f480a4cc0ce56ccd81181488&queryName=SocialDashCommentsBySocialDetail
 ```
 
 The `socialDetailUrn` is NOT the activity URN -- it's the `urn:li:fsd_socialDetail:...`
-URN found in the feed response's social metadata. This is a different URN format
-that maps 1:1 to an activity but uses a different namespace.
+URN found in the feed response's `socialDetail.dashEntityUrn`. This is a different
+URN format that maps 1:1 to an activity but uses a different namespace.
+
+CLI:
+
+```bash
+linkedin-cli feed comments 'urn:li:fsd_socialDetail:(...)' --count 20 --json
+```
+
+Live-validated on 2026-05-02 through Proton SG proxy: returned `elements`, `metadata`,
+and `paging` for a group post social detail URN.
+
+## Fetch Replies
+
+Replies use the FINDER query `socialDashCommentsByRepliesByCursor`:
+
+```
+GET /voyager/api/graphql?variables=(commentUrn:...,count:10,cursor:...)&queryId=voyagerSocialDashComments.8ada653d14b465e4f86d3ed7dcbe6695&queryName=SocialDashCommentsByRepliesByCursor
+```
+
+This endpoint requires a non-null `cursor` variable. Calling it without a cursor returns:
+
+```text
+Variable 'cursor' has coerced Null value for NonNull type 'String!'
+```
+
+CLI:
+
+```bash
+linkedin-cli feed replies 'urn:li:fsd_comment:(...)' --cursor '<replyCursor>' --count 20 --json
+```
+
+## Fetch Single Comment
+
+Single-comment fetch uses `socialDashCommentsBySingleComment`:
+
+```
+GET /voyager/api/graphql?variables=(commentUrn:...,updateThreadUrn:...)&queryId=voyagerSocialDashComments.a84e91d6baaa2d2018fdc49f21541de5&queryName=SocialDashCommentsBySingleComment
+```
+
+The `updateThreadUrn` variable is required; calling without it returns:
+
+```text
+Variable 'updateThreadUrn' has coerced Null value for NonNull type 'String!'
+```
+
+CLI:
+
+```bash
+linkedin-cli feed comment-get 'urn:li:fsd_comment:(...)' --thread-urn 'urn:li:activity:...' --json
+```

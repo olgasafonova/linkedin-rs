@@ -90,6 +90,61 @@ enum FeedAction {
         #[arg(long)]
         json: bool,
     },
+    /// List top-level comments for a feed post social detail URN
+    ///
+    /// This is read-only. The URN must be the post's `urn:li:fsd_socialDetail:...`,
+    /// not the activity URN. Extract it from `feed list --json`.
+    Comments {
+        /// Social detail URN from feed JSON (urn:li:fsd_socialDetail:...)
+        social_detail_urn: String,
+
+        /// Number of comments to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Pagination offset (default: 0)
+        #[arg(long, default_value = "0")]
+        start: u32,
+
+        /// Opaque cursor from response metadata/paging, if returned
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// List replies under a parent comment URN
+    Replies {
+        /// Parent comment URN
+        comment_urn: String,
+
+        /// Number of replies to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Opaque cursor from response metadata/paging, if returned
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a single comment by URN
+    #[command(name = "comment-get")]
+    CommentGet {
+        /// Comment URN
+        comment_urn: String,
+
+        /// Parent update/thread URN containing the comment
+        #[arg(long = "thread-urn")]
+        update_thread_urn: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
     /// React to a post (like, celebrate, etc.)
     ///
     /// WARNING: This creates a REAL reaction on a LinkedIn post.
@@ -501,6 +556,43 @@ async fn main() {
         Commands::Feed { action } => match action {
             FeedAction::List { count, start, json } => {
                 if let Err(e) = cmd_feed_list(start, count, json).await {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Comments {
+                social_detail_urn,
+                count,
+                start,
+                cursor,
+                json,
+            } => {
+                if let Err(e) =
+                    cmd_feed_comments(&social_detail_urn, count, start, cursor.as_deref(), json)
+                        .await
+                {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::Replies {
+                comment_urn,
+                count,
+                cursor,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_replies(&comment_urn, count, cursor.as_deref(), json).await
+                {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+            FeedAction::CommentGet {
+                comment_urn,
+                update_thread_urn,
+                json,
+            } => {
+                if let Err(e) = cmd_feed_comment_get(&comment_urn, &update_thread_urn, json).await {
                     eprintln!("error: {e}");
                     process::exit(1);
                 }
@@ -1356,6 +1448,141 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
         println!("    {}", commentary_display);
     }
     println!("    likes: {}  comments: {}", likes, comments);
+}
+
+async fn cmd_feed_comments(
+    social_detail_urn: &str,
+    count: u32,
+    start: u32,
+    cursor: Option<&str>,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+    let value = client
+        .get_comments_by_social_detail(social_detail_urn, count, start, cursor)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        print_comment_collection("Comments", &value);
+    }
+
+    Ok(())
+}
+
+async fn cmd_feed_replies(
+    comment_urn: &str,
+    count: u32,
+    cursor: Option<&str>,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+    let value = client
+        .get_comment_replies(comment_urn, count, cursor)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        print_comment_collection("Replies", &value);
+    }
+
+    Ok(())
+}
+
+async fn cmd_feed_comment_get(
+    comment_urn: &str,
+    update_thread_urn: &str,
+    raw_json: bool,
+) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+    let value = client
+        .get_single_comment(comment_urn, update_thread_urn)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        let pretty =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        println!("{}", pretty);
+    } else {
+        print_comment_item(1, &value);
+    }
+
+    Ok(())
+}
+
+fn print_comment_collection(label: &str, value: &serde_json::Value) {
+    let elements = value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    println!("{} (showing {})", label, elements.len());
+    for (idx, item) in elements.iter().enumerate() {
+        print_comment_item(idx + 1, item);
+    }
+
+    if let Some(cursor) = value
+        .get("metadata")
+        .and_then(|m| m.get("nextCursor"))
+        .and_then(|c| c.as_str())
+    {
+        println!("nextCursor: {}", cursor);
+    }
+}
+
+fn print_comment_item(index: usize, item: &serde_json::Value) {
+    let urn = item
+        .get("entityUrn")
+        .or_else(|| item.get("commentUrn"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let actor = extract_comment_actor_name(item).unwrap_or("(unknown author)");
+    let text = extract_comment_text(item).unwrap_or("");
+
+    println!("[{}] {} {}", index, actor, urn);
+    if !text.is_empty() {
+        println!("    {}", truncate_with_ellipsis(text, 220));
+    }
+}
+
+fn extract_comment_text(item: &serde_json::Value) -> Option<&str> {
+    item.get("commentary")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| {
+            if t.is_string() {
+                t.as_str()
+            } else {
+                t.get("text").and_then(|v| v.as_str())
+            }
+        })
+        .or_else(|| item.get("text").and_then(|v| v.as_str()))
+}
+
+fn extract_comment_actor_name(item: &serde_json::Value) -> Option<&str> {
+    item.get("actor")
+        .and_then(|a| a.get("name"))
+        .and_then(|n| {
+            if n.is_string() {
+                n.as_str()
+            } else {
+                n.get("text").and_then(|v| v.as_str())
+            }
+        })
+        .or_else(|| {
+            item.get("actor")
+                .and_then(|a| a.get("title"))
+                .and_then(|t| t.get("text"))
+                .and_then(|v| v.as_str())
+        })
 }
 
 /// Handle `feed react <post_urn> [--type LIKE] [--json]`.
@@ -2602,6 +2829,41 @@ mod tests {
                 action: ProfileAction::Visit { yes, .. },
             } => assert!(yes),
             _ => panic!("expected profile visit command"),
+        }
+    }
+
+    #[test]
+    fn feed_comments_parse_read_only_context_command() {
+        let cli = Cli::try_parse_from([
+            "linkedin-cli",
+            "feed",
+            "comments",
+            "urn:li:fsd_socialDetail:(urn:li:activity:1,urn:li:fsd_profile:abc)",
+            "--count",
+            "5",
+            "--cursor",
+            "next&cursor",
+            "--json",
+        ])
+        .expect("feed comments should parse");
+
+        match cli.command {
+            Commands::Feed {
+                action:
+                    FeedAction::Comments {
+                        social_detail_urn,
+                        count,
+                        cursor,
+                        json,
+                        ..
+                    },
+            } => {
+                assert_eq!(count, 5);
+                assert!(social_detail_urn.starts_with("urn:li:fsd_socialDetail:"));
+                assert_eq!(cursor.as_deref(), Some("next&cursor"));
+                assert!(json);
+            }
+            _ => panic!("expected feed comments command"),
         }
     }
 }

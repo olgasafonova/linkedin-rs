@@ -508,6 +508,74 @@ impl LinkedInClient {
         self.get(&path).await
     }
 
+    /// Fetch top-level comments for a feed post's social detail URN.
+    ///
+    /// LinkedIn's Dash comments finder is keyed by `socialDetailUrn`, not the
+    /// activity/post URN. Use `feed list --json` and extract the post's
+    /// `socialDetail.entityUrn` / `socialDetailUrn` value before calling this.
+    pub async fn get_comments_by_social_detail(
+        &self,
+        social_detail_urn: &str,
+        count: u32,
+        start: u32,
+        next_cursor: Option<&str>,
+    ) -> Result<Value, Error> {
+        let vars = build_comments_by_social_detail_graphql_vars(
+            social_detail_urn,
+            count,
+            start,
+            next_cursor,
+        );
+        let params = graphql_params(
+            &vars,
+            "voyagerSocialDashComments.59bca422f480a4cc0ce56ccd81181488",
+            "SocialDashCommentsBySocialDetail",
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashCommentsBySocialDetail")
+    }
+
+    /// Fetch replies for a parent comment URN.
+    ///
+    /// LinkedIn's `ByRepliesByCursor` finder requires a non-null cursor. Use
+    /// the parent comment's embedded reply cursor from `feed comments --json`.
+    pub async fn get_comment_replies(
+        &self,
+        comment_urn: &str,
+        count: u32,
+        cursor: Option<&str>,
+    ) -> Result<Value, Error> {
+        let cursor = cursor.filter(|c| !c.is_empty()).ok_or_else(|| {
+            Error::InvalidInput(
+                "feed replies requires --cursor from the parent comment's reply cursor".to_string(),
+            )
+        })?;
+        let vars = build_comment_replies_graphql_vars(comment_urn, count, cursor);
+        let params = graphql_params(
+            &vars,
+            "voyagerSocialDashComments.8ada653d14b465e4f86d3ed7dcbe6695",
+            "SocialDashCommentsByRepliesByCursor",
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashCommentsByRepliesByCursor")
+    }
+
+    /// Fetch a single comment by comment URN and update/thread URN.
+    pub async fn get_single_comment(
+        &self,
+        comment_urn: &str,
+        update_thread_urn: &str,
+    ) -> Result<Value, Error> {
+        let vars = build_single_comment_graphql_vars(comment_urn, update_thread_urn);
+        let params = graphql_params(
+            &vars,
+            "voyagerSocialDashComments.a84e91d6baaa2d2018fdc49f21541de5",
+            "SocialDashCommentsBySingleComment",
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashCommentsBySingleComment")
+    }
+
     /// Fetch a user's full profile by public identifier (vanity URL slug).
     ///
     /// Uses the Voyager GraphQL endpoint with the `identityDashProfilesByMemberIdentity`
@@ -1703,6 +1771,47 @@ fn build_conversation_events_graphql_vars(
     }
 }
 
+fn build_comments_by_social_detail_graphql_vars(
+    social_detail_urn: &str,
+    count: u32,
+    start: u32,
+    next_cursor: Option<&str>,
+) -> String {
+    let encoded_urn = restli_encode_string(social_detail_urn);
+    if let Some(cursor) = next_cursor.filter(|c| !c.is_empty()) {
+        format!(
+            "(socialDetailUrn:{},count:{},start:{},sortOrder:RELEVANCE,nextCursor:{})",
+            encoded_urn,
+            count,
+            start,
+            restli_encode_string(cursor)
+        )
+    } else {
+        format!(
+            "(socialDetailUrn:{},count:{},start:{},sortOrder:RELEVANCE)",
+            encoded_urn, count, start
+        )
+    }
+}
+
+fn build_comment_replies_graphql_vars(comment_urn: &str, count: u32, cursor: &str) -> String {
+    let encoded_urn = restli_encode_string(comment_urn);
+    format!(
+        "(commentUrn:{},count:{},cursor:{})",
+        encoded_urn,
+        count,
+        restli_encode_string(cursor)
+    )
+}
+
+fn build_single_comment_graphql_vars(comment_urn: &str, update_thread_urn: &str) -> String {
+    format!(
+        "(commentUrn:{},updateThreadUrn:{})",
+        restli_encode_string(comment_urn),
+        restli_encode_string(update_thread_urn)
+    )
+}
+
 /// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
 /// parenthesized record variables within a URL query parameter.
 ///
@@ -2041,6 +2150,37 @@ mod tests {
         );
         assert!(vars.starts_with("(conversationUrn:urn%3Ali%3Amsg_conversation"));
         assert!(vars.contains("nextCursor:ASCENDING%261774929897240%262-MTc3...%3D%3D"));
+    }
+
+    #[test]
+    fn social_detail_comment_variables_encode_social_detail_urn_and_cursor() {
+        let vars = build_comments_by_social_detail_graphql_vars(
+            "urn:li:fsd_socialDetail:(urn:li:activity:7442172982820524035,urn:li:fsd_profile:abc)",
+            10,
+            0,
+            Some("comments-cursor&next"),
+        );
+
+        assert!(vars.contains("socialDetailUrn:urn%3Ali%3Afsd_socialDetail%3A%28urn%3Ali%3Aactivity%3A7442172982820524035%2Curn%3Ali%3Afsd_profile%3Aabc%29"));
+        assert!(vars.contains("count:10"));
+        assert!(vars.contains("start:0"));
+        assert!(vars.contains("sortOrder:RELEVANCE"));
+        assert!(vars.contains("nextCursor:comments-cursor%26next"));
+    }
+
+    #[test]
+    fn comment_reply_variables_encode_parent_comment_urn_and_cursor() {
+        let vars = build_comment_replies_graphql_vars(
+            "urn:li:comment:(activity:7442172982820524035,123456789)",
+            5,
+            "reply-cursor==",
+        );
+
+        assert!(vars.contains(
+            "commentUrn:urn%3Ali%3Acomment%3A%28activity%3A7442172982820524035%2C123456789%29"
+        ));
+        assert!(vars.contains("count:5"));
+        assert!(vars.contains("cursor:reply-cursor%3D%3D"));
     }
 
     #[test]
