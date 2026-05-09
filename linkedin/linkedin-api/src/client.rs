@@ -1033,34 +1033,9 @@ impl LinkedInClient {
         recipient_profile_urn: &str,
         message_body: &str,
     ) -> Result<Value, Error> {
-        let origin_token = uuid::Uuid::new_v4().to_string();
         let my_urn = self.my_profile_urn().await?;
-
-        // Captured from live browser traffic via Chrome DevTools MCP.
-        // Endpoint: POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
-        // Key discovery: trackingId must be 16 random bytes mapped to chars
-        // via `byte as char`. NOT base64-encoded — the messaging endpoint
-        // specifically requires raw byte-to-char mapping, unlike
-        // send_connection_request which uses base64.
-        // See re/send_message.md: "Without this field, or with a UUID/string
-        // value, the server returns {"status": 400} with no further details."
-        let tracking_bytes: [u8; 16] = rand::random();
-        let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
-
-        let payload = serde_json::json!({
-            "message": {
-                "body": {
-                    "attributes": [],
-                    "text": message_body
-                },
-                "originToken": origin_token,
-                "renderContentUnions": []
-            },
-            "mailboxUrn": my_urn,
-            "trackingId": tracking_id,
-            "dedupeByClientGeneratedToken": false,
-            "hostRecipientUrns": [recipient_profile_urn]
-        });
+        let recipients = vec![recipient_profile_urn.to_string()];
+        let payload = build_create_message_payload(my_urn, &recipients, message_body);
 
         self.post(
             "voyagerMessagingDashMessengerMessages?action=createMessage",
@@ -1100,15 +1075,10 @@ impl LinkedInClient {
         conversation_id: &str,
         message_body: &str,
     ) -> Result<Value, Error> {
-        // Fetch the conversation to get participant URNs.
         let conv_data = self.get_conversations(20, None).await?;
         let my_urn = self.my_profile_urn().await?;
+        let thread_id = strip_messaging_thread_prefix(conversation_id);
 
-        let thread_id = conversation_id
-            .strip_prefix("urn:li:messagingThread:")
-            .unwrap_or(conversation_id);
-
-        // Find this conversation in the list and extract participant URNs.
         let elements = conv_data
             .get("elements")
             .and_then(|e| e.as_array())
@@ -1117,48 +1087,16 @@ impl LinkedInClient {
                 body: "no conversations found".to_string(),
             })?;
 
-        let mut recipient_urns: Vec<String> = Vec::new();
-
-        for conv in elements {
-            let backend_urn = conv
-                .get("backendUrn")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
-            let conv_thread_id = backend_urn
-                .strip_prefix("urn:li:messagingThread:")
-                .unwrap_or(backend_urn);
-
-            if conv_thread_id == thread_id {
-                // Extract participant URNs.
-                if let Some(participants) = conv
-                    .get("conversationParticipants")
-                    .and_then(|p| p.as_array())
-                {
-                    for p in participants {
-                        // Each participant has participantType.member with entityUrn or hostIdentityUrn.
-                        let urn = p
-                            .get("hostIdentityUrn")
-                            .and_then(|u| u.as_str())
-                            .or_else(|| {
-                                p.get("participantType")
-                                    .and_then(|pt| pt.get("member"))
-                                    .and_then(|m| {
-                                        m.get("entityUrn")
-                                            .or_else(|| m.get("hostIdentityUrn"))
-                                            .and_then(|u| u.as_str())
-                                    })
-                            });
-                        if let Some(u) = urn {
-                            // Skip self.
-                            if u != my_urn {
-                                recipient_urns.push(u.to_string());
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-        }
+        let recipient_urns = elements
+            .iter()
+            .find(|conv| {
+                conv.get("backendUrn")
+                    .and_then(|u| u.as_str())
+                    .map(strip_messaging_thread_prefix)
+                    == Some(thread_id)
+            })
+            .map(|conv| extract_recipient_urns(conv, my_urn))
+            .unwrap_or_default();
 
         if recipient_urns.is_empty() {
             return Err(Error::Api {
@@ -1170,27 +1108,9 @@ impl LinkedInClient {
             });
         }
 
-        // Send using the same endpoint as send_message, with the extracted
-        // recipient URNs. LinkedIn routes to the existing thread.
-        let origin_token = uuid::Uuid::new_v4().to_string();
-        let tracking_bytes: [u8; 16] = rand::random();
-        let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
-
-        let payload = serde_json::json!({
-            "message": {
-                "body": {
-                    "attributes": [],
-                    "text": message_body
-                },
-                "originToken": origin_token,
-                "renderContentUnions": []
-            },
-            "mailboxUrn": my_urn,
-            "trackingId": tracking_id,
-            "dedupeByClientGeneratedToken": false,
-            "hostRecipientUrns": recipient_urns
-        });
-
+        // Same endpoint as send_message; LinkedIn routes to the existing thread
+        // when the recipient set matches.
+        let payload = build_create_message_payload(my_urn, &recipient_urns, message_body);
         self.post(
             "voyagerMessagingDashMessengerMessages?action=createMessage",
             &payload,
@@ -1744,10 +1664,7 @@ impl LinkedInClient {
         let full_urn = if conversation_urn.starts_with("urn:li:msg_conversation:") {
             conversation_urn.to_string()
         } else {
-            // Extract the thread ID.
-            let thread_id = conversation_urn
-                .strip_prefix("urn:li:messagingThread:")
-                .unwrap_or(conversation_urn);
+            let thread_id = strip_messaging_thread_prefix(conversation_urn);
 
             // Get the user's fsd_profile URN (cached after first /me call).
             let profile_urn = self.my_profile_urn().await?;
@@ -2144,6 +2061,78 @@ const VALID_REACTION_TYPES: &[&str] = &[
 
 /// Validate a reaction type string against the known enum values.
 ///
+/// Strip the `urn:li:messagingThread:` prefix if present, returning the bare
+/// thread id (e.g. `2-abc123`). Idempotent: bare ids pass through unchanged.
+fn strip_messaging_thread_prefix(urn: &str) -> &str {
+    urn.strip_prefix("urn:li:messagingThread:").unwrap_or(urn)
+}
+
+/// Build the JSON payload for the
+/// `voyagerMessagingDashMessengerMessages?action=createMessage` endpoint.
+///
+/// `recipient_urns` carries one URN for a new message and one or more URNs for
+/// a thread reply; LinkedIn routes to the existing thread when the set matches.
+///
+/// Captured from live browser traffic via Chrome DevTools MCP. Key discovery:
+/// `trackingId` must be 16 random bytes mapped via `byte as char`, NOT
+/// base64-encoded — unlike `send_connection_request`. Without this field, or
+/// with a UUID/string value, the server returns `{"status": 400}` with no
+/// further detail. See `re/send_message.md`.
+fn build_create_message_payload(
+    my_urn: &str,
+    recipient_urns: &[String],
+    message_body: &str,
+) -> Value {
+    let origin_token = uuid::Uuid::new_v4().to_string();
+    let tracking_bytes: [u8; 16] = rand::random();
+    let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
+
+    serde_json::json!({
+        "message": {
+            "body": {
+                "attributes": [],
+                "text": message_body
+            },
+            "originToken": origin_token,
+            "renderContentUnions": []
+        },
+        "mailboxUrn": my_urn,
+        "trackingId": tracking_id,
+        "dedupeByClientGeneratedToken": false,
+        "hostRecipientUrns": recipient_urns
+    })
+}
+
+/// Extract recipient URNs from a conversation, excluding `my_urn`.
+///
+/// Each participant carries the URN as `hostIdentityUrn` directly, or nested
+/// under `participantType.member.{entityUrn,hostIdentityUrn}`.
+fn extract_recipient_urns(conv: &Value, my_urn: &str) -> Vec<String> {
+    let Some(participants) = conv
+        .get("conversationParticipants")
+        .and_then(|p| p.as_array())
+    else {
+        return Vec::new();
+    };
+    participants
+        .iter()
+        .filter_map(participant_urn)
+        .filter(|u| *u != my_urn)
+        .map(str::to_string)
+        .collect()
+}
+
+fn participant_urn(p: &Value) -> Option<&str> {
+    if let Some(u) = p.get("hostIdentityUrn").and_then(|u| u.as_str()) {
+        return Some(u);
+    }
+    let member = p.get("participantType").and_then(|pt| pt.get("member"))?;
+    member
+        .get("entityUrn")
+        .or_else(|| member.get("hostIdentityUrn"))
+        .and_then(|u| u.as_str())
+}
+
 /// Returns the uppercased reaction type on success, or an `InvalidInput`
 /// error if the value is not recognized.
 fn validate_reaction_type(reaction_type: &str) -> Result<String, Error> {
