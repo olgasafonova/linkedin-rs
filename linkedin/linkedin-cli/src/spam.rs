@@ -55,60 +55,67 @@ pub fn looks_like_spam(text: &str) -> bool {
 
 /// Check if a conversation element looks like recruiter spam.
 ///
-/// Checks participant names/headlines and the last message body.
+/// Checks the title, participant names/headlines, and the last message body.
 pub fn is_spam_conversation(conv: &serde_json::Value) -> bool {
-    // Check title field.
-    if let Some(title) = conv.get("title").and_then(|v| v.as_str()) {
-        if looks_like_spam(title) {
-            return true;
-        }
-    }
+    title_looks_spammy(conv)
+        || any_participant_looks_spammy(conv)
+        || last_message_looks_spammy(conv)
+}
 
-    // Check participant headlines/occupations.
-    if let Some(participants) = conv
-        .get("conversationParticipants")
+fn title_looks_spammy(conv: &serde_json::Value) -> bool {
+    conv.get("title")
+        .and_then(|v| v.as_str())
+        .is_some_and(looks_like_spam)
+}
+
+fn any_participant_looks_spammy(conv: &serde_json::Value) -> bool {
+    conv.get("conversationParticipants")
         .and_then(|p| p.as_array())
-    {
-        for p in participants {
-            if let Some(member) = p.get("participantType").and_then(|pt| pt.get("member")) {
-                if let Some(headline) = member.get("headline").and_then(|h| {
-                    h.get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| h.as_str())
-                }) {
-                    if looks_like_spam(headline) {
-                        return true;
-                    }
-                }
-                if let Some(occ) = member.get("occupation").and_then(|v| v.as_str()) {
-                    if looks_like_spam(occ) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
+        .into_iter()
+        .flatten()
+        .any(participant_looks_spammy)
+}
 
-    // Check last message body.
-    let last_msg_text = conv
+fn participant_looks_spammy(p: &serde_json::Value) -> bool {
+    let Some(member) = p.get("participantType").and_then(|pt| pt.get("member")) else {
+        return false;
+    };
+    let headline_match = member
+        .get("headline")
+        .and_then(|h| {
+            h.get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| h.as_str())
+        })
+        .is_some_and(looks_like_spam);
+    if headline_match {
+        return true;
+    }
+    member
+        .get("occupation")
+        .and_then(|v| v.as_str())
+        .is_some_and(looks_like_spam)
+}
+
+fn last_message_looks_spammy(conv: &serde_json::Value) -> bool {
+    let Some(text) = last_message_body(conv) else {
+        return false;
+    };
+    looks_like_spam(&text)
+}
+
+/// Message bodies arrive as either a bare string or `{text: "..."}`.
+fn last_message_body(conv: &serde_json::Value) -> Option<String> {
+    let body = conv
         .get("messages")
         .and_then(|m| m.get("elements"))
         .and_then(|e| e.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|msg| {
-            msg.get("body").and_then(|b| {
-                if b.is_string() {
-                    b.as_str().map(|s| s.to_string())
-                } else {
-                    b.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                }
-            })
-        })
-        .unwrap_or_default();
-
-    looks_like_spam(&last_msg_text)
+        .and_then(|arr| arr.first())?
+        .get("body")?;
+    if body.is_string() {
+        return body.as_str().map(str::to_string);
+    }
+    body.get("text").and_then(|t| t.as_str()).map(str::to_string)
 }
 
 /// Check if an invitation element looks like recruiter spam.

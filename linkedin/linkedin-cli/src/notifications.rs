@@ -66,56 +66,75 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<
     }
 
     let cache = load_notifications_cache()?;
-    let elements = cache
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .ok_or_else(|| "cached notifications response has no elements array".to_string())?;
-    let card = elements.get(index - 1).ok_or_else(|| {
-        format!(
-            "index {} out of range (cached notifications has {} items)",
-            index,
-            elements.len()
-        )
-    })?;
-
-    let action_target = card
-        .get("cardAction")
-        .and_then(|a| a.get("actionTarget"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    let activity_urn = extract_activity_urn_from_url(action_target).ok_or_else(|| {
-        format!(
-            "notification {} has no activity URN in cardAction.actionTarget ({})",
-            index, action_target
-        )
-    })?;
+    let card = cached_notification_at(&cache, index)?;
+    let activity_urn = activity_urn_for_card(card, index)?;
 
     let (client, _path) = load_session_client()?;
     let post = client
         .get_post(&activity_urn)
         .await
         .map_err(|e| format!("failed to fetch post {}: {e}", activity_urn))?;
-
     let mentions = collect_post_mentions(&post);
 
     if raw_json {
-        let payload = serde_json::json!({
-            "activityUrn": activity_urn,
-            "mentions": mentions,
-        });
-        let pretty = serde_json::to_string_pretty(&payload)
-            .map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_mentions_json(&activity_urn, &mentions);
     }
+    print_mentions_report(&activity_urn, &mentions);
+    Ok(())
+}
 
+fn cached_notification_at(
+    cache: &serde_json::Value,
+    index: usize,
+) -> Result<&serde_json::Value, String> {
+    let elements = cache
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "cached notifications response has no elements array".to_string())?;
+    elements.get(index - 1).ok_or_else(|| {
+        format!(
+            "index {} out of range (cached notifications has {} items)",
+            index,
+            elements.len()
+        )
+    })
+}
+
+fn activity_urn_for_card(card: &serde_json::Value, index: usize) -> Result<String, String> {
+    let action_target = card
+        .get("cardAction")
+        .and_then(|a| a.get("actionTarget"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    extract_activity_urn_from_url(action_target).ok_or_else(|| {
+        format!(
+            "notification {} has no activity URN in cardAction.actionTarget ({})",
+            index, action_target
+        )
+    })
+}
+
+fn print_mentions_json(
+    activity_urn: &str,
+    mentions: &[serde_json::Value],
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "activityUrn": activity_urn,
+        "mentions": mentions,
+    });
+    let pretty =
+        serde_json::to_string_pretty(&payload).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+fn print_mentions_report(activity_urn: &str, mentions: &[serde_json::Value]) {
     if mentions.is_empty() {
         println!("(no mentions found in {})", activity_urn);
-        return Ok(());
+        return;
     }
-
     println!("Mentions in {}:", activity_urn);
-    for m in &mentions {
+    for m in mentions {
         let urn = m.get("urn").and_then(|u| u.as_str()).unwrap_or("(no urn)");
         let name = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
         if name.is_empty() {
@@ -124,8 +143,6 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<
             println!("  {}  ({})", name, urn);
         }
     }
-
-    Ok(())
 }
 
 /// Walk a post's commentary attributes and pull any fsd_profile URNs out
@@ -189,54 +206,52 @@ fn collect_post_mentions(post: &serde_json::Value) -> Vec<serde_json::Value> {
 /// Notification cards use TextViewModel wrappers for text fields; we extract
 /// the inner `text` string from `headline`, `subHeadline`, and `kicker`.
 fn print_notification_card(index: usize, card: &serde_json::Value) {
-    let read = card.get("read").and_then(|r| r.as_bool()).unwrap_or(true);
-    let unread_marker = if read { " " } else { "*" };
+    let unread_marker = if card_is_read(card) { " " } else { "*" };
+    let headline = card_text(card, "headline").unwrap_or("(no headline)");
 
-    // headline.text -- primary notification text.
-    let headline = card
-        .get("headline")
-        .and_then(|h| h.get("text").and_then(|t| t.as_str()))
-        .unwrap_or("(no headline)");
+    println!("[{}]{} {}", index, unread_marker, truncate_with_ellipsis(headline, 120));
 
-    // subHeadline.text -- secondary detail.
-    let sub_headline = card
-        .get("subHeadline")
-        .and_then(|s| s.get("text").and_then(|t| t.as_str()))
-        .unwrap_or("");
+    if let Some(preview) = content_preview(card) {
+        println!("    \"{}\"", preview);
+    }
+    if let Some(sub) = card_text(card, "subHeadline").filter(|s| !s.is_empty()) {
+        println!("    {}", sub);
+    }
+    let meta = card_meta_line(card);
+    if !meta.is_empty() {
+        println!("    {}", meta);
+    }
+    if let Some(url) = card_post_link(card) {
+        println!("    {}", url);
+    }
+}
 
-    // kicker.text -- time indicator (e.g. "2h ago"). Currently unused since
-    // publishedAt provides a more precise timestamp.
-    let _kicker = card
-        .get("kicker")
-        .and_then(|k| k.get("text").and_then(|t| t.as_str()))
-        .unwrap_or("");
+fn card_is_read(card: &serde_json::Value) -> bool {
+    card.get("read").and_then(|r| r.as_bool()).unwrap_or(true)
+}
 
-    // publishedAt -- epoch millis timestamp.
-    let published_at = card
-        .get("publishedAt")
-        .and_then(|p| p.as_i64())
-        .and_then(|millis| {
-            let secs = millis / 1000;
-            chrono::DateTime::from_timestamp(secs, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-        })
-        .unwrap_or_default();
+/// Extract the inner string from a TextViewModel-wrapped field.
+fn card_text<'a>(card: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    card.get(field)
+        .and_then(|h| h.get("text"))
+        .and_then(|t| t.as_str())
+}
 
-    // contentType -- discriminator like PROFILE_VIEW, REACTION, etc.
-    let content_type = card
-        .get("contentType")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    // contentPrimaryText -- the actual post body for reaction/mention notifications.
-    let content_text = card
+fn content_preview(card: &serde_json::Value) -> Option<String> {
+    let text = card
         .get("contentPrimaryText")
         .and_then(|arr| arr.as_array())
         .and_then(|a| a.first())
-        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-        .unwrap_or("");
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())?;
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(first_line, 100))
+}
 
-    // socialActivityCounts -- engagement numbers.
+fn card_meta_line(card: &serde_json::Value) -> String {
     let social = card.get("socialActivityCounts");
     let num_likes = social
         .and_then(|s| s.get("numLikes").and_then(|n| n.as_u64()))
@@ -244,53 +259,41 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
     let num_comments = social
         .and_then(|s| s.get("numComments").and_then(|n| n.as_u64()))
         .unwrap_or(0);
+    let content_type = card.get("contentType").and_then(|c| c.as_str()).unwrap_or("");
+    let published_at = card
+        .get("publishedAt")
+        .and_then(|p| p.as_i64())
+        .and_then(|millis| {
+            chrono::DateTime::from_timestamp(millis / 1000, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        })
+        .unwrap_or_default();
 
-    // Post URL from cardAction.actionTarget.
-    let post_url = card
-        .get("cardAction")
-        .and_then(|a| a.get("actionTarget").and_then(|t| t.as_str()))
-        .unwrap_or("");
-
-    // Truncate long headlines for summary view.
-    let headline_display = truncate_with_ellipsis(headline, 120);
-
-    print!("[{}]{} {}", index, unread_marker, headline_display);
-    println!();
-
-    // Show post preview for content notifications.
-    if !content_text.is_empty() {
-        // Show first line of the post as a preview.
-        let first_line = content_text.lines().next().unwrap_or("");
-        let preview = truncate_with_ellipsis(first_line, 100);
-        println!("    \"{}\"", preview);
-    }
-
-    if !sub_headline.is_empty() {
-        println!("    {}", sub_headline);
-    }
-
-    // Engagement stats + timestamp on one line.
-    let mut meta_parts = Vec::new();
+    let mut parts = Vec::new();
     if num_likes > 0 || num_comments > 0 {
-        meta_parts.push(format!("likes: {}  comments: {}", num_likes, num_comments));
+        parts.push(format!("likes: {}  comments: {}", num_likes, num_comments));
     }
     if !content_type.is_empty() {
-        meta_parts.push(format!("type: {}", content_type));
+        parts.push(format!("type: {}", content_type));
     }
     if !published_at.is_empty() {
-        meta_parts.push(published_at);
+        parts.push(published_at);
     }
-    if !meta_parts.is_empty() {
-        println!("    {}", meta_parts.join("  |  "));
-    }
+    parts.join("  |  ")
+}
 
-    // Post link.
-    if !post_url.is_empty() && post_url.contains("/feed/") {
-        println!(
-            "    https://www.linkedin.com{}",
-            post_url.replace("%3A", ":").replace("%2F", "/")
-        );
+fn card_post_link(card: &serde_json::Value) -> Option<String> {
+    let target = card
+        .get("cardAction")
+        .and_then(|a| a.get("actionTarget"))
+        .and_then(|t| t.as_str())?;
+    if target.is_empty() || !target.contains("/feed/") {
+        return None;
     }
+    Some(format!(
+        "https://www.linkedin.com{}",
+        target.replace("%3A", ":").replace("%2F", "/")
+    ))
 }
 
 fn notifications_cache_path() -> Result<std::path::PathBuf, String> {
