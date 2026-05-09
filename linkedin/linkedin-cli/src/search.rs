@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 use linkedin_api::models::SearchResponse;
 
 use crate::connections::cmd_connections_invite;
@@ -23,51 +25,25 @@ pub async fn cmd_search_people(
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
-    // Cache results for index-based profile view.
     if let Err(e) = save_search_cache("people", &value) {
         eprintln!("warning: failed to cache search results: {e}");
     }
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        return print_json(&value);
+    }
+
+    let resp = parse_search_response(&value)?;
+    print_search_header(&resp, &format!("Search results for '{}'", keywords));
+
+    let entities: Vec<&Value> = iter_cluster_items(&resp, "entityResult").collect();
+    if entities.is_empty() {
+        println!("(no results)");
         return Ok(());
     }
-
-    // The response (after GraphQL unwrapping) has: elements (clusters),
-    // paging, metadata. Parse paging for the header line.
-    let resp: SearchResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse search response: {e}"))?;
-
-    if let Some(ref paging) = resp.paging {
-        print_paging_header(&format!("Search results for '{}'", keywords), paging);
-    }
-    println!("---");
-
-    // Flatten clusters -> items -> entityResult for display.
-    // Each cluster element contains an `items` array with search results.
-    let mut result_idx = start as usize;
-    let mut any_results = false;
-    for cluster in &resp.elements {
-        let items = cluster
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            let entity = item_wrapper.get("item").and_then(|i| i.get("entityResult"));
-            if let Some(entity) = entity {
-                result_idx += 1;
-                any_results = true;
-                print_search_entity(result_idx, entity);
-                println!();
-            }
-        }
-    }
-
-    if !any_results {
-        println!("(no results)");
+    for (i, entity) in entities.iter().enumerate() {
+        print_search_entity(start as usize + i + 1, entity);
+        println!();
     }
 
     Ok(())
@@ -78,47 +54,15 @@ pub async fn cmd_search_people(
 /// The GraphQL `searchDashClustersByAll` response returns `entityResult`
 /// objects with structured text fields rather than the legacy
 /// `SearchProfile.miniProfile` format.
-///
-/// Fields used:
-/// - `title.text`: person's name
-/// - `primarySubtitle.text`: headline / occupation
-/// - `secondarySubtitle.text`: location
-/// - `navigationUrl`: profile link
-/// - `badgeText.text`: connection degree badge (e.g., "2nd")
-fn print_search_entity(index: usize, entity: &serde_json::Value) {
-    let name = entity
-        .get("title")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("(unknown)");
-
-    let headline = entity
-        .get("primarySubtitle")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let location = entity
-        .get("secondarySubtitle")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let badge = entity
-        .get("badgeText")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Extract public profile slug from navigationUrl if available.
+fn print_search_entity(index: usize, entity: &Value) {
+    let name = text_field(entity, "title").unwrap_or("(unknown)");
+    let headline = text_field(entity, "primarySubtitle").unwrap_or("");
+    let location = text_field(entity, "secondarySubtitle").unwrap_or("");
+    let badge = text_field(entity, "badgeText").unwrap_or("");
     let profile_slug = entity
         .get("navigationUrl")
         .and_then(|v| v.as_str())
-        .and_then(|url| {
-            // URL format: https://www.linkedin.com/in/<slug>?...
-            url.strip_prefix("https://www.linkedin.com/in/")
-                .map(|rest| rest.split('?').next().unwrap_or(rest))
-        })
+        .and_then(profile_slug_from_url)
         .unwrap_or("");
 
     print!("[{}] {}", index, name);
@@ -139,9 +83,6 @@ fn print_search_entity(index: usize, entity: &serde_json::Value) {
 }
 
 /// Handle `search jobs <keywords> [--count N] [--start N] [--json]`.
-///
-/// Loads the session, calls the Voyager GraphQL `searchDashClustersByAll`
-/// endpoint with `resultType:List(JOBS)` and prints the results.
 pub async fn cmd_search_jobs(
     keywords: &str,
     start: u32,
@@ -156,73 +97,38 @@ pub async fn cmd_search_jobs(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        return print_json(&value);
+    }
+
+    let resp = parse_search_response(&value)?;
+    print_search_header(&resp, &format!("Job search results for '{}'", keywords));
+
+    let cards: Vec<&Value> = resp
+        .elements
+        .iter()
+        .filter_map(|el| el.get("jobCard").and_then(|jc| jc.get("jobPostingCard")))
+        .collect();
+    if cards.is_empty() {
+        println!("(no results)");
         return Ok(());
     }
-
-    // The jobsDashJobCardsByJobSearch response has the standard collection
-    // shape: elements (array of job cards), paging, metadata.
-    let resp: SearchResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse search response: {e}"))?;
-
-    if let Some(ref paging) = resp.paging {
-        print_paging_header(&format!("Job search results for '{}'", keywords), paging);
-    }
-    println!("---");
-
-    let mut result_idx = start as usize;
-    let mut any_results = false;
-    for element in &resp.elements {
-        // Each element has jobCard.jobPostingCard with the display fields.
-        let card = element
-            .get("jobCard")
-            .and_then(|jc| jc.get("jobPostingCard"));
-        if let Some(card) = card {
-            result_idx += 1;
-            any_results = true;
-            print_job_card(result_idx, card);
-            println!();
-        }
-    }
-
-    if !any_results {
-        println!("(no results)");
+    for (i, card) in cards.iter().enumerate() {
+        print_job_card(start as usize + i + 1, card);
+        println!();
     }
 
     Ok(())
 }
 
 /// Print a brief human-readable summary of a single job search card.
-///
-/// The GraphQL `jobsDashJobCardsByJobSearch` response returns elements
-/// with `jobCard.jobPostingCard` objects containing:
-/// - `jobPosting.title`: job title
-/// - `primaryDescription.text`: company name
-/// - `secondaryDescription.text`: location
-/// - `cardActionV2.navigationAction.actionTarget`: job URL
-/// - `footerItems[].timeAt`: posted date (epoch millis)
-fn print_job_card(index: usize, card: &serde_json::Value) {
+fn print_job_card(index: usize, card: &Value) {
     let title = card
         .get("jobPosting")
         .and_then(|jp| jp.get("title"))
         .and_then(|v| v.as_str())
         .unwrap_or("(unknown)");
-
-    let company = card
-        .get("primaryDescription")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let location = card
-        .get("secondaryDescription")
-        .and_then(|t| t.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // Extract job URL from the card action.
+    let company = text_field(card, "primaryDescription").unwrap_or("");
+    let location = text_field(card, "secondaryDescription").unwrap_or("");
     let job_url = card
         .get("cardActionV2")
         .and_then(|a| a.get("navigationAction"))
@@ -230,21 +136,16 @@ fn print_job_card(index: usize, card: &serde_json::Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    print!("[{}] {}", index, title);
-    println!();
-
+    println!("[{}] {}", index, title);
     if !company.is_empty() {
         println!("    company: {}", company);
     }
     if !location.is_empty() {
         println!("    location: {}", location);
     }
-    if !job_url.is_empty() {
-        // Show just the job view path, not the full URL with tracking params
-        if let Some(path) = job_url.strip_prefix("https://www.linkedin.com") {
-            let clean = path.split('?').next().unwrap_or(path);
-            println!("    url: {}", clean);
-        }
+    if let Some(path) = job_url.strip_prefix("https://www.linkedin.com") {
+        let clean = path.split('?').next().unwrap_or(path);
+        println!("    url: {}", clean);
     }
 }
 
@@ -256,7 +157,7 @@ fn search_cache_path(kind: &str) -> Result<std::path::PathBuf, String> {
         .join(format!("last_search_{}.json", kind)))
 }
 
-fn save_search_cache(kind: &str, value: &serde_json::Value) -> Result<(), String> {
+fn save_search_cache(kind: &str, value: &Value) -> Result<(), String> {
     let path = search_cache_path(kind)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
@@ -267,92 +168,134 @@ fn save_search_cache(kind: &str, value: &serde_json::Value) -> Result<(), String
     Ok(())
 }
 
-fn load_search_cache(kind: &str) -> Result<serde_json::Value, String> {
+fn load_search_cache(kind: &str) -> Result<Value, String> {
     let path = search_cache_path(kind)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| format!("no cached {} search. Run `search {}` first.", kind, kind))?;
     serde_json::from_str(&data).map_err(|e| format!("failed to parse search cache: {e}"))
 }
 
+/// Pretty-print a JSON value to stdout.
+fn print_json(value: &Value) -> Result<(), String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+/// Decode a raw search payload into the typed envelope.
+fn parse_search_response(value: &Value) -> Result<SearchResponse, String> {
+    serde_json::from_value(value.clone())
+        .map_err(|e| format!("failed to parse search response: {e}"))
+}
+
+/// Print the standard "label … --- " header used by every search command.
+fn print_search_header(resp: &SearchResponse, label: &str) {
+    if let Some(ref paging) = resp.paging {
+        print_paging_header(label, paging);
+    }
+    println!("---");
+}
+
+/// Iterate over all `item.<kind>` values across every cluster's `items`
+/// array. Skips wrappers that don't carry the requested kind, so the
+/// resulting index lines up with what users see in the printed list.
+fn iter_cluster_items<'a>(
+    resp: &'a SearchResponse,
+    kind: &'a str,
+) -> impl Iterator<Item = &'a Value> + 'a {
+    resp.elements
+        .iter()
+        .flat_map(|cluster| {
+            cluster
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+                .iter()
+        })
+        .filter_map(move |wrapper| wrapper.get("item").and_then(|i| i.get(kind)))
+}
+
+/// Find the Nth (1-based) item of `kind` from a cached search payload.
+fn nth_cached_item(cache_kind: &str, item_kind: &str, index: usize) -> Result<Value, String> {
+    let cache = load_search_cache(cache_kind)?;
+    let resp = parse_search_response(&cache)?;
+    let items: Vec<Value> = iter_cluster_items(&resp, item_kind)
+        .cloned()
+        .collect();
+    if index == 0 || index > items.len() {
+        return Err(format!(
+            "index {} out of range (search has {} results)",
+            index,
+            items.len()
+        ));
+    }
+    Ok(items[index - 1].clone())
+}
+
 /// Extract the Nth post's activity URN from cached search results.
 fn resolve_search_post_urn(index: usize) -> Result<String, String> {
-    let cache = load_search_cache("posts")?;
-    let resp: SearchResponse =
-        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
+    let sfu = nth_cached_item("posts", "searchFeedUpdate", index)?;
+    let update = sfu.get("update").unwrap_or(&sfu);
+    activity_urn_from_update(update)
+        .ok_or_else(|| format!("search result {} has no activity URN", index))
+}
 
-    let mut result_idx = 0usize;
-    for cluster in &resp.elements {
-        let items = cluster
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            let sfu = item_wrapper
-                .get("item")
-                .and_then(|i| i.get("searchFeedUpdate"));
-            if let Some(sfu) = sfu {
-                result_idx += 1;
-                if result_idx == index {
-                    let update = sfu.get("update").unwrap_or(sfu);
-                    return update
-                        .get("metadata")
-                        .and_then(|m| m.get("backendUrn"))
-                        .and_then(|u| u.as_str())
-                        .and_then(|u| {
-                            if u.starts_with("urn:li:activity:") {
-                                Some(u.to_string())
-                            } else {
-                                extract_activity_urn(u)
-                            }
-                        })
-                        .ok_or_else(|| format!("search result {} has no activity URN", index));
-                }
-            }
-        }
+/// Extract an activity URN (`urn:li:activity:N`) from an update value.
+/// Tries `metadata.backendUrn`, then `entityUrn`, then `socialDetail.entityUrn`.
+fn activity_urn_from_update(update: &Value) -> Option<String> {
+    let from_metadata = update
+        .get("metadata")
+        .and_then(|m| m.get("backendUrn"))
+        .and_then(|u| u.as_str())
+        .and_then(coerce_activity_urn);
+    let from_entity = update
+        .get("entityUrn")
+        .and_then(|u| u.as_str())
+        .and_then(extract_activity_urn);
+    let from_social = update
+        .get("socialDetail")
+        .and_then(|sd| sd.get("entityUrn"))
+        .and_then(|u| u.as_str())
+        .and_then(extract_activity_urn);
+    from_metadata.or(from_entity).or(from_social)
+}
+
+/// Pass-through for `urn:li:activity:*` strings; otherwise delegate to
+/// `extract_activity_urn` which handles `urn:li:fs_updateV2:*` etc.
+fn coerce_activity_urn(s: &str) -> Option<String> {
+    if s.starts_with("urn:li:activity:") {
+        Some(s.to_string())
+    } else {
+        extract_activity_urn(s)
     }
-
-    Err(format!(
-        "index {} out of range (search has {} results)",
-        index, result_idx
-    ))
 }
 
 /// Extract the Nth person's profile slug from cached people search results.
 fn resolve_search_person_slug(index: usize) -> Result<String, String> {
-    let cache = load_search_cache("people")?;
-    let resp: SearchResponse =
-        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
+    let entity = nth_cached_item("people", "entityResult", index)?;
+    entity
+        .get("navigationUrl")
+        .and_then(|v| v.as_str())
+        .and_then(profile_slug_from_url)
+        .map(str::to_string)
+        .ok_or_else(|| format!("search result {} has no profile URL", index))
+}
 
-    let mut result_idx = 0usize;
-    for cluster in &resp.elements {
-        let items = cluster
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            let entity = item_wrapper.get("item").and_then(|i| i.get("entityResult"));
-            if let Some(entity) = entity {
-                result_idx += 1;
-                if result_idx == index {
-                    return entity
-                        .get("navigationUrl")
-                        .and_then(|v| v.as_str())
-                        .and_then(|url| {
-                            url.strip_prefix("https://www.linkedin.com/in/")
-                                .map(|rest| rest.split('?').next().unwrap_or(rest).to_string())
-                        })
-                        .ok_or_else(|| format!("search result {} has no profile URL", index));
-                }
-            }
-        }
-    }
+/// Strip the "/in/" prefix and trailing query string from a navigation URL.
+fn profile_slug_from_url(url: &str) -> Option<&str> {
+    url.strip_prefix("https://www.linkedin.com/in/")
+        .map(|rest| rest.split('?').next().unwrap_or(rest))
+}
 
-    Err(format!(
-        "index {} out of range (search has {} results)",
-        index, result_idx
-    ))
+/// Read a `<key>.text` string field, the standard shape used by GraphQL
+/// search responses for display strings.
+fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
 }
 
 /// Handle `search posts <keywords> [--count N] [--start N] [--json]`.
@@ -369,59 +312,36 @@ pub async fn cmd_search_posts(
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
-    // Cache results for index-based react/comment.
     if let Err(e) = save_search_cache("posts", &value) {
         eprintln!("warning: failed to cache search results: {e}");
     }
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        return print_json(&value);
+    }
+
+    let resp = parse_search_response(&value)?;
+    print_search_header(&resp, &format!("Post results for '{}'", keywords));
+
+    let posts: Vec<&Value> = iter_cluster_items(&resp, "searchFeedUpdate").collect();
+    if posts.is_empty() {
+        println!("(no results)");
         return Ok(());
     }
-
-    let resp: SearchResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse search response: {e}"))?;
-
-    if let Some(ref paging) = resp.paging {
-        print_paging_header(&format!("Post results for '{}'", keywords), paging);
-    }
-    println!("---");
-
-    // Content search returns `searchFeedUpdate` items (not `entityResult`).
-    let mut result_idx = start as usize;
-    let mut any_results = false;
-    for cluster in &resp.elements {
-        let items = cluster
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            let sfu = item_wrapper
-                .get("item")
-                .and_then(|i| i.get("searchFeedUpdate"));
-            if let Some(sfu) = sfu {
-                result_idx += 1;
-                any_results = true;
-                print_search_content(result_idx, sfu);
-                println!();
-            }
-        }
-    }
-
-    if !any_results {
-        println!("(no results)");
+    for (i, sfu) in posts.iter().enumerate() {
+        print_search_content(start as usize + i + 1, sfu);
+        println!();
     }
 
     Ok(())
 }
 
 /// Handle `search react <index> [--type LIKE] [--json]`.
-///
-/// Reacts to a post from cached search results.
-pub async fn cmd_search_react(index: usize, reaction_type: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_search_react(
+    index: usize,
+    reaction_type: &str,
+    raw_json: bool,
+) -> Result<(), String> {
     if index == 0 {
         return Err("index must be >= 1".to_string());
     }
@@ -437,19 +357,14 @@ pub async fn cmd_search_react(index: usize, reaction_type: &str, raw_json: bool)
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&result)?;
     } else {
         println!("Reacted with {} to search result [{}]", rt_upper, index);
     }
-
     Ok(())
 }
 
 /// Handle `search view <index> [--json]`.
-///
-/// Views a profile from cached people search results.
 pub async fn cmd_search_view(index: usize, raw_json: bool) -> Result<(), String> {
     if index == 0 {
         return Err("index must be >= 1".to_string());
@@ -487,10 +402,6 @@ pub async fn cmd_search_invite(
 }
 
 /// Resolved target for a cached search result.
-///
-/// Carries both the URN (preferred for invites) and the slug (fallback +
-/// human-readable label). One of these is always present; the other may
-/// be absent depending on the cached payload shape.
 struct SearchPersonTarget {
     urn: Option<String>,
     slug: Option<String>,
@@ -498,8 +409,6 @@ struct SearchPersonTarget {
 }
 
 impl SearchPersonTarget {
-    /// Pick the best argument to pass to `cmd_connections_invite`. Prefers
-    /// URN (skips the resolver) but falls through to slug when needed.
     fn invite_arg(&self) -> String {
         self.urn
             .clone()
@@ -517,144 +426,57 @@ impl SearchPersonTarget {
     }
 }
 
-/// Resolve a target struct from the cached people-search response by index.
-///
-/// The cache mirrors the GraphQL `searchDashClustersByAll` envelope:
-/// each cluster has an `items` array; entries with an `item.entityResult`
-/// represent a person hit. Sponsored, query-clarification, and feedback
-/// cards are skipped so the index lines up with what the user sees in the
-/// printed list.
 fn resolve_search_person_target(index: usize) -> Result<SearchPersonTarget, String> {
-    let cache = load_search_cache("people")?;
-    let resp: SearchResponse =
-        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached search: {e}"))?;
+    let entity = nth_cached_item("people", "entityResult", index)?;
+    let urn = profile_urn_from_entity(&entity);
+    let slug = entity
+        .get("navigationUrl")
+        .and_then(|v| v.as_str())
+        .and_then(profile_slug_from_url)
+        .map(str::to_string);
+    let name = text_field(&entity, "title").map(str::to_string);
 
-    let mut result_idx = 0usize;
-    for cluster in &resp.elements {
-        let items = cluster
-            .get("items")
-            .and_then(|v| v.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            let entity = match item_wrapper.get("item").and_then(|i| i.get("entityResult")) {
-                Some(e) => e,
-                None => continue,
-            };
-            result_idx += 1;
-            if result_idx != index {
-                continue;
-            }
-
-            let urn = entity
-                .get("entityUrn")
-                .and_then(|v| v.as_str())
-                .filter(|s| s.starts_with("urn:li:fsd_profile:"))
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    entity
-                        .get("trackingUrn")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| s.starts_with("urn:li:fsd_profile:"))
-                        .map(|s| s.to_string())
-                });
-
-            let slug = entity
-                .get("navigationUrl")
-                .and_then(|v| v.as_str())
-                .and_then(|url| {
-                    url.strip_prefix("https://www.linkedin.com/in/")
-                        .map(|rest| rest.split('?').next().unwrap_or(rest).to_string())
-                });
-
-            let name = entity
-                .get("title")
-                .and_then(|t| t.get("text"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            if urn.is_none() && slug.is_none() {
-                return Err(format!(
-                    "search result {} has neither entityUrn nor navigationUrl",
-                    index
-                ));
-            }
-
-            return Ok(SearchPersonTarget { urn, slug, name });
-        }
+    if urn.is_none() && slug.is_none() {
+        return Err(format!(
+            "search result {} has neither entityUrn nor navigationUrl",
+            index
+        ));
     }
 
-    Err(format!(
-        "index {} out of range (search has {} results)",
-        index, result_idx
-    ))
+    Ok(SearchPersonTarget { urn, slug, name })
+}
+
+/// Pull a `urn:li:fsd_profile:*` URN from an entity. Prefers `entityUrn`,
+/// falls back to `trackingUrn`.
+fn profile_urn_from_entity(entity: &Value) -> Option<String> {
+    let take = |key: &str| {
+        entity
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("urn:li:fsd_profile:"))
+            .map(|s| s.to_string())
+    };
+    take("entityUrn").or_else(|| take("trackingUrn"))
 }
 
 /// Print a human-readable summary of a content search result.
-///
-/// Content search results use `searchFeedUpdate` which contains an `update`
-/// field with the same structure as feed `UpdateV2` items.
-fn print_search_content(index: usize, sfu: &serde_json::Value) {
+fn print_search_content(index: usize, sfu: &Value) {
     let update = sfu.get("update").unwrap_or(sfu);
-
     let actor_name = update
         .get("actor")
         .and_then(|a| a.get("name"))
         .and_then(|n| n.get("text"))
         .and_then(|t| t.as_str())
         .unwrap_or("(unknown)");
-
     let commentary = update
         .get("commentary")
         .and_then(|c| c.get("text"))
         .and_then(|t| t.get("text"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
-
     let commentary_display = truncate_with_ellipsis(commentary, 200);
-
-    let likes = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numLikes"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let comments = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numComments"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-
-    // Extract the activity URN for react/comment support.
-    // Primary source: update.metadata.backendUrn (contains urn:li:activity:XXX).
-    // Fallback: update.entityUrn, socialDetail.entityUrn, or permalink.
-    let activity_urn = update
-        .get("metadata")
-        .and_then(|m| m.get("backendUrn"))
-        .and_then(|u| u.as_str())
-        .and_then(|u| {
-            if u.starts_with("urn:li:activity:") {
-                Some(u.to_string())
-            } else {
-                extract_activity_urn(u)
-            }
-        })
-        .or_else(|| {
-            update
-                .get("entityUrn")
-                .and_then(|u| u.as_str())
-                .and_then(extract_activity_urn)
-        })
-        .or_else(|| {
-            update
-                .get("socialDetail")
-                .and_then(|sd| sd.get("entityUrn"))
-                .and_then(|u| u.as_str())
-                .and_then(extract_activity_urn)
-        })
-        .unwrap_or_default();
-
+    let (likes, comments) = social_counts(update);
+    let activity_urn = activity_urn_from_update(update).unwrap_or_default();
     let permalink = sfu.get("permalink").and_then(|p| p.as_str()).unwrap_or("");
 
     println!("[{}] {}", index, actor_name);
@@ -663,7 +485,6 @@ fn print_search_content(index: usize, sfu: &serde_json::Value) {
     }
     println!("    likes: {}  comments: {}", likes, comments);
     if !activity_urn.is_empty() {
-        // Generate a LinkedIn post URL from the activity URN.
         let activity_id = activity_urn
             .strip_prefix("urn:li:activity:")
             .unwrap_or(&activity_urn);
@@ -672,10 +493,24 @@ fn print_search_content(index: usize, sfu: &serde_json::Value) {
             activity_id
         );
         println!("    URN: {}", activity_urn);
-    }
-    if !permalink.is_empty() && activity_urn.is_empty() {
+    } else if !permalink.is_empty() {
         println!("    {}", permalink);
     }
+}
+
+fn social_counts(update: &Value) -> (u64, u64) {
+    let counts = update
+        .get("socialDetail")
+        .and_then(|s| s.get("totalSocialActivityCounts"));
+    let likes = counts
+        .and_then(|c| c.get("numLikes"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let comments = counts
+        .and_then(|c| c.get("numComments"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    (likes, comments)
 }
 
 #[cfg(test)]
