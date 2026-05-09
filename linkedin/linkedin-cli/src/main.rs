@@ -26,6 +26,7 @@ use company::{cmd_company_followers, cmd_company_view};
 use connections::{
     cmd_connections_accept, cmd_connections_invitations, cmd_connections_invite,
     cmd_connections_invite_batch, cmd_connections_list, cmd_connections_withdraw,
+    ConnectionsListOptions,
 };
 use events::{cmd_event_attendees, cmd_event_view};
 use feed::{
@@ -197,7 +198,16 @@ async fn dispatch_connections(action: ConnectionsAction) {
             all,
             keyword,
             json,
-        } => exit_on_err(cmd_connections_list(start, count, all, keyword.as_deref(), json).await),
+        } => {
+            let opts = ConnectionsListOptions {
+                start,
+                count,
+                fetch_all: all,
+                keyword_filter: keyword.as_deref(),
+                raw_json: json,
+            };
+            exit_on_err(cmd_connections_list(opts).await);
+        }
         ConnectionsAction::Invite {
             public_id_or_urn,
             message,
