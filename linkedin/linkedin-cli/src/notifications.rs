@@ -114,10 +114,7 @@ fn activity_urn_for_card(card: &serde_json::Value, index: usize) -> Result<Strin
     })
 }
 
-fn print_mentions_json(
-    activity_urn: &str,
-    mentions: &[serde_json::Value],
-) -> Result<(), String> {
+fn print_mentions_json(activity_urn: &str, mentions: &[serde_json::Value]) -> Result<(), String> {
     let payload = serde_json::json!({
         "activityUrn": activity_urn,
         "mentions": mentions,
@@ -209,7 +206,12 @@ fn print_notification_card(index: usize, card: &serde_json::Value) {
     let unread_marker = if card_is_read(card) { " " } else { "*" };
     let headline = card_text(card, "headline").unwrap_or("(no headline)");
 
-    println!("[{}]{} {}", index, unread_marker, truncate_with_ellipsis(headline, 120));
+    println!(
+        "[{}]{} {}",
+        index,
+        unread_marker,
+        truncate_with_ellipsis(headline, 120)
+    );
 
     if let Some(preview) = content_preview(card) {
         println!("    \"{}\"", preview);
@@ -259,7 +261,10 @@ fn card_meta_line(card: &serde_json::Value) -> String {
     let num_comments = social
         .and_then(|s| s.get("numComments").and_then(|n| n.as_u64()))
         .unwrap_or(0);
-    let content_type = card.get("contentType").and_then(|c| c.as_str()).unwrap_or("");
+    let content_type = card
+        .get("contentType")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
     let published_at = card
         .get("publishedAt")
         .and_then(|p| p.as_i64())

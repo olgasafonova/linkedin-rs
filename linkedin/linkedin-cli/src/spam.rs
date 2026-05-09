@@ -115,7 +115,9 @@ fn last_message_body(conv: &serde_json::Value) -> Option<String> {
     if body.is_string() {
         return body.as_str().map(str::to_string);
     }
-    body.get("text").and_then(|t| t.as_str()).map(str::to_string)
+    body.get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 /// Check if an invitation element looks like recruiter spam.

@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::ConnectionsResponse;
 
@@ -5,6 +7,64 @@ use crate::graphql_print::{print_graphql_conversation, print_graphql_message};
 use crate::session::load_session_client;
 use crate::spam::{is_spam_conversation, is_spam_invitation};
 use crate::util::truncate_with_ellipsis;
+
+/// URN prefixes recognised as already-resolved member identifiers.
+const PROFILE_URN_PREFIXES: &[&str] = &[
+    "urn:li:fsd_profile:",
+    "urn:li:member:",
+    "urn:li:fs_miniProfile:",
+];
+
+/// Pretty-print a JSON value to stdout.
+fn print_json(value: &Value) -> Result<(), String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+/// Read a string field that may be either a bare string or a `{text: "..."}`
+/// object. LinkedIn's GraphQL responses use both shapes interchangeably for
+/// participant names.
+fn flexible_text(value: Option<&Value>) -> Option<&str> {
+    let v = value?;
+    v.get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| v.as_str())
+}
+
+/// Build "First Last" from a member-shaped value, returning None if both
+/// names are missing or empty.
+fn extract_member_name(member: &Value) -> Option<String> {
+    let first = flexible_text(member.get("firstName")).unwrap_or("");
+    let last = flexible_text(member.get("lastName")).unwrap_or("");
+    if first.is_empty() && last.is_empty() {
+        None
+    } else {
+        Some(format!("{} {}", first, last).trim().to_string())
+    }
+}
+
+/// Read a message's body text. Handles both the bare-string and the
+/// `{text: "..."}` shapes.
+fn extract_message_body(msg: &Value) -> Option<String> {
+    let body = msg.get("body")?;
+    if body.is_string() {
+        return body.as_str().map(str::to_string);
+    }
+    body.get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+}
+
+/// `elements` array from a wrapper response, defaulting to empty.
+fn elements_slice(value: &Value) -> &[Value] {
+    value
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+}
 
 /// Handle `inbox [--json] [--all]`.
 ///
@@ -34,215 +94,207 @@ pub async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
             "pendingInvitations": invitations,
             "recentNotifications": notifications,
         });
-        let pretty = serde_json::to_string_pretty(&combined)
-            .map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&combined);
     }
 
-    // --- Unread messages ---
-    let conv_elements = conversations
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+    print_unread_messages_section(&conversations, show_all);
+    println!();
+    print_pending_invitations_section(&invitations, show_all);
+    println!();
+    print_unread_notifications_section(&notifications);
+    Ok(())
+}
 
-    let unread: Vec<&serde_json::Value> = conv_elements
+fn print_unread_messages_section(conversations: &Value, show_all: bool) {
+    let unread: Vec<&Value> = elements_slice(conversations)
         .iter()
-        .filter(|c| {
-            c.get("read").and_then(|r| r.as_bool()) == Some(false)
-                || c.get("unreadCount").and_then(|n| n.as_u64()).unwrap_or(0) > 0
-        })
+        .filter(|c| is_unread_conversation(c))
         .collect();
 
-    let spam_msg_count = if show_all {
-        0
-    } else {
-        unread.iter().filter(|c| is_spam_conversation(c)).count()
-    };
-    let displayed_unread: Vec<&serde_json::Value> = unread
-        .into_iter()
-        .filter(|c| show_all || !is_spam_conversation(c))
-        .collect();
+    let (displayed, spam_count) =
+        filter_spam(unread.as_slice(), show_all, |c| is_spam_conversation(c));
 
-    println!("Unread Messages ({})", displayed_unread.len());
+    println!("Unread Messages ({})", displayed.len());
     println!("---");
-    if displayed_unread.is_empty() {
+    if displayed.is_empty() {
         println!("  (all caught up)");
     } else {
-        for (i, conv) in displayed_unread.iter().enumerate() {
-            let title = conv.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let names = extract_conversation_names(conv);
-            let display = if !title.is_empty() {
-                title.to_string()
-            } else if !names.is_empty() {
-                names.join(", ")
-            } else {
-                "(unknown)".to_string()
-            };
-
-            let backend_urn = conv
-                .get("backendUrn")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
-            let conv_id = backend_urn
-                .strip_prefix("urn:li:messagingThread:")
-                .unwrap_or(backend_urn);
-
-            let last_msg = conv
-                .get("messages")
-                .and_then(|m| m.get("elements"))
-                .and_then(|e| e.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|msg| {
-                    msg.get("body").and_then(|b| {
-                        if b.is_string() {
-                            b.as_str().map(|s| s.to_string())
-                        } else {
-                            b.get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|s| s.to_string())
-                        }
-                    })
-                })
-                .unwrap_or_default();
-
-            let unread_count = conv
-                .get("unreadCount")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(1);
-
-            println!("  [{}] {} ({} unread)", i + 1, display, unread_count);
-            if !last_msg.is_empty() {
-                println!("      {}", truncate_with_ellipsis(&last_msg, 80));
-            }
-            println!("      read: messages read {}", conv_id);
+        for (i, conv) in displayed.iter().enumerate() {
+            print_inbox_conversation(i + 1, conv);
         }
     }
-    if spam_msg_count > 0 {
+    if spam_count > 0 {
         println!(
             "  ({} recruiter message(s) hidden, use --all to show)",
-            spam_msg_count
+            spam_count
         );
     }
-    println!();
+}
 
-    // --- Pending invitations ---
-    let inv_elements = invitations
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+fn is_unread_conversation(conv: &Value) -> bool {
+    let read_false = conv.get("read").and_then(|r| r.as_bool()) == Some(false);
+    let has_unread = conv
+        .get("unreadCount")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0)
+        > 0;
+    read_false || has_unread
+}
 
-    let spam_inv_count = if show_all {
-        0
-    } else {
-        inv_elements
-            .iter()
-            .filter(|i| is_spam_invitation(i))
-            .count()
-    };
-    let displayed_invs: Vec<&serde_json::Value> = inv_elements
-        .iter()
-        .filter(|i| show_all || !is_spam_invitation(i))
-        .collect();
-
-    println!("Pending Invitations ({})", displayed_invs.len());
-    println!("---");
-    if displayed_invs.is_empty() {
-        println!("  (none)");
-    } else {
-        for (i, inv) in displayed_invs.iter().enumerate() {
-            let name = inv
-                .get("title")
-                .and_then(|t| t.get("text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            let headline = inv
-                .get("subtitle")
-                .and_then(|t| t.get("text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let sent_time = inv
-                .get("sentTimeLabel")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let invitation_id = inv
-                .get("invitation")
-                .and_then(|i| i.get("entityUrn"))
-                .and_then(|v| v.as_str())
-                .and_then(|u| u.rsplit(':').next())
-                .unwrap_or("");
-            let secret = inv
-                .get("invitation")
-                .and_then(|i| i.get("sharedSecret"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            print!("  [{}] {}", i + 1, name);
-            if !sent_time.is_empty() {
-                print!("  ({})", sent_time);
-            }
-            println!();
-            if !headline.is_empty() {
-                println!("      {}", truncate_with_ellipsis(headline, 60));
-            }
-            if !invitation_id.is_empty() {
-                println!(
-                    "      accept: connections accept {} --secret \"{}\"",
-                    invitation_id, secret
-                );
-            }
+/// Split a slice into (displayed, hidden_count) using `is_spam`. When
+/// `show_all` is true everything is displayed and the hidden count is 0.
+fn filter_spam<'a, F>(items: &[&'a Value], show_all: bool, is_spam: F) -> (Vec<&'a Value>, usize)
+where
+    F: Fn(&Value) -> bool,
+{
+    if show_all {
+        return (items.to_vec(), 0);
+    }
+    let mut displayed = Vec::with_capacity(items.len());
+    let mut hidden = 0usize;
+    for item in items {
+        if is_spam(item) {
+            hidden += 1;
+        } else {
+            displayed.push(*item);
         }
     }
-    if spam_inv_count > 0 {
+    (displayed, hidden)
+}
+
+fn print_inbox_conversation(index: usize, conv: &Value) {
+    let title = conv.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let names = extract_conversation_names(conv);
+    let display = if !title.is_empty() {
+        title.to_string()
+    } else if !names.is_empty() {
+        names.join(", ")
+    } else {
+        "(unknown)".to_string()
+    };
+    let conv_id = conversation_id(conv);
+    let last_msg = first_message_body(conv).unwrap_or_default();
+    let unread_count = conv
+        .get("unreadCount")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1);
+
+    println!("  [{}] {} ({} unread)", index, display, unread_count);
+    if !last_msg.is_empty() {
+        println!("      {}", truncate_with_ellipsis(&last_msg, 80));
+    }
+    println!("      read: messages read {}", conv_id);
+}
+
+fn conversation_id(conv: &Value) -> String {
+    let backend_urn = conv
+        .get("backendUrn")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    backend_urn
+        .strip_prefix("urn:li:messagingThread:")
+        .unwrap_or(backend_urn)
+        .to_string()
+}
+
+fn first_message_body(conv: &Value) -> Option<String> {
+    conv.get("messages")
+        .and_then(|m| m.get("elements"))
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(extract_message_body)
+}
+
+fn print_pending_invitations_section(invitations: &Value, show_all: bool) {
+    let inv_refs: Vec<&Value> = elements_slice(invitations).iter().collect();
+    let (displayed, spam_count) =
+        filter_spam(inv_refs.as_slice(), show_all, |i| is_spam_invitation(i));
+
+    println!("Pending Invitations ({})", displayed.len());
+    println!("---");
+    if displayed.is_empty() {
+        println!("  (none)");
+    } else {
+        for (i, inv) in displayed.iter().enumerate() {
+            print_inbox_invitation(i + 1, inv);
+        }
+    }
+    if spam_count > 0 {
         println!(
             "  ({} recruiter invitation(s) hidden, use --all to show)",
-            spam_inv_count
+            spam_count
         );
     }
+}
+
+fn print_inbox_invitation(index: usize, inv: &Value) {
+    let name = nested_text(inv, &["title", "text"]).unwrap_or("(unknown)");
+    let headline = nested_text(inv, &["subtitle", "text"]).unwrap_or("");
+    let sent_time = inv
+        .get("sentTimeLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let invitation = inv.get("invitation");
+    let invitation_id = invitation
+        .and_then(|i| i.get("entityUrn"))
+        .and_then(|v| v.as_str())
+        .and_then(|u| u.rsplit(':').next())
+        .unwrap_or("");
+    let secret = invitation
+        .and_then(|i| i.get("sharedSecret"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    print!("  [{}] {}", index, name);
+    if !sent_time.is_empty() {
+        print!("  ({})", sent_time);
+    }
     println!();
+    if !headline.is_empty() {
+        println!("      {}", truncate_with_ellipsis(headline, 60));
+    }
+    if !invitation_id.is_empty() {
+        println!(
+            "      accept: connections accept {} --secret \"{}\"",
+            invitation_id, secret
+        );
+    }
+}
 
-    // --- Recent notifications (unread only) ---
-    let notif_elements = notifications
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
+/// Walk a nested object path, returning the final string if every step
+/// resolves and the leaf is a string.
+fn nested_text<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(key)?;
+    }
+    current.as_str()
+}
 
-    let unread_notifs: Vec<&serde_json::Value> = notif_elements
+fn print_unread_notifications_section(notifications: &Value) {
+    let unread: Vec<&Value> = elements_slice(notifications)
         .iter()
         .filter(|n| n.get("read").and_then(|r| r.as_bool()) == Some(false))
         .collect();
 
-    println!("Unread Notifications ({})", unread_notifs.len());
+    println!("Unread Notifications ({})", unread.len());
     println!("---");
-    if unread_notifs.is_empty() {
+    if unread.is_empty() {
         println!("  (all read)");
-    } else {
-        for (i, notif) in unread_notifs.iter().take(5).enumerate() {
-            let headline = notif
-                .get("headline")
-                .and_then(|h| h.get("text").and_then(|t| t.as_str()))
-                .unwrap_or("(no headline)");
-            let kicker = notif
-                .get("kicker")
-                .and_then(|k| k.get("text").and_then(|t| t.as_str()))
-                .unwrap_or("");
-
-            print!("  [{}] {}", i + 1, truncate_with_ellipsis(headline, 80));
-            if !kicker.is_empty() {
-                print!("  ({})", kicker);
-            }
-            println!();
-        }
-        if unread_notifs.len() > 5 {
-            println!("  ... and {} more", unread_notifs.len() - 5);
-        }
+        return;
     }
-
-    Ok(())
+    for (i, notif) in unread.iter().take(5).enumerate() {
+        let headline = nested_text(notif, &["headline", "text"]).unwrap_or("(no headline)");
+        let kicker = nested_text(notif, &["kicker", "text"]).unwrap_or("");
+        print!("  [{}] {}", i + 1, truncate_with_ellipsis(headline, 80));
+        if !kicker.is_empty() {
+            print!("  ({})", kicker);
+        }
+        println!();
+    }
+    if unread.len() > 5 {
+        println!("  ... and {} more", unread.len() - 5);
+    }
 }
 
 /// Handle `who <company> [--json]`.
@@ -274,11 +326,28 @@ pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
     eprintln!("Searching people at {}...", company.name);
     let people = search_people_at(&client, &company.name, &name_lower, &slug_lower).await;
 
+    let findings = WhoFindings {
+        company,
+        connections,
+        viewers,
+        messages,
+        people,
+    };
     if raw_json {
-        return print_who_json(&company, &connections, &viewers, &messages, &people);
+        return print_who_json(&findings);
     }
-    print_who_report(&company, &connections, &viewers, &messages, &people);
+    print_who_report(&findings);
     Ok(())
+}
+
+/// Aggregated network-overlap findings for `cmd_who`. Lets the print
+/// helpers take one argument instead of five.
+struct WhoFindings {
+    company: CompanySummary,
+    connections: Vec<ConnectionMatch>,
+    viewers: Vec<ViewerMatch>,
+    messages: Vec<MessageMatch>,
+    people: Vec<PersonMatch>,
 }
 
 struct CompanySummary {
@@ -512,16 +581,6 @@ fn extract_message_match(conv: &serde_json::Value) -> MessageMatch {
     }
 }
 
-/// Message bodies come back as either a bare string or a `{text: "..."}`
-/// object depending on how the conversation was rendered.
-fn extract_message_body(msg: &serde_json::Value) -> Option<String> {
-    let body = msg.get("body")?;
-    if body.is_string() {
-        return body.as_str().map(str::to_string);
-    }
-    body.get("text").and_then(|t| t.as_str()).map(str::to_string)
-}
-
 async fn search_people_at(
     client: &LinkedInClient,
     company_name: &str,
@@ -581,56 +640,41 @@ fn match_search_person(
     })
 }
 
-fn print_who_json(
-    company: &CompanySummary,
-    connections: &[ConnectionMatch],
-    viewers: &[ViewerMatch],
-    messages: &[MessageMatch],
-    people: &[PersonMatch],
-) -> Result<(), String> {
+fn print_who_json(f: &WhoFindings) -> Result<(), String> {
     let output = serde_json::json!({
         "company": {
-            "name": company.name,
-            "slug": company.slug,
-            "hq": format!("{}, {}", company.hq, company.hq_country),
-            "staff": company.staff,
-            "industry": company.industry,
+            "name": f.company.name,
+            "slug": f.company.slug,
+            "hq": format!("{}, {}", f.company.hq, f.company.hq_country),
+            "staff": f.company.staff,
+            "industry": f.company.industry,
         },
-        "connections": connections
+        "connections": f.connections
             .iter()
             .map(|c| serde_json::json!({"name": c.name, "headline": c.headline, "publicId": c.public_id}))
             .collect::<Vec<_>>(),
-        "viewers": viewers
+        "viewers": f.viewers
             .iter()
             .map(|v| serde_json::json!({"name": v.name, "headline": v.headline}))
             .collect::<Vec<_>>(),
-        "messages": messages
+        "messages": f.messages
             .iter()
             .map(|m| serde_json::json!({"name": m.name, "lastMessage": m.last_msg, "conversationId": m.conv_id}))
             .collect::<Vec<_>>(),
-        "people": people
+        "people": f.people
             .iter()
             .map(|p| serde_json::json!({"name": p.name, "headline": p.headline, "degree": p.degree, "publicId": p.public_id}))
             .collect::<Vec<_>>(),
     });
-    let pretty =
-        serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
-    println!("{}", pretty);
-    Ok(())
+    print_json(&output)
 }
 
-fn print_who_report(
-    company: &CompanySummary,
-    connections: &[ConnectionMatch],
-    viewers: &[ViewerMatch],
-    messages: &[MessageMatch],
-    people: &[PersonMatch],
-) {
-    print_company_header(company);
-    print_connections_section(connections);
-    print_viewers_section(&company.name, viewers);
-    print_messages_section(messages);
-    print_people_section(&company.name, people);
+fn print_who_report(f: &WhoFindings) {
+    print_company_header(&f.company);
+    print_connections_section(&f.connections);
+    print_viewers_section(&f.company.name, &f.viewers);
+    print_messages_section(&f.messages);
+    print_people_section(&f.company.name, &f.people);
 }
 
 fn print_company_header(company: &CompanySummary) {
@@ -708,45 +752,20 @@ fn print_people_section(company_name: &str, people: &[PersonMatch]) {
 }
 
 /// Extract participant names from a conversation element.
-pub fn extract_conversation_names(conv: &serde_json::Value) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(participants) = conv
-        .get("conversationParticipants")
+pub fn extract_conversation_names(conv: &Value) -> Vec<String> {
+    conv.get("conversationParticipants")
         .and_then(|p| p.as_array())
-    {
-        for p in participants {
-            if let Some(name) = p
-                .get("participantType")
-                .and_then(|pt| pt.get("member"))
-                .and_then(|member| {
-                    let first = member
-                        .get("firstName")
-                        .and_then(|f| {
-                            f.get("text")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| f.as_str())
-                        })
-                        .unwrap_or("");
-                    let last = member
-                        .get("lastName")
-                        .and_then(|l| {
-                            l.get("text")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| l.as_str())
-                        })
-                        .unwrap_or("");
-                    if first.is_empty() && last.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} {}", first, last).trim().to_string())
-                    }
+        .map(|participants| {
+            participants
+                .iter()
+                .filter_map(|p| {
+                    p.get("participantType")
+                        .and_then(|pt| pt.get("member"))
+                        .and_then(extract_member_name)
                 })
-            {
-                names.push(name);
-            }
-        }
-    }
-    names
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Handle `messages list [--count N] [--start N] [--json]`.
@@ -766,10 +785,7 @@ pub async fn cmd_messages_list(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&value);
     }
 
     // The API client already unwraps the GraphQL envelope to
@@ -814,10 +830,7 @@ pub async fn cmd_messages_read(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&value);
     }
 
     // The API client already unwraps the GraphQL envelope to
@@ -855,45 +868,13 @@ pub async fn cmd_messages_send(
     raw_json: bool,
 ) -> Result<(), String> {
     if !confirmed {
-        let preview = if message.chars().count() > 80 {
-            let truncated: String = message.chars().take(80).collect();
-            format!("{}…", truncated)
-        } else {
-            message.to_string()
-        };
-        return Err(format!(
-            "this will send a REAL DIRECT MESSAGE to {} that they will see in \
-             their inbox: \"{}\". Pass --yes to confirm.",
-            recipient, preview
-        ));
+        return Err(send_confirmation_error(recipient, message));
     }
 
     let (client, _path) = load_session_client()?;
-
-    // Resolve recipient to fsd_profile URN. Accepts:
-    // - Direct URN: urn:li:fsd_profile:ACoAABivN...
-    // - Vanity slug: john-doe-123
-    // - Name with spaces: "Paul Bang" (fuzzy-matched against connections)
-    let profile_urn = if recipient.starts_with("urn:li:fsd_profile:")
-        || recipient.starts_with("urn:li:member:")
-        || recipient.starts_with("urn:li:fs_miniProfile:")
-    {
-        eprintln!("Using provided URN directly.");
-        recipient.to_string()
-    } else if recipient.contains(' ') {
-        // Name-based lookup: search connections for a match.
-        eprintln!("Searching connections for '{}'...", recipient);
-        resolve_recipient_by_name(&client, recipient).await?
-    } else {
-        eprintln!("Resolving profile URN for '{}'...", recipient);
-        client
-            .resolve_profile_urn(recipient)
-            .await
-            .map_err(|e| format!("failed to resolve profile URN: {e}"))?
-    };
+    let profile_urn = resolve_send_recipient(&client, recipient).await?;
     eprintln!("Recipient URN: {}", profile_urn);
 
-    // Send the message.
     eprintln!("Sending message...");
     let value = client
         .send_message(&profile_urn, message)
@@ -901,109 +882,170 @@ pub async fn cmd_messages_send(
         .map_err(|e| format!("failed to send message: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&value)?;
     } else {
         println!("Message sent to {} ({})", recipient, profile_urn);
     }
-
     Ok(())
+}
+
+fn send_confirmation_error(recipient: &str, message: &str) -> String {
+    let preview = if message.chars().count() > 80 {
+        let truncated: String = message.chars().take(80).collect();
+        format!("{}…", truncated)
+    } else {
+        message.to_string()
+    };
+    format!(
+        "this will send a REAL DIRECT MESSAGE to {} that they will see in \
+         their inbox: \"{}\". Pass --yes to confirm.",
+        recipient, preview
+    )
+}
+
+/// Resolve a `messages send` recipient. Accepts a URN, a vanity slug, or
+/// a "First Last" name (fuzzy-matched against connections).
+async fn resolve_send_recipient(
+    client: &LinkedInClient,
+    recipient: &str,
+) -> Result<String, String> {
+    if PROFILE_URN_PREFIXES
+        .iter()
+        .any(|p| recipient.starts_with(p))
+    {
+        eprintln!("Using provided URN directly.");
+        return Ok(recipient.to_string());
+    }
+    if recipient.contains(' ') {
+        eprintln!("Searching connections for '{}'...", recipient);
+        return resolve_recipient_by_name(client, recipient).await;
+    }
+    eprintln!("Resolving profile URN for '{}'...", recipient);
+    client
+        .resolve_profile_urn(recipient)
+        .await
+        .map_err(|e| format!("failed to resolve profile URN: {e}"))
+}
+
+/// One row of the name-fuzzy-match resolver. At least one of `slug` /
+/// `urn` is always non-empty when this is constructed.
+struct NameMatch {
+    name: String,
+    slug: String,
+    urn: String,
 }
 
 /// Resolve a recipient name to a profile URN by searching connections.
 ///
-/// Fetches connections and finds the best match for the given name
-/// (case-insensitive substring match on first+last name). If multiple
-/// matches are found, lists them and asks the user to be more specific.
+/// Fetches connections (up to 200) and finds the best match for the
+/// given name (case-insensitive substring match on first+last). If
+/// multiple matches are found, lists them and asks the user to be more
+/// specific.
 async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> Result<String, String> {
-    let name_lower = name.to_lowercase();
+    let matches = scan_connections_for_name(client, &name.to_lowercase()).await?;
+    pick_unique_match(client, name, matches).await
+}
 
-    // Search through connections (fetch up to 200 to get a good match).
-    let mut offset = 0u32;
+/// Page through connections collecting every entry whose full name
+/// contains `name_lower`. Caps at 200 connections scanned.
+async fn scan_connections_for_name(
+    client: &LinkedInClient,
+    name_lower: &str,
+) -> Result<Vec<NameMatch>, String> {
     let page_size = 40u32;
-    let mut matches: Vec<(String, String, String)> = Vec::new(); // (name, slug, urn)
+    let max_scan = 200u32;
+    let mut offset = 0u32;
+    let mut matches: Vec<NameMatch> = Vec::new();
 
     loop {
         let value = client
             .get_connections(offset, page_size)
             .await
             .map_err(|e| format!("failed to fetch connections: {e}"))?;
-
-        let elements = value
-            .get("elements")
-            .and_then(|e| e.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let elements = elements_slice(&value);
 
         for conn in elements {
-            let mini = match conn.get("miniProfile") {
-                Some(m) => m,
-                None => continue,
-            };
-
-            let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
-            let last = mini.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
-            let full_name = format!("{} {}", first, last);
-            let slug = mini
-                .get("publicIdentifier")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let urn = mini
-                .get("dashEntityUrn")
-                .or_else(|| mini.get("entityUrn"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if full_name.to_lowercase().contains(&name_lower) {
-                matches.push((
-                    full_name.trim().to_string(),
-                    slug.to_string(),
-                    urn.to_string(),
-                ));
+            if let Some(m) = match_connection_by_name(conn, name_lower) {
+                matches.push(m);
             }
         }
 
         let page_count = elements.len() as u32;
-        if page_count < page_size || offset + page_count >= 200 {
+        if page_count < page_size || offset + page_count >= max_scan {
             break;
         }
         offset += page_count;
     }
 
+    Ok(matches)
+}
+
+fn match_connection_by_name(conn: &Value, name_lower: &str) -> Option<NameMatch> {
+    let mini = conn.get("miniProfile")?;
+    let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
+    let last = mini.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
+    let full_name = format!("{} {}", first, last);
+    if !full_name.to_lowercase().contains(name_lower) {
+        return None;
+    }
+    let slug = mini
+        .get("publicIdentifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let urn = mini
+        .get("dashEntityUrn")
+        .or_else(|| mini.get("entityUrn"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Some(NameMatch {
+        name: full_name.trim().to_string(),
+        slug: slug.to_string(),
+        urn: urn.to_string(),
+    })
+}
+
+/// Resolve a single match to an fsd_profile URN. Returns an ambiguity
+/// error if multiple matches were collected, or a not-found error if
+/// none were.
+async fn pick_unique_match(
+    client: &LinkedInClient,
+    name: &str,
+    matches: Vec<NameMatch>,
+) -> Result<String, String> {
     match matches.len() {
         0 => Err(format!(
             "no connection found matching '{}'. Try a vanity slug instead.",
             name
         )),
-        1 => {
-            let (matched_name, slug, urn) = &matches[0];
-            eprintln!("Matched: {} ({})", matched_name, slug);
-            let profile_urn = if !urn.is_empty() {
-                // Convert fs_miniProfile URN to fsd_profile if needed.
-                urn.replace("fs_miniProfile", "fsd_profile")
-            } else if !slug.is_empty() {
-                client
-                    .resolve_profile_urn(slug)
-                    .await
-                    .map_err(|e| format!("failed to resolve profile: {e}"))?
-            } else {
-                return Err("matched connection has no URN or slug".to_string());
-            };
-            Ok(profile_urn)
-        }
-        _ => {
-            eprintln!("Multiple matches for '{}':", name);
-            for (i, (n, s, _)) in matches.iter().enumerate() {
-                eprintln!("  [{}] {} ({})", i + 1, n, s);
-            }
-            Err(format!(
-                "ambiguous name '{}': {} matches found. Use a more specific name or the vanity slug.",
-                name,
-                matches.len()
-            ))
-        }
+        1 => urn_for_match(client, &matches[0]).await,
+        _ => Err(format_ambiguous_error(name, &matches)),
     }
+}
+
+async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> Result<String, String> {
+    eprintln!("Matched: {} ({})", m.name, m.slug);
+    if !m.urn.is_empty() {
+        return Ok(m.urn.replace("fs_miniProfile", "fsd_profile"));
+    }
+    if !m.slug.is_empty() {
+        return client
+            .resolve_profile_urn(&m.slug)
+            .await
+            .map_err(|e| format!("failed to resolve profile: {e}"));
+    }
+    Err("matched connection has no URN or slug".to_string())
+}
+
+fn format_ambiguous_error(name: &str, matches: &[NameMatch]) -> String {
+    eprintln!("Multiple matches for '{}':", name);
+    for (i, m) in matches.iter().enumerate() {
+        eprintln!("  [{}] {} ({})", i + 1, m.name, m.slug);
+    }
+    format!(
+        "ambiguous name '{}': {} matches found. Use a more specific name or the vanity slug.",
+        name,
+        matches.len()
+    )
 }
 
 /// Handle `messages reply <conversation_id> <message> [--yes] [--json]`.
@@ -1016,87 +1058,10 @@ pub async fn cmd_messages_reply(
     raw_json: bool,
 ) -> Result<(), String> {
     if !confirmed {
-        // Show the last few messages for context before confirming.
-        let (client, _path) = load_session_client()?;
-        let events = client
-            .get_conversation_events(conversation_id, None)
-            .await
-            .map_err(|e| format!("failed to load conversation: {e}"))?;
-
-        let elements = events
-            .get("elements")
-            .and_then(|e| e.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-
-        eprintln!("--- Last messages in thread ---");
-        // Show last 3 messages for context.
-        let show = if elements.len() > 3 {
-            &elements[elements.len() - 3..]
-        } else {
-            elements
-        };
-        for msg in show {
-            let sender = msg
-                .get("sender")
-                .and_then(|s| s.get("participantType"))
-                .and_then(|pt| pt.get("member"))
-                .and_then(|m| {
-                    let first = m
-                        .get("firstName")
-                        .and_then(|f| {
-                            f.get("text")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| f.as_str())
-                        })
-                        .unwrap_or("");
-                    let last = m
-                        .get("lastName")
-                        .and_then(|l| {
-                            l.get("text")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| l.as_str())
-                        })
-                        .unwrap_or("");
-                    if first.is_empty() && last.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{} {}", first, last).trim().to_string())
-                    }
-                })
-                .unwrap_or_else(|| {
-                    msg.get("sender")
-                        .and_then(|s| s.get("hostIdentityUrn"))
-                        .and_then(|u| u.as_str())
-                        .and_then(|u| u.strip_prefix("urn:li:fsd_profile:"))
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-            let body = msg
-                .get("body")
-                .and_then(|b| {
-                    if b.is_string() {
-                        b.as_str().map(|s| s.to_string())
-                    } else {
-                        b.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string())
-                    }
-                })
-                .unwrap_or_default();
-            eprintln!("  {}: {}", sender, truncate_with_ellipsis(&body, 100));
-        }
-        eprintln!("---");
-        eprintln!("Your reply: {}", message);
-        eprintln!();
-        return Err(
-            "this will send a REAL MESSAGE in this LinkedIn conversation. Pass --yes to confirm."
-                .to_string(),
-        );
+        return preview_thread_then_abort(conversation_id, message).await;
     }
 
     let (client, _path) = load_session_client()?;
-
     eprintln!("Replying to conversation {}...", conversation_id);
     let value = client
         .reply_to_conversation(conversation_id, message)
@@ -1104,12 +1069,54 @@ pub async fn cmd_messages_reply(
         .map_err(|e| format!("failed to send reply: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&value)?;
     } else {
         println!("Reply sent to conversation {}", conversation_id);
     }
-
     Ok(())
+}
+
+async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> Result<(), String> {
+    let (client, _path) = load_session_client()?;
+    let events = client
+        .get_conversation_events(conversation_id, None)
+        .await
+        .map_err(|e| format!("failed to load conversation: {e}"))?;
+    let elements = elements_slice(&events);
+    let show = elements
+        .get(elements.len().saturating_sub(3)..)
+        .unwrap_or(elements);
+
+    eprintln!("--- Last messages in thread ---");
+    for msg in show {
+        let sender = sender_display_name(msg);
+        let body = extract_message_body(msg).unwrap_or_default();
+        eprintln!("  {}: {}", sender, truncate_with_ellipsis(&body, 100));
+    }
+    eprintln!("---");
+    eprintln!("Your reply: {}", message);
+    eprintln!();
+    Err(
+        "this will send a REAL MESSAGE in this LinkedIn conversation. Pass --yes to confirm."
+            .to_string(),
+    )
+}
+
+/// Best-effort sender label. Prefers the structured member name; falls
+/// back to the trailing segment of `hostIdentityUrn`, then "unknown".
+fn sender_display_name(msg: &Value) -> String {
+    let sender = msg.get("sender");
+    let from_member = sender
+        .and_then(|s| s.get("participantType"))
+        .and_then(|pt| pt.get("member"))
+        .and_then(extract_member_name);
+    if let Some(name) = from_member {
+        return name;
+    }
+    sender
+        .and_then(|s| s.get("hostIdentityUrn"))
+        .and_then(|u| u.as_str())
+        .and_then(|u| u.strip_prefix("urn:li:fsd_profile:"))
+        .unwrap_or("unknown")
+        .to_string()
 }

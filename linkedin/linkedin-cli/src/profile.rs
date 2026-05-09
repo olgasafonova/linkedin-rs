@@ -31,7 +31,11 @@ pub async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
 ///
 /// Loads the session, creates a client, calls the identity/profiles endpoint
 /// with decoration for full field projection, and prints the result.
-pub async fn cmd_profile_view(public_id: &str, raw_json: bool, summary: bool) -> Result<(), String> {
+pub async fn cmd_profile_view(
+    public_id: &str,
+    raw_json: bool,
+    summary: bool,
+) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let profile = client
@@ -225,7 +229,10 @@ pub async fn cmd_profile_audit(raw_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_audit_findings(profile: &serde_json::Value, full_profile: bool) -> Vec<serde_json::Value> {
+fn collect_audit_findings(
+    profile: &serde_json::Value,
+    full_profile: bool,
+) -> Vec<serde_json::Value> {
     let mut findings = Vec::new();
     let current_year = chrono::Utc::now().year() as u64;
 

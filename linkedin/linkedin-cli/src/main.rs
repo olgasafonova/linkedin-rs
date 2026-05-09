@@ -35,8 +35,7 @@ use feed::{
     cmd_feed_view,
 };
 use messages::{
-    cmd_inbox, cmd_messages_list, cmd_messages_read, cmd_messages_reply, cmd_messages_send,
-    cmd_who,
+    cmd_inbox, cmd_messages_list, cmd_messages_read, cmd_messages_reply, cmd_messages_send, cmd_who,
 };
 use notifications::{cmd_notifications_list, cmd_notifications_mentions};
 use profile::{
@@ -71,7 +70,9 @@ async fn dispatch_misc(cmd: Commands) {
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "li", &mut std::io::stdout());
         }
-        _ => unreachable!("dispatch_misc only handles Events/Company/Notifications/Inbox/Who/Completions"),
+        _ => unreachable!(
+            "dispatch_misc only handles Events/Company/Notifications/Inbox/Who/Completions"
+        ),
     }
 }
 
@@ -274,9 +275,7 @@ async fn dispatch_search(action: SearchAction) {
 
 async fn dispatch_events(action: EventsAction) {
     match action {
-        EventsAction::View { event_id, json } => {
-            exit_on_err(cmd_event_view(&event_id, json).await)
-        }
+        EventsAction::View { event_id, json } => exit_on_err(cmd_event_view(&event_id, json).await),
         EventsAction::Attendees {
             event_id,
             count,

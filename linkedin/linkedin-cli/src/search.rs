@@ -221,9 +221,7 @@ fn iter_cluster_items<'a>(
 fn nth_cached_item(cache_kind: &str, item_kind: &str, index: usize) -> Result<Value, String> {
     let cache = load_search_cache(cache_kind)?;
     let resp = parse_search_response(&cache)?;
-    let items: Vec<Value> = iter_cluster_items(&resp, item_kind)
-        .cloned()
-        .collect();
+    let items: Vec<Value> = iter_cluster_items(&resp, item_kind).cloned().collect();
     if index == 0 || index > items.len() {
         return Err(format!(
             "index {} out of range (search has {} results)",

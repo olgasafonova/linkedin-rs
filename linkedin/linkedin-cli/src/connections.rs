@@ -445,7 +445,11 @@ async fn invitation_op(
     let invitation_urn = build_invitation_urn(invitation_id);
 
     let value = match op {
-        InvitationOp::Accept => client.accept_invitation(&invitation_urn, shared_secret).await,
+        InvitationOp::Accept => {
+            client
+                .accept_invitation(&invitation_urn, shared_secret)
+                .await
+        }
         InvitationOp::Withdraw => {
             client
                 .withdraw_invitation(&invitation_urn, shared_secret)

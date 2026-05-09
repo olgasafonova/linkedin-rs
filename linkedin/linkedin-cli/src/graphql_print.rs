@@ -4,7 +4,10 @@ use crate::util::truncate_with_ellipsis;
 pub fn print_graphql_conversation(index: usize, conv: &serde_json::Value) {
     let conv_id = conv_thread_id(conv);
     let unread_marker = if conv_is_read(conv) { " " } else { "*" };
-    let unread_count = conv.get("unreadCount").and_then(|n| n.as_u64()).unwrap_or(0);
+    let unread_count = conv
+        .get("unreadCount")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
 
     let display_name = conv_display_name(conv);
 
@@ -184,7 +187,9 @@ fn message_body_text(msg: &serde_json::Value) -> Option<String> {
     if body.is_string() {
         return body.as_str().map(str::to_string);
     }
-    body.get("text").and_then(|t| t.as_str()).map(str::to_string)
+    body.get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 fn render_content_lines(msg: &serde_json::Value) -> Vec<String> {
