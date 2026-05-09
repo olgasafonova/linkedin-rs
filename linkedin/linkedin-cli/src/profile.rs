@@ -192,7 +192,6 @@ pub async fn cmd_profile_viewers(raw_json: bool) -> Result<(), String> {
 pub async fn cmd_profile_audit(raw_json: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
-    // Get the user's public ID from /me, then fetch full profile.
     let me = client
         .get_me()
         .await
@@ -212,228 +211,278 @@ pub async fn cmd_profile_audit(raw_json: bool) -> Result<(), String> {
                 "warning: full profile fetch failed ({}), using basic /me data",
                 e
             );
-            // Build a minimal profile-like object from /me miniProfile.
             let fallback = mini.cloned().unwrap_or(serde_json::json!({}));
             (fallback, false)
         }
     };
 
-    let mut findings: Vec<serde_json::Value> = Vec::new();
+    let findings = collect_audit_findings(&profile, full_profile);
+
+    if raw_json {
+        return print_audit_json(public_id, &findings);
+    }
+    print_audit_report(public_id, &findings);
+    Ok(())
+}
+
+fn collect_audit_findings(profile: &serde_json::Value, full_profile: bool) -> Vec<serde_json::Value> {
+    let mut findings = Vec::new();
     let current_year = chrono::Utc::now().year() as u64;
 
-    // Check: headline (in full profile it's "headline", in miniProfile it's "occupation")
-    let headline = profile
-        .get("headline")
-        .and_then(|v| v.as_str())
-        .or_else(|| profile.get("occupation").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    if headline.is_empty() {
-        findings.push(serde_json::json!({
-            "field": "headline",
-            "severity": "high",
-            "message": "No headline set. This is the first thing people see."
-        }));
+    if let Some(f) = check_headline(profile) {
+        findings.push(f);
+    }
+    if let Some(f) = check_summary(profile) {
+        findings.push(f);
     }
 
-    // Check: about / summary
-    let summary = profile
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if summary.is_empty() {
-        findings.push(serde_json::json!({
-            "field": "summary",
-            "severity": "medium",
-            "message": "Empty About section. Add a brief professional summary."
-        }));
-    } else if summary.len() < 50 {
-        findings.push(serde_json::json!({
-            "field": "summary",
-            "severity": "low",
-            "message": format!("About section is very short ({} chars). Consider expanding.", summary.len())
-        }));
-    }
-
-    // The remaining checks require the full profile response.
     if !full_profile {
         findings.push(serde_json::json!({
             "field": "profile",
             "severity": "low",
             "message": "Full profile unavailable; positions, education, and connections checks skipped."
         }));
+        return findings;
     }
 
-    if full_profile {
-        // Check: positions
-        let position_groups = profile
-            .get("profilePositionGroups")
-            .and_then(|p| p.get("elements"))
-            .and_then(|e| e.as_array());
+    findings.extend(check_positions(profile, current_year));
+    if let Some(f) = check_education(profile) {
+        findings.push(f);
+    }
+    if let Some(f) = check_connections(profile) {
+        findings.push(f);
+    }
+    if let Some(f) = check_location(profile) {
+        findings.push(f);
+    }
+    findings
+}
 
-        let mut has_current_role = false;
-        let mut newest_end_year: Option<u64> = None;
+/// Headline lives at `headline` in the full profile and `occupation` in the
+/// miniProfile fallback.
+fn check_headline(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let headline = profile
+        .get("headline")
+        .and_then(|v| v.as_str())
+        .or_else(|| profile.get("occupation").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if !headline.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "field": "headline",
+        "severity": "high",
+        "message": "No headline set. This is the first thing people see."
+    }))
+}
 
-        if let Some(groups) = position_groups {
-            for group in groups {
-                if let Some(pos_list) = group
-                    .get("profilePositionInPositionGroup")
-                    .and_then(|p| p.get("elements"))
-                    .and_then(|e| e.as_array())
-                {
-                    for pos in pos_list {
-                        let date_range = pos.get("dateRange");
-                        let end_year = date_range
-                            .and_then(|dr| dr.get("end"))
-                            .and_then(|d| d.get("year"))
-                            .and_then(|y| y.as_u64());
-                        let start_year = date_range
-                            .and_then(|dr| dr.get("start"))
-                            .and_then(|d| d.get("year"))
-                            .and_then(|y| y.as_u64());
+fn check_summary(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let summary = profile
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if summary.is_empty() {
+        return Some(serde_json::json!({
+            "field": "summary",
+            "severity": "medium",
+            "message": "Empty About section. Add a brief professional summary."
+        }));
+    }
+    if summary.len() < 50 {
+        return Some(serde_json::json!({
+            "field": "summary",
+            "severity": "low",
+            "message": format!("About section is very short ({} chars). Consider expanding.", summary.len())
+        }));
+    }
+    None
+}
 
-                        if end_year.is_none() {
-                            has_current_role = true;
-                            if let Some(sy) = start_year {
-                                if current_year.saturating_sub(sy) > 5 {
-                                    let title = pos
-                                        .get("title")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("(untitled)");
-                                    findings.push(serde_json::json!({
-                                        "field": "positions",
-                                        "severity": "low",
-                                        "message": format!("Current role '{}' started {} years ago. Confirm it's still accurate.", title, current_year - sy)
-                                    }));
-                                }
-                            }
-                        }
+fn check_positions(profile: &serde_json::Value, current_year: u64) -> Vec<serde_json::Value> {
+    let positions: Vec<&serde_json::Value> = iter_positions(profile).collect();
 
-                        if let Some(ey) = end_year {
-                            newest_end_year =
-                                Some(newest_end_year.map_or(ey, |prev: u64| prev.max(ey)));
-                        }
-                    }
-                }
-            }
+    if positions.is_empty() {
+        return vec![serde_json::json!({
+            "field": "positions",
+            "severity": "high",
+            "message": "No positions listed. Add your work experience."
+        })];
+    }
 
-            if groups.is_empty() {
-                findings.push(serde_json::json!({
-                    "field": "positions",
-                    "severity": "high",
-                    "message": "No positions listed. Add your work experience."
-                }));
-            } else if !has_current_role {
-                let stale_msg = if let Some(ey) = newest_end_year {
-                    format!("No current position. Most recent role ended in {}.", ey)
-                } else {
-                    "No current position. Your profile may look inactive.".to_string()
-                };
-                findings.push(serde_json::json!({
-                    "field": "positions",
-                    "severity": "high",
-                    "message": stale_msg
-                }));
-            }
-        } else {
-            findings.push(serde_json::json!({
-                "field": "positions",
-                "severity": "high",
-                "message": "No positions listed. Add your work experience."
-            }));
-        }
+    let mut findings = Vec::new();
+    let mut has_current_role = false;
+    let mut newest_end_year: Option<u64> = None;
 
-        // Check: education
-        let edu_list = profile
-            .get("profileEducations")
-            .and_then(|e| e.get("elements"))
-            .and_then(|e| e.as_array());
-        if edu_list.is_none_or(|l| l.is_empty()) {
-            findings.push(serde_json::json!({
-                "field": "education",
-                "severity": "low",
-                "message": "No education listed."
-            }));
-        }
+    for pos in positions {
+        let date_range = pos.get("dateRange");
+        let end_year = date_range
+            .and_then(|dr| dr.get("end"))
+            .and_then(|d| d.get("year"))
+            .and_then(|y| y.as_u64());
+        let start_year = date_range
+            .and_then(|dr| dr.get("start"))
+            .and_then(|d| d.get("year"))
+            .and_then(|y| y.as_u64());
 
-        // Check: connection count
-        let connections = profile
-            .get("networkInfo")
-            .and_then(|n| n.get("connectionsCount").and_then(|v| v.as_u64()))
-            .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()));
-        if let Some(count) = connections {
-            if count < 50 {
-                findings.push(serde_json::json!({
-                    "field": "connections",
-                    "severity": "low",
-                    "message": format!("Only {} connections. Growing your network improves visibility.", count)
-                }));
+        if end_year.is_none() {
+            has_current_role = true;
+            if let Some(f) = stale_current_role_finding(pos, start_year, current_year) {
+                findings.push(f);
             }
         }
-
-        // Check: location
-        let has_location = profile
-            .get("geoLocation")
-            .and_then(|g| g.get("geo"))
-            .and_then(|g| g.get("defaultLocalizedName"))
-            .and_then(|v| v.as_str())
-            .is_some();
-        if !has_location {
-            findings.push(serde_json::json!({
-                "field": "location",
-                "severity": "low",
-                "message": "No location set. Recruiters and connections filter by location."
-            }));
+        if let Some(ey) = end_year {
+            newest_end_year = Some(newest_end_year.map_or(ey, |prev: u64| prev.max(ey)));
         }
     }
 
-    if raw_json {
-        let output = serde_json::json!({
-            "publicId": public_id,
-            "findings": findings,
-            "score": if findings.is_empty() { "complete" } else { "needs_attention" }
-        });
-        let pretty =
-            serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+    if !has_current_role {
+        let msg = match newest_end_year {
+            Some(ey) => format!("No current position. Most recent role ended in {}.", ey),
+            None => "No current position. Your profile may look inactive.".to_string(),
+        };
+        findings.push(serde_json::json!({
+            "field": "positions",
+            "severity": "high",
+            "message": msg
+        }));
     }
 
-    // Human-readable output.
+    findings
+}
+
+/// Flatten the two-level `profilePositionGroups[].profilePositionInPositionGroup[]`
+/// nesting into a single iterator over individual positions.
+fn iter_positions(profile: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    profile
+        .get("profilePositionGroups")
+        .and_then(|p| p.get("elements"))
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|group| {
+            group
+                .get("profilePositionInPositionGroup")
+                .and_then(|p| p.get("elements"))
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+        })
+}
+
+fn stale_current_role_finding(
+    pos: &serde_json::Value,
+    start_year: Option<u64>,
+    current_year: u64,
+) -> Option<serde_json::Value> {
+    let sy = start_year?;
+    if current_year.saturating_sub(sy) <= 5 {
+        return None;
+    }
+    let title = pos
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(untitled)");
+    Some(serde_json::json!({
+        "field": "positions",
+        "severity": "low",
+        "message": format!("Current role '{}' started {} years ago. Confirm it's still accurate.", title, current_year - sy)
+    }))
+}
+
+fn check_education(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let edu_list = profile
+        .get("profileEducations")
+        .and_then(|e| e.get("elements"))
+        .and_then(|e| e.as_array());
+    if edu_list.is_some_and(|l| !l.is_empty()) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "field": "education",
+        "severity": "low",
+        "message": "No education listed."
+    }))
+}
+
+fn check_connections(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let count = profile
+        .get("networkInfo")
+        .and_then(|n| n.get("connectionsCount").and_then(|v| v.as_u64()))
+        .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()))?;
+    if count >= 50 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "field": "connections",
+        "severity": "low",
+        "message": format!("Only {} connections. Growing your network improves visibility.", count)
+    }))
+}
+
+fn check_location(profile: &serde_json::Value) -> Option<serde_json::Value> {
+    let has_location = profile
+        .get("geoLocation")
+        .and_then(|g| g.get("geo"))
+        .and_then(|g| g.get("defaultLocalizedName"))
+        .and_then(|v| v.as_str())
+        .is_some();
+    if has_location {
+        return None;
+    }
+    Some(serde_json::json!({
+        "field": "location",
+        "severity": "low",
+        "message": "No location set. Recruiters and connections filter by location."
+    }))
+}
+
+fn print_audit_json(public_id: &str, findings: &[serde_json::Value]) -> Result<(), String> {
+    let output = serde_json::json!({
+        "publicId": public_id,
+        "findings": findings,
+        "score": if findings.is_empty() { "complete" } else { "needs_attention" }
+    });
+    let pretty =
+        serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+fn print_audit_report(public_id: &str, findings: &[serde_json::Value]) {
     println!("Profile Audit: {}", public_id);
     println!("===");
 
     if findings.is_empty() {
         println!("  All clear. No staleness signals detected.");
-    } else {
-        let high_count = findings.iter().filter(|f| f["severity"] == "high").count();
-        let medium_count = findings
-            .iter()
-            .filter(|f| f["severity"] == "medium")
-            .count();
-        let low_count = findings.iter().filter(|f| f["severity"] == "low").count();
-
-        for finding in &findings {
-            let severity = finding["severity"].as_str().unwrap_or("?");
-            let msg = finding["message"].as_str().unwrap_or("");
-            let marker = match severity {
-                "high" => "!!",
-                "medium" => " !",
-                _ => "  ",
-            };
-            println!("  {} {}", marker, msg);
-        }
-
-        println!();
-        println!(
-            "  {} issue(s): {} high, {} medium, {} low",
-            findings.len(),
-            high_count,
-            medium_count,
-            low_count
-        );
+        return;
     }
 
-    Ok(())
+    let high_count = findings.iter().filter(|f| f["severity"] == "high").count();
+    let medium_count = findings
+        .iter()
+        .filter(|f| f["severity"] == "medium")
+        .count();
+    let low_count = findings.iter().filter(|f| f["severity"] == "low").count();
+
+    for finding in findings {
+        let severity = finding["severity"].as_str().unwrap_or("?");
+        let msg = finding["message"].as_str().unwrap_or("");
+        let marker = match severity {
+            "high" => "!!",
+            "medium" => " !",
+            _ => "  ",
+        };
+        println!("  {} {}", marker, msg);
+    }
+
+    println!();
+    println!(
+        "  {} issue(s): {} high, {} medium, {} low",
+        findings.len(),
+        high_count,
+        medium_count,
+        low_count
+    );
 }
 
 /// Print a human-readable summary of the wvmpCards response.

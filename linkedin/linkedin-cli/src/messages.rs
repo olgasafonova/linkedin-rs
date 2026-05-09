@@ -253,27 +253,86 @@ pub async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
 pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
-    // 1. Fetch company info.
     eprintln!("Looking up {}...", company_slug);
-    let company = client
+    let company_data = client
         .get_company(company_slug)
         .await
         .map_err(|e| format!("company lookup failed: {e}"))?;
+    let company = summarize_company(&company_data, company_slug);
+    let name_lower = company.name.to_lowercase();
+    let slug_lower = company_slug.to_lowercase();
 
-    let company_name = company
+    eprintln!("Scanning connections...");
+    let connections = scan_connections_at(&client, &name_lower, &slug_lower).await?;
+
+    eprintln!("Checking profile viewers...");
+    let viewers = scan_viewers_at(&client, &company.name, &name_lower).await;
+
+    eprintln!("Checking messages...");
+    let messages = scan_messages_with(&client, &name_lower).await;
+
+    eprintln!("Searching people at {}...", company.name);
+    let people = search_people_at(&client, &company.name, &name_lower, &slug_lower).await;
+
+    if raw_json {
+        return print_who_json(&company, &connections, &viewers, &messages, &people);
+    }
+    print_who_report(&company, &connections, &viewers, &messages, &people);
+    Ok(())
+}
+
+struct CompanySummary {
+    name: String,
+    slug: String,
+    hq: String,
+    hq_country: String,
+    staff: u64,
+    industry: String,
+    tagline: String,
+}
+
+struct ConnectionMatch {
+    name: String,
+    headline: String,
+    public_id: String,
+}
+
+struct ViewerMatch {
+    name: String,
+    headline: String,
+}
+
+struct MessageMatch {
+    name: String,
+    last_msg: String,
+    conv_id: String,
+}
+
+struct PersonMatch {
+    name: String,
+    headline: String,
+    degree: String,
+    public_id: String,
+}
+
+fn summarize_company(company: &serde_json::Value, slug: &str) -> CompanySummary {
+    let name = company
         .get("name")
         .and_then(|v| v.as_str())
-        .unwrap_or(company_slug);
+        .unwrap_or(slug)
+        .to_string();
     let hq = company
         .get("headquarter")
         .and_then(|h| h.get("city"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let hq_country = company
         .get("headquarter")
         .and_then(|h| h.get("country"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let staff = company
         .get("staffCount")
         .and_then(|v| v.as_u64())
@@ -284,18 +343,30 @@ pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
         .and_then(|a| a.first())
         .and_then(|i| i.get("localizedName"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let tagline = company
         .get("tagline")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+    CompanySummary {
+        name,
+        slug: slug.to_string(),
+        hq,
+        hq_country,
+        staff,
+        industry,
+        tagline,
+    }
+}
 
-    // Build search terms: company name and common variants.
-    let name_lower = company_name.to_lowercase();
-
-    // 2. Scan connections (all pages) for people at this company.
-    eprintln!("Scanning connections...");
-    let mut my_connections: Vec<(String, String, String)> = Vec::new(); // (name, headline, public_id)
+async fn scan_connections_at(
+    client: &LinkedInClient,
+    name_lower: &str,
+    slug_lower: &str,
+) -> Result<Vec<ConnectionMatch>, String> {
+    let mut matches = Vec::new();
     let page_size = 40u32;
     let mut offset = 0u32;
     loop {
@@ -307,30 +378,8 @@ pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
             serde_json::from_value(value).map_err(|e| format!("parse error: {e}"))?;
 
         for element in &resp.elements {
-            let mini = element.get("miniProfile");
-            let first = mini
-                .and_then(|m| m.get("firstName").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let last = mini
-                .and_then(|m| m.get("lastName").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let headline = mini
-                .and_then(|m| m.get("occupation").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let pub_id = mini
-                .and_then(|m| m.get("publicIdentifier").and_then(|v| v.as_str()))
-                .unwrap_or("");
-
-            if headline.to_lowercase().contains(&name_lower)
-                || headline
-                    .to_lowercase()
-                    .contains(&company_slug.to_lowercase())
-            {
-                my_connections.push((
-                    format!("{} {}", first, last).trim().to_string(),
-                    headline.to_string(),
-                    pub_id.to_string(),
-                ));
+            if let Some(m) = match_connection_at(element, name_lower, slug_lower) {
+                matches.push(m);
             }
         }
 
@@ -345,230 +394,317 @@ pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
         }
         offset += page_count;
     }
+    Ok(matches)
+}
 
-    // 3. Check profile viewers for anyone at this company.
-    eprintln!("Checking profile viewers...");
-    let mut viewers_at_company: Vec<(String, String)> = Vec::new(); // (name, headline)
-    if let Ok(viewers_data) = client.get_profile_viewers().await {
-        let viewers_str = serde_json::to_string(&viewers_data).unwrap_or_default();
-        // Quick scan: if company name appears anywhere in the viewers response,
-        // extract the individual viewer cards.
-        if viewers_str.to_lowercase().contains(&name_lower) {
-            if let Some(elements) = viewers_data.get("elements").and_then(|e| e.as_array()) {
-                for el in elements {
-                    let el_str = serde_json::to_string(el).unwrap_or_default();
-                    if el_str.to_lowercase().contains(&name_lower) {
-                        // Try to extract name and headline from the deeply nested structure.
-                        let name = el
-                            .pointer("/value/com.linkedin.voyager.identity.me.WvmpViewersCard/insightCards")
-                            .and_then(|cards| cards.as_array())
-                            .and_then(|arr| arr.iter().find(|c| {
-                                serde_json::to_string(c).unwrap_or_default().to_lowercase().contains(&name_lower)
-                            }))
-                            .and_then(|card| {
-                                // Extract from card text
-                                card.pointer("/value/com.linkedin.voyager.identity.me.WvmpSummaryInsightCard/cards")
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|arr| arr.iter().find(|c| {
-                                        serde_json::to_string(c).unwrap_or_default().to_lowercase().contains(&name_lower)
-                                    }))
-                            });
-                        if name.is_some() {
-                            viewers_at_company.push((
-                                "(viewer from company)".to_string(),
-                                company_name.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+fn match_connection_at(
+    element: &serde_json::Value,
+    name_lower: &str,
+    slug_lower: &str,
+) -> Option<ConnectionMatch> {
+    let mini = element.get("miniProfile")?;
+    let headline = mini
+        .get("occupation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let h_lower = headline.to_lowercase();
+    if !h_lower.contains(name_lower) && !h_lower.contains(slug_lower) {
+        return None;
     }
+    let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
+    let last = mini.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
+    let public_id = mini
+        .get("publicIdentifier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Some(ConnectionMatch {
+        name: format!("{} {}", first, last).trim().to_string(),
+        headline: headline.to_string(),
+        public_id: public_id.to_string(),
+    })
+}
 
-    // 4. Check recent messages for conversations with people at this company.
-    eprintln!("Checking messages...");
-    let mut messages_from_company: Vec<(String, String, String)> = Vec::new(); // (name, last_msg, conv_id)
-    if let Ok(conversations) = client.get_conversations(20, None).await {
-        if let Some(elements) = conversations.get("elements").and_then(|e| e.as_array()) {
-            for conv in elements {
-                let conv_str = serde_json::to_string(conv).unwrap_or_default();
-                if conv_str.to_lowercase().contains(&name_lower) {
-                    let names = extract_conversation_names(conv);
-                    let display = names.join(", ");
-                    let last_msg = conv
-                        .get("messages")
-                        .and_then(|m| m.get("elements"))
-                        .and_then(|e| e.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|msg| {
-                            msg.get("body").and_then(|b| {
-                                if b.is_string() {
-                                    b.as_str().map(|s| s.to_string())
-                                } else {
-                                    b.get("text")
-                                        .and_then(|t| t.as_str())
-                                        .map(|s| s.to_string())
-                                }
-                            })
-                        })
-                        .unwrap_or_default();
-                    let conv_id = conv
-                        .get("backendUrn")
-                        .and_then(|u| u.as_str())
-                        .and_then(|u| u.strip_prefix("urn:li:messagingThread:"))
-                        .unwrap_or("")
-                        .to_string();
-                    messages_from_company.push((display, last_msg, conv_id));
-                }
-            }
-        }
+async fn scan_viewers_at(
+    client: &LinkedInClient,
+    company_name: &str,
+    name_lower: &str,
+) -> Vec<ViewerMatch> {
+    let Ok(viewers_data) = client.get_profile_viewers().await else {
+        return Vec::new();
+    };
+    let viewers_str = serde_json::to_string(&viewers_data).unwrap_or_default();
+    if !viewers_str.to_lowercase().contains(name_lower) {
+        return Vec::new();
     }
+    let Some(elements) = viewers_data.get("elements").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    elements
+        .iter()
+        .filter(|el| viewer_card_mentions(el, name_lower))
+        .map(|_| ViewerMatch {
+            name: "(viewer from company)".to_string(),
+            headline: company_name.to_string(),
+        })
+        .collect()
+}
 
-    // 5. Search for notable people at the company.
-    eprintln!("Searching people at {}...", company_name);
+/// True when the WvmpViewersCard nested under `el` contains an insight card
+/// whose serialized form mentions `name_lower`. The cards are deeply nested
+/// under `value.com.linkedin.voyager.identity.me.WvmpViewersCard.insightCards`,
+/// then again under each card's WvmpSummaryInsightCard.
+fn viewer_card_mentions(el: &serde_json::Value, name_lower: &str) -> bool {
+    let el_str = serde_json::to_string(el).unwrap_or_default();
+    if !el_str.to_lowercase().contains(name_lower) {
+        return false;
+    }
+    el.pointer("/value/com.linkedin.voyager.identity.me.WvmpViewersCard/insightCards")
+        .and_then(|cards| cards.as_array())
+        .and_then(|arr| arr.iter().find(|c| serialized_contains(c, name_lower)))
+        .and_then(|card| {
+            card.pointer("/value/com.linkedin.voyager.identity.me.WvmpSummaryInsightCard/cards")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.iter().find(|c| serialized_contains(c, name_lower)))
+        })
+        .is_some()
+}
+
+fn serialized_contains(value: &serde_json::Value, needle: &str) -> bool {
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains(needle)
+}
+
+async fn scan_messages_with(client: &LinkedInClient, name_lower: &str) -> Vec<MessageMatch> {
+    let Ok(conversations) = client.get_conversations(20, None).await else {
+        return Vec::new();
+    };
+    let Some(elements) = conversations.get("elements").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    elements
+        .iter()
+        .filter(|conv| serialized_contains(conv, name_lower))
+        .map(extract_message_match)
+        .collect()
+}
+
+fn extract_message_match(conv: &serde_json::Value) -> MessageMatch {
+    let names = extract_conversation_names(conv);
+    let last_msg = conv
+        .get("messages")
+        .and_then(|m| m.get("elements"))
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(extract_message_body)
+        .unwrap_or_default();
+    let conv_id = conv
+        .get("backendUrn")
+        .and_then(|u| u.as_str())
+        .and_then(|u| u.strip_prefix("urn:li:messagingThread:"))
+        .unwrap_or("")
+        .to_string();
+    MessageMatch {
+        name: names.join(", "),
+        last_msg,
+        conv_id,
+    }
+}
+
+/// Message bodies come back as either a bare string or a `{text: "..."}`
+/// object depending on how the conversation was rendered.
+fn extract_message_body(msg: &serde_json::Value) -> Option<String> {
+    let body = msg.get("body")?;
+    if body.is_string() {
+        return body.as_str().map(str::to_string);
+    }
+    body.get("text").and_then(|t| t.as_str()).map(str::to_string)
+}
+
+async fn search_people_at(
+    client: &LinkedInClient,
+    company_name: &str,
+    name_lower: &str,
+    slug_lower: &str,
+) -> Vec<PersonMatch> {
     let search_results = client
         .search_people(company_name, 0, 5)
         .await
         .unwrap_or_default();
-    let mut notable_people: Vec<(String, String, String, String)> = Vec::new(); // (name, headline, degree, pub_id)
-    if let Some(elements) = search_results.get("elements").and_then(|e| e.as_array()) {
-        for el in elements {
-            if let Some(items) = el.get("items").and_then(|i| i.as_array()) {
-                for item in items {
-                    let er = item
-                        .pointer("/item/entityResult")
-                        .unwrap_or(&serde_json::Value::Null);
-                    let title = er
-                        .get("title")
-                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let headline = er
-                        .get("primarySubtitle")
-                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let badge = er
-                        .get("badgeText")
-                        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let nav_url = er
-                        .get("navigationUrl")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let pub_id = nav_url
-                        .strip_prefix("https://www.linkedin.com/in/")
-                        .and_then(|s| s.split('?').next())
-                        .unwrap_or("");
+    let Some(elements) = search_results.get("elements").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    elements
+        .iter()
+        .filter_map(|el| el.get("items").and_then(|i| i.as_array()))
+        .flatten()
+        .filter_map(|item| match_search_person(item, name_lower, slug_lower))
+        .collect()
+}
 
-                    // Only include people whose headline mentions the company.
-                    if headline.to_lowercase().contains(&name_lower)
-                        || headline
-                            .to_lowercase()
-                            .contains(&company_slug.to_lowercase())
-                    {
-                        notable_people.push((
-                            title.to_string(),
-                            headline.to_string(),
-                            badge.to_string(),
-                            pub_id.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
+fn match_search_person(
+    item: &serde_json::Value,
+    name_lower: &str,
+    slug_lower: &str,
+) -> Option<PersonMatch> {
+    let er = item.pointer("/item/entityResult")?;
+    let headline = er
+        .get("primarySubtitle")
+        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let h_lower = headline.to_lowercase();
+    if !h_lower.contains(name_lower) && !h_lower.contains(slug_lower) {
+        return None;
     }
+    let title = er
+        .get("title")
+        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let badge = er
+        .get("badgeText")
+        .and_then(|t| t.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let nav_url = er
+        .get("navigationUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let public_id = nav_url
+        .strip_prefix("https://www.linkedin.com/in/")
+        .and_then(|s| s.split('?').next())
+        .unwrap_or("");
+    Some(PersonMatch {
+        name: title.to_string(),
+        headline: headline.to_string(),
+        degree: badge.to_string(),
+        public_id: public_id.to_string(),
+    })
+}
 
-    // --- Output ---
+fn print_who_json(
+    company: &CompanySummary,
+    connections: &[ConnectionMatch],
+    viewers: &[ViewerMatch],
+    messages: &[MessageMatch],
+    people: &[PersonMatch],
+) -> Result<(), String> {
+    let output = serde_json::json!({
+        "company": {
+            "name": company.name,
+            "slug": company.slug,
+            "hq": format!("{}, {}", company.hq, company.hq_country),
+            "staff": company.staff,
+            "industry": company.industry,
+        },
+        "connections": connections
+            .iter()
+            .map(|c| serde_json::json!({"name": c.name, "headline": c.headline, "publicId": c.public_id}))
+            .collect::<Vec<_>>(),
+        "viewers": viewers
+            .iter()
+            .map(|v| serde_json::json!({"name": v.name, "headline": v.headline}))
+            .collect::<Vec<_>>(),
+        "messages": messages
+            .iter()
+            .map(|m| serde_json::json!({"name": m.name, "lastMessage": m.last_msg, "conversationId": m.conv_id}))
+            .collect::<Vec<_>>(),
+        "people": people
+            .iter()
+            .map(|p| serde_json::json!({"name": p.name, "headline": p.headline, "degree": p.degree, "publicId": p.public_id}))
+            .collect::<Vec<_>>(),
+    });
+    let pretty =
+        serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
 
-    if raw_json {
-        let output = serde_json::json!({
-            "company": {
-                "name": company_name,
-                "slug": company_slug,
-                "hq": format!("{}, {}", hq, hq_country),
-                "staff": staff,
-                "industry": industry,
-            },
-            "connections": my_connections.iter().map(|(n, h, p)| serde_json::json!({"name": n, "headline": h, "publicId": p})).collect::<Vec<_>>(),
-            "viewers": viewers_at_company.iter().map(|(n, h)| serde_json::json!({"name": n, "headline": h})).collect::<Vec<_>>(),
-            "messages": messages_from_company.iter().map(|(n, m, c)| serde_json::json!({"name": n, "lastMessage": m, "conversationId": c})).collect::<Vec<_>>(),
-            "people": notable_people.iter().map(|(n, h, d, p)| serde_json::json!({"name": n, "headline": h, "degree": d, "publicId": p})).collect::<Vec<_>>(),
-        });
-        let pretty =
-            serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
-    }
+fn print_who_report(
+    company: &CompanySummary,
+    connections: &[ConnectionMatch],
+    viewers: &[ViewerMatch],
+    messages: &[MessageMatch],
+    people: &[PersonMatch],
+) {
+    print_company_header(company);
+    print_connections_section(connections);
+    print_viewers_section(&company.name, viewers);
+    print_messages_section(messages);
+    print_people_section(&company.name, people);
+}
 
-    // Header.
-    println!("{}", company_name);
+fn print_company_header(company: &CompanySummary) {
+    println!("{}", company.name);
     let mut meta = Vec::new();
-    if !hq.is_empty() {
-        if !hq_country.is_empty() {
-            meta.push(format!("{}, {}", hq, hq_country));
+    if !company.hq.is_empty() {
+        if company.hq_country.is_empty() {
+            meta.push(company.hq.clone());
         } else {
-            meta.push(hq.to_string());
+            meta.push(format!("{}, {}", company.hq, company.hq_country));
         }
     }
-    if staff > 0 {
-        meta.push(format!("{} employees", staff));
+    if company.staff > 0 {
+        meta.push(format!("{} employees", company.staff));
     }
-    if !industry.is_empty() {
-        meta.push(industry.to_string());
+    if !company.industry.is_empty() {
+        meta.push(company.industry.clone());
     }
     if !meta.is_empty() {
         println!("  {}", meta.join("  |  "));
     }
-    if !tagline.is_empty() {
-        println!("  \"{}\"", truncate_with_ellipsis(tagline, 80));
+    if !company.tagline.is_empty() {
+        println!("  \"{}\"", truncate_with_ellipsis(&company.tagline, 80));
     }
     println!();
+}
 
-    // Connections.
-    println!("Your connections there: {}", my_connections.len());
-    if !my_connections.is_empty() {
-        for (name, headline, pub_id) in &my_connections {
-            println!("  {} ({})", name, pub_id);
-            println!("    {}", truncate_with_ellipsis(headline, 80));
-        }
+fn print_connections_section(connections: &[ConnectionMatch]) {
+    println!("Your connections there: {}", connections.len());
+    for c in connections {
+        println!("  {} ({})", c.name, c.public_id);
+        println!("    {}", truncate_with_ellipsis(&c.headline, 80));
     }
     println!();
+}
 
-    // Profile viewers.
-    if !viewers_at_company.is_empty() {
-        println!(
-            "Recent profile viewers from {}: {}",
-            company_name,
-            viewers_at_company.len()
-        );
-        for (name, headline) in &viewers_at_company {
-            println!("  {} — {}", name, headline);
-        }
-        println!();
+fn print_viewers_section(company_name: &str, viewers: &[ViewerMatch]) {
+    if viewers.is_empty() {
+        return;
     }
-
-    // Messages.
-    if !messages_from_company.is_empty() {
-        println!("Recent messages:");
-        for (name, last_msg, conv_id) in &messages_from_company {
-            println!("  {}", name);
-            println!("    \"{}\"", truncate_with_ellipsis(last_msg, 80));
-            println!("    read: messages read {}", conv_id);
-        }
-        println!();
+    println!(
+        "Recent profile viewers from {}: {}",
+        company_name,
+        viewers.len()
+    );
+    for v in viewers {
+        println!("  {} — {}", v.name, v.headline);
     }
+    println!();
+}
 
-    // Notable people (from search).
-    if !notable_people.is_empty() {
-        println!("People at {} (from search):", company_name);
-        for (name, headline, degree, pub_id) in &notable_people {
-            println!("  {} {} ({})", name, degree, pub_id);
-            println!("    {}", truncate_with_ellipsis(headline, 80));
-        }
-    } else {
+fn print_messages_section(messages: &[MessageMatch]) {
+    if messages.is_empty() {
+        return;
+    }
+    println!("Recent messages:");
+    for m in messages {
+        println!("  {}", m.name);
+        println!("    \"{}\"", truncate_with_ellipsis(&m.last_msg, 80));
+        println!("    read: messages read {}", m.conv_id);
+    }
+    println!();
+}
+
+fn print_people_section(company_name: &str, people: &[PersonMatch]) {
+    if people.is_empty() {
         println!("No people found at {} in search.", company_name);
+        return;
     }
-
-    Ok(())
+    println!("People at {} (from search):", company_name);
+    for p in people {
+        println!("  {} {} ({})", p.name, p.degree, p.public_id);
+        println!("    {}", truncate_with_ellipsis(&p.headline, 80));
+    }
 }
 
 /// Extract participant names from a conversation element.

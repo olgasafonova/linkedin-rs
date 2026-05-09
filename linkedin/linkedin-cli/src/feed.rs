@@ -33,12 +33,41 @@ pub async fn cmd_feed_list(
         return Ok(());
     }
 
-    // Try to parse into our typed FeedResponse for structured output.
     let feed: FeedResponse = serde_json::from_value(value.clone())
         .map_err(|e| format!("failed to parse feed response: {e}"))?;
 
-    // Print paging info.
-    let filtering = author_filter.is_some() || keyword_filter.is_some();
+    print_feed_list_header(&feed, author_filter, keyword_filter);
+
+    if feed.elements.is_empty() {
+        println!("(no feed items)");
+        return Ok(());
+    }
+
+    let author_lower = author_filter.map(str::to_lowercase);
+    let keyword_lower = keyword_filter.map(str::to_lowercase);
+
+    let mut shown = 0;
+    for (i, element) in feed.elements.iter().enumerate() {
+        if !feed_item_passes_filters(element, author_lower.as_deref(), keyword_lower.as_deref()) {
+            continue;
+        }
+        shown += 1;
+        print_feed_item(start as usize + i + 1, element);
+        println!();
+    }
+
+    if shown == 0 {
+        println!("(no matching feed items)");
+    }
+
+    Ok(())
+}
+
+fn print_feed_list_header(
+    feed: &FeedResponse,
+    author_filter: Option<&str>,
+    keyword_filter: Option<&str>,
+) {
     if let Some(ref paging) = feed.paging {
         print_paging_header("Feed updates", paging);
     }
@@ -49,61 +78,49 @@ pub async fn cmd_feed_list(
         println!("  filter: text contains \"{}\"", keyword);
     }
     println!("---");
+}
 
-    if feed.elements.is_empty() {
-        println!("(no feed items)");
-        return Ok(());
+/// Strip the optional `value.com.linkedin.voyager.feed.render.UpdateV2`
+/// wrapper that wraps feed elements in the live response shape.
+fn unwrap_update_v2(element: &serde_json::Value) -> &serde_json::Value {
+    element
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(element)
+}
+
+fn feed_item_passes_filters(
+    element: &serde_json::Value,
+    author_lower: Option<&str>,
+    keyword_lower: Option<&str>,
+) -> bool {
+    if author_lower.is_none() && keyword_lower.is_none() {
+        return true;
     }
-
-    let author_lower = author_filter.map(|s| s.to_lowercase());
-    let keyword_lower = keyword_filter.map(|s| s.to_lowercase());
-
-    let mut shown = 0;
-    for (i, element) in feed.elements.iter().enumerate() {
-        let idx = start as usize + i + 1;
-
-        // Apply filters on the cached data.
-        if filtering {
-            let update = element
-                .get("value")
-                .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-                .unwrap_or(element);
-
-            if let Some(ref author_q) = author_lower {
-                let actor = update
-                    .get("actor")
-                    .and_then(|a| a.get("name"))
-                    .and_then(|n| n.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                if !actor.to_lowercase().contains(author_q) {
-                    continue;
-                }
-            }
-
-            if let Some(ref kw_q) = keyword_lower {
-                let commentary = update
-                    .get("commentary")
-                    .and_then(|c| c.get("text"))
-                    .and_then(|t| t.get("text"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                if !commentary.to_lowercase().contains(kw_q) {
-                    continue;
-                }
-            }
+    let update = unwrap_update_v2(element);
+    if let Some(q) = author_lower {
+        let actor = update
+            .get("actor")
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !actor.to_lowercase().contains(q) {
+            return false;
         }
-
-        shown += 1;
-        print_feed_item(idx, element);
-        println!();
     }
-
-    if shown == 0 {
-        println!("(no matching feed items)");
+    if let Some(q) = keyword_lower {
+        let commentary = update
+            .get("commentary")
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !commentary.to_lowercase().contains(q) {
+            return false;
+        }
     }
-
-    Ok(())
+    true
 }
 
 /// Print a brief human-readable summary of a single feed item.
