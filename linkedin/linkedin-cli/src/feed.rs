@@ -1,50 +1,116 @@
+use serde_json::Value;
+
 use linkedin_api::models::FeedResponse;
 
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Pretty-print a JSON value to stdout.
+fn print_json(value: &Value) -> Result<(), String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+/// Walk a nested object path, returning the final string if every step
+/// resolves and the leaf is a string.
+fn nested_text<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(key)?;
+    }
+    current.as_str()
+}
+
+/// Read a string field directly under `value`, or "" if missing.
+fn field_str<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Read `<key>.text` -- the GraphQL TextViewModel shape.
+fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    nested_text(value, &[key, "text"])
+}
+
+/// Strip the optional `value.com.linkedin.voyager.feed.render.UpdateV2`
+/// wrapper that wraps feed elements in the live response shape.
+fn unwrap_update_v2(element: &Value) -> &Value {
+    element
+        .get("value")
+        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
+        .unwrap_or(element)
+}
+
+/// Read commentary text. The shape is `commentary.text.text`.
+fn commentary_text(update: &Value) -> &str {
+    nested_text(update, &["commentary", "text", "text"]).unwrap_or("")
+}
+
+/// Read the actor's display name from `actor.name.text`.
+fn actor_name(update: &Value) -> &str {
+    nested_text(update, &["actor", "name", "text"]).unwrap_or("(unknown author)")
+}
+
+/// Read a `socialDetail.totalSocialActivityCounts.<key>` count.
+fn social_count(update: &Value, key: &str) -> u64 {
+    update
+        .get("socialDetail")
+        .and_then(|s| s.get("totalSocialActivityCounts"))
+        .and_then(|c| c.get(key))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// feed list
+// ---------------------------------------------------------------------------
+
+/// Options for `feed list`. Bundles the five-argument call into a struct.
+pub struct FeedListOptions<'a> {
+    pub start: u32,
+    pub count: u32,
+    pub author_filter: Option<&'a str>,
+    pub keyword_filter: Option<&'a str>,
+    pub raw_json: bool,
+}
+
 /// Handle `feed list [--count N] [--start N] [--json]`.
 ///
 /// Loads the session, calls GET /voyager/api/feed/updates?q=findFeed with
 /// pagination params, and prints the results.
-pub async fn cmd_feed_list(
-    start: u32,
-    count: u32,
-    author_filter: Option<&str>,
-    keyword_filter: Option<&str>,
-    raw_json: bool,
-) -> Result<(), String> {
+pub async fn cmd_feed_list(opts: FeedListOptions<'_>) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
     let value = client
-        .get_feed(start, count)
+        .get_feed(opts.start, opts.count)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
-    // Cache the raw feed response for `feed read` / `feed react` / `feed comment` by index.
     if let Err(e) = save_feed_cache(&value) {
         eprintln!("warning: failed to cache feed: {e}");
     }
 
-    if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+    if opts.raw_json {
+        return print_json(&value);
     }
 
     let feed: FeedResponse = serde_json::from_value(value.clone())
         .map_err(|e| format!("failed to parse feed response: {e}"))?;
 
-    print_feed_list_header(&feed, author_filter, keyword_filter);
+    print_feed_list_header(&feed, opts.author_filter, opts.keyword_filter);
 
     if feed.elements.is_empty() {
         println!("(no feed items)");
         return Ok(());
     }
 
-    let author_lower = author_filter.map(str::to_lowercase);
-    let keyword_lower = keyword_filter.map(str::to_lowercase);
+    let author_lower = opts.author_filter.map(str::to_lowercase);
+    let keyword_lower = opts.keyword_filter.map(str::to_lowercase);
 
     let mut shown = 0;
     for (i, element) in feed.elements.iter().enumerate() {
@@ -52,7 +118,7 @@ pub async fn cmd_feed_list(
             continue;
         }
         shown += 1;
-        print_feed_item(start as usize + i + 1, element);
+        print_feed_item(opts.start as usize + i + 1, element);
         println!();
     }
 
@@ -80,17 +146,8 @@ fn print_feed_list_header(
     println!("---");
 }
 
-/// Strip the optional `value.com.linkedin.voyager.feed.render.UpdateV2`
-/// wrapper that wraps feed elements in the live response shape.
-fn unwrap_update_v2(element: &serde_json::Value) -> &serde_json::Value {
-    element
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(element)
-}
-
 fn feed_item_passes_filters(
-    element: &serde_json::Value,
+    element: &Value,
     author_lower: Option<&str>,
     keyword_lower: Option<&str>,
 ) -> bool {
@@ -98,90 +155,30 @@ fn feed_item_passes_filters(
         return true;
     }
     let update = unwrap_update_v2(element);
-    if let Some(q) = author_lower {
-        let actor = update
-            .get("actor")
-            .and_then(|a| a.get("name"))
-            .and_then(|n| n.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        if !actor.to_lowercase().contains(q) {
-            return false;
-        }
+    matches_lowercase(actor_name(update), author_lower)
+        && matches_lowercase(commentary_text(update), keyword_lower)
+}
+
+/// True when `needle` is None, or `haystack` contains `needle` (both
+/// compared lowercase).
+fn matches_lowercase(haystack: &str, needle: Option<&str>) -> bool {
+    match needle {
+        None => true,
+        Some(q) => haystack.to_lowercase().contains(q),
     }
-    if let Some(q) = keyword_lower {
-        let commentary = update
-            .get("commentary")
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        if !commentary.to_lowercase().contains(q) {
-            return false;
-        }
-    }
-    true
 }
 
 /// Print a brief human-readable summary of a single feed item.
-///
-/// Feed items are `UpdateV2` records. We extract what we can and skip
-/// unknown fields gracefully. The real structure is deeply nested, so
-/// this is best-effort until we've validated against live data.
-fn print_feed_item(index: usize, item: &serde_json::Value) {
-    // The real feed response wraps the UpdateV2 payload inside:
-    //   element.value["com.linkedin.voyager.feed.render.UpdateV2"]
-    // This is LinkedIn's Rest.li union encoding. Unwrap it first,
-    // falling back to the element itself for forward-compatibility.
-    let update = item
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(item);
-
-    // Try to extract actor name.
-    let actor_name = update
-        .get("actor")
-        .and_then(|a| a.get("name"))
-        .and_then(|n| n.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("(unknown author)");
-
-    // Try to extract commentary text.
-    let commentary = update
-        .get("commentary")
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-
-    // Truncate long commentary for the summary view.
-    let commentary_display = truncate_with_ellipsis(commentary, 120);
-
-    // Entity URN -- lives at the top-level element, not inside the UpdateV2.
-    let urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
-
-    // Social counts are inside the UpdateV2 payload.
-    let likes = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numLikes"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let comments = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numComments"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-
+fn print_feed_item(index: usize, item: &Value) {
+    let update = unwrap_update_v2(item);
+    let actor = actor_name(update);
+    let commentary_display = truncate_with_ellipsis(commentary_text(update), 120);
+    let urn = field_str(item, "entityUrn");
+    let likes = social_count(update, "numLikes");
+    let comments = social_count(update, "numComments");
     let media_label = extract_media_type_label(update);
 
-    println!(
-        "[{}] {} {}",
-        index,
-        actor_name,
-        if !urn.is_empty() { urn } else { "" }
-    );
+    println!("[{}] {} {}", index, actor, urn);
     if !commentary_display.is_empty() {
         println!("    {}", commentary_display);
     }
@@ -193,11 +190,11 @@ fn print_feed_item(index: usize, item: &serde_json::Value) {
     println!("likes: {}  comments: {}", likes, comments);
 }
 
+// ---------------------------------------------------------------------------
+// feed my-posts
+// ---------------------------------------------------------------------------
+
 /// Handle `feed my-posts [--start N] [--count N] [--json]`.
-///
-/// Fetches the authenticated user's own posts with engagement metrics.
-/// Uses `identity/profileUpdatesV2?q=memberShareFeed` which returns
-/// standard UpdateV2 records with full social detail.
 pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
 
@@ -211,10 +208,7 @@ pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result
     }
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&value);
     }
 
     let feed: FeedResponse = serde_json::from_value(value.clone())
@@ -231,112 +225,81 @@ pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result
     }
 
     for (i, element) in feed.elements.iter().enumerate() {
-        let idx = start as usize + i + 1;
-        print_my_post(idx, element);
+        print_my_post(start as usize + i + 1, element);
         println!();
     }
-
     Ok(())
 }
 
-/// Print a human-readable summary of one of the user's own posts.
-///
-/// Same UpdateV2 format as general feed items, but we also show view count
-/// since it's available for own posts.
-fn print_my_post(index: usize, item: &serde_json::Value) {
-    let update = item
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(item);
-
-    // Commentary text.
-    let commentary = update
-        .get("commentary")
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-
-    let commentary_display = truncate_with_ellipsis(commentary, 120);
-
-    // Activity URN -- extract from the composite entityUrn.
-    // The profileUpdatesV2 response uses MEMBER_SHARES context, so we need to
-    // trim at the first comma to get just the activity URN.
-    let entity_urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
+fn print_my_post(index: usize, item: &Value) {
+    let update = unwrap_update_v2(item);
+    let entity_urn = field_str(item, "entityUrn");
     let activity_urn = extract_activity_urn(entity_urn)
         .map(|u| u.split(',').next().unwrap_or(&u).to_string())
         .unwrap_or_default();
+    let display_urn = if !activity_urn.is_empty() {
+        activity_urn.as_str()
+    } else {
+        entity_urn
+    };
+    println!("[{}] {}", index, display_urn);
 
-    // Social counts.
-    let social = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"));
-
-    let likes = social
-        .and_then(|c| c.get("numLikes"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let comments = social
-        .and_then(|c| c.get("numComments"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let shares = social
-        .and_then(|c| c.get("numShares"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let views = social
-        .and_then(|c| c.get("numViews"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-
-    // Timestamp from actor subDescription (e.g. "3d • ").
-    let time_desc = update
-        .get("actor")
-        .and_then(|a| a.get("subDescription"))
-        .and_then(|s| s.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches("• \u{a0}\u{a0}")
-        .trim_end_matches("•")
-        .trim();
-
-    println!(
-        "[{}] {}",
-        index,
-        if !activity_urn.is_empty() {
-            &activity_urn
-        } else {
-            entity_urn
-        }
-    );
+    let time_desc = my_post_time_label(update);
     if !time_desc.is_empty() {
         println!("    posted: {}", time_desc);
     }
+    let commentary_display = truncate_with_ellipsis(commentary_text(update), 120);
     if !commentary_display.is_empty() {
         println!("    {}", commentary_display);
     }
+    print_my_post_metrics(update);
+    print_my_post_reactions(update);
+}
+
+/// Pull the timestamp string from `actor.subDescription.text`, stripping
+/// the trailing bullet/spacer LinkedIn appends.
+fn my_post_time_label(update: &Value) -> String {
+    nested_text(update, &["actor", "subDescription", "text"])
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches("• \u{a0}\u{a0}")
+        .trim_end_matches('•')
+        .trim()
+        .to_string()
+}
+
+fn print_my_post_metrics(update: &Value) {
     println!(
         "    views: {}  reactions: {}  comments: {}  reposts: {}",
-        views, likes, comments, shares
+        social_count(update, "numViews"),
+        social_count(update, "numLikes"),
+        social_count(update, "numComments"),
+        social_count(update, "numShares"),
     );
+}
 
-    // Reaction type breakdown (if available).
-    if let Some(rtc) = social
+fn print_my_post_reactions(update: &Value) {
+    let Some(rtc) = update
+        .get("socialDetail")
+        .and_then(|s| s.get("totalSocialActivityCounts"))
         .and_then(|c| c.get("reactionTypeCounts"))
         .and_then(|r| r.as_array())
-    {
-        if !rtc.is_empty() {
-            let parts: Vec<String> = rtc
-                .iter()
-                .filter_map(|r| {
-                    let rtype = r.get("reactionType").and_then(|t| t.as_str())?;
-                    let count = r.get("count").and_then(|c| c.as_u64())?;
-                    Some(format!("{}: {}", reaction_emoji(rtype), count))
-                })
-                .collect();
-            println!("    {}", parts.join("  "));
-        }
+    else {
+        return;
+    };
+    if rtc.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = rtc
+        .iter()
+        .filter_map(|r| {
+            let rtype = r.get("reactionType").and_then(|t| t.as_str())?;
+            let count = r.get("count").and_then(|c| c.as_u64())?;
+            Some(format!("{}: {}", reaction_emoji(rtype), count))
+        })
+        .collect();
+    if !parts.is_empty() {
+        println!("    {}", parts.join("  "));
     }
 }
 
@@ -353,47 +316,48 @@ fn reaction_emoji(reaction_type: &str) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// feed reactions
+// ---------------------------------------------------------------------------
+
+/// Options for `feed reactions`. Bundles the five-argument call into a struct.
+pub struct FeedReactionsOptions<'a> {
+    pub post_urn: Option<&'a str>,
+    pub from_list: Option<usize>,
+    pub start: u32,
+    pub count: u32,
+    pub raw_json: bool,
+}
+
 /// Handle `feed reactions <post_urn> [--start N] [--count N] [--json]`.
-///
-/// Fetches and displays the list of people who reacted to a specific post.
-pub async fn cmd_feed_reactions(
-    post_urn: Option<&str>,
-    from_list: Option<usize>,
-    start: u32,
-    count: u32,
-    raw_json: bool,
-) -> Result<(), String> {
-    let urn = match (post_urn, from_list) {
+pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> Result<(), String> {
+    let urn = match (opts.post_urn, opts.from_list) {
         (Some(u), None) => normalize_reactions_urn(u),
         (None, Some(index)) => reactions_urn_from_cache(index)?,
         (None, None) => {
             return Err(
                 "provide a post URN or use --from-list N after `feed list`/`feed my-posts`"
                     .to_string(),
-            )
+            );
         }
         (Some(_), Some(_)) => unreachable!("clap conflicts_with guards this"),
     };
 
     let (client, _path) = load_session_client()?;
     let value = client
-        .get_post_reactions(&urn, start, count)
+        .get_post_reactions(&urn, opts.start, opts.count)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
-    if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+    if opts.raw_json {
+        return print_json(&value);
     }
 
     let elements = value
         .get("elements")
         .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
-
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
     let total = value
         .get("paging")
         .and_then(|p| p.get("total"))
@@ -405,59 +369,53 @@ pub async fn cmd_feed_reactions(
 
     if elements.is_empty() {
         println!("(no reactions)");
-        if from_list.is_none() && urn.starts_with("urn:li:activity:") {
-            println!();
-            println!(
-                "Hint: LinkedIn's reactions endpoint uses different URN types \
-                 depending on the post backing (ugcPost for most posts, \
-                 activity for reshares). If you expected reactions here, try \
-                 `feed list` or `feed my-posts` first, then run \
-                 `feed reactions --from-list N` — the CLI will pick the \
-                 right URN. See re/reactions.md."
-            );
-        }
+        print_reactions_empty_hint(&urn, opts.from_list);
         return Ok(());
     }
 
-    for element in &elements {
-        let lockup = element.get("reactorLockup").unwrap_or(element);
-        let name = lockup
-            .get("title")
-            .and_then(|t| t.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("(unknown)");
-        let subtitle = lockup
-            .get("subtitle")
-            .and_then(|s| s.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-
-        let rtype = element
-            .get("reactionType")
-            .and_then(|r| r.as_str())
-            .unwrap_or("?");
-
-        let subtitle_display = truncate_with_ellipsis(subtitle, 60);
-
-        println!(
-            "  {:12} {} {}",
-            reaction_emoji(rtype),
-            name,
-            if subtitle_display.is_empty() {
-                String::new()
-            } else {
-                format!("- {}", subtitle_display)
-            }
-        );
+    for element in elements {
+        print_reaction_row(element);
     }
-
     Ok(())
 }
 
-/// Handle `feed react <post_urn> [--type LIKE] [--json]`.
-///
-/// Reacts to a feed post with the specified reaction type.
-/// Reaction type validation is handled by the API layer.
+fn print_reaction_row(element: &Value) {
+    let lockup = element.get("reactorLockup").unwrap_or(element);
+    let name = text_field(lockup, "title").unwrap_or("(unknown)");
+    let subtitle = text_field(lockup, "subtitle").unwrap_or("");
+    let rtype = element
+        .get("reactionType")
+        .and_then(|r| r.as_str())
+        .unwrap_or("?");
+
+    let subtitle_display = truncate_with_ellipsis(subtitle, 60);
+    let suffix = if subtitle_display.is_empty() {
+        String::new()
+    } else {
+        format!("- {}", subtitle_display)
+    };
+    println!("  {:12} {} {}", reaction_emoji(rtype), name, suffix);
+}
+
+fn print_reactions_empty_hint(urn: &str, from_list: Option<usize>) {
+    if from_list.is_some() || !urn.starts_with("urn:li:activity:") {
+        return;
+    }
+    println!();
+    println!(
+        "Hint: LinkedIn's reactions endpoint uses different URN types \
+         depending on the post backing (ugcPost for most posts, \
+         activity for reshares). If you expected reactions here, try \
+         `feed list` or `feed my-posts` first, then run \
+         `feed reactions --from-list N` — the CLI will pick the \
+         right URN. See re/reactions.md."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// feed react / unreact / comment / post
+// ---------------------------------------------------------------------------
+
 pub async fn cmd_feed_react(
     post_urn: &str,
     reaction_type: &str,
@@ -483,19 +441,13 @@ pub async fn cmd_feed_react(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&result)?;
     } else {
         println!("Reacted with {} to {}", rt_upper, resolved_urn);
     }
-
     Ok(())
 }
 
-/// Handle `feed unreact <post_urn> [--type LIKE] [--json]`.
-///
-/// Removes a reaction from a feed post.
 pub async fn cmd_feed_unreact(
     post_urn: &str,
     reaction_type: &str,
@@ -512,20 +464,13 @@ pub async fn cmd_feed_unreact(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&result)?;
     } else {
         println!("Removed {} reaction from {}", rt_upper, resolved_urn);
     }
-
     Ok(())
 }
 
-/// Handle `feed comment <post_urn> <text> [--yes] [--json]`.
-///
-/// Creates a comment on a feed post. Requires `--yes` to confirm,
-/// since this creates a REAL COMMENT on a LinkedIn post.
 pub async fn cmd_feed_comment(
     post_urn: &str,
     text: &str,
@@ -548,29 +493,72 @@ pub async fn cmd_feed_comment(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&result)?;
     } else {
         println!("Commented on {}", resolved_urn);
     }
-
     Ok(())
 }
 
+pub async fn cmd_feed_post(
+    text: &str,
+    visibility: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> Result<(), String> {
+    let vis_upper = visibility.to_uppercase();
+    if vis_upper != "ANYONE" && vis_upper != "CONNECTIONS_ONLY" {
+        return Err(format!(
+            "invalid visibility '{}'. Must be ANYONE or CONNECTIONS_ONLY",
+            visibility
+        ));
+    }
+
+    if !confirmed {
+        eprintln!("WARNING: This will create a REAL post on your LinkedIn account!");
+        eprintln!();
+        eprintln!("  Visibility: {}", vis_upper);
+        eprintln!("  Text: {}", truncate_with_ellipsis(text, 200));
+        eprintln!();
+        eprintln!("Use --yes to confirm and publish this post.");
+        return Err("post not confirmed (use --yes to publish)".to_string());
+    }
+
+    let (client, _path) = load_session_client()?;
+
+    eprintln!("Creating post (visibility: {})...", vis_upper);
+    let result = client
+        .create_post(text, &vis_upper)
+        .await
+        .map_err(|e| format!("API call failed: {e}"))?;
+
+    if raw_json {
+        print_json(&result)?;
+    } else {
+        let urn = result
+            .get("data")
+            .and_then(|d| d.get("createContentcreationDashShares"))
+            .and_then(|c| c.get("entityUrn"))
+            .and_then(|v| v.as_str())
+            .or_else(|| result.get("entityUrn").and_then(|v| v.as_str()))
+            .unwrap_or("(unknown)");
+        println!("Post created successfully!");
+        println!("  URN: {}", urn);
+        println!("  Visibility: {}", vis_upper);
+        println!("  Text: {}", truncate_with_ellipsis(text, 100));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// feed stats
+// ---------------------------------------------------------------------------
+
 /// Handle `feed stats [--json]`.
-///
-/// Aggregates engagement across the user's last 20 posts by summing the
-/// per-post counts embedded in `socialDetail.totalSocialActivityCounts` on
-/// the `identity/profileUpdatesV2?q=memberShareFeed` response.
-///
-/// The legacy `identity/socialUpdateAnalytics{,Header}` endpoints return
-/// HTTP 400 and are not used -- see `re/my_posts.md` for details.
 pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
     const POST_COUNT: u32 = 20;
 
     let (client, _path) = load_session_client()?;
-
     let value = client
         .get_my_posts(0, POST_COUNT)
         .await
@@ -579,50 +567,53 @@ pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
     let elements = value
         .get("elements")
         .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
-
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
     let posts: Vec<PostStat> = elements.iter().map(extract_post_stat).collect();
     let totals = PostStat::sum(&posts);
     let n = posts.len() as u64;
 
     if raw_json {
-        let averages = match (
-            totals.views.checked_div(n),
-            totals.likes.checked_div(n),
-            totals.comments.checked_div(n),
-            totals.shares.checked_div(n),
-        ) {
-            (Some(v), Some(l), Some(c), Some(s)) => serde_json::json!({
-                "views": v,
-                "likes": l,
-                "comments": c,
-                "shares": s,
-            }),
-            _ => serde_json::json!({}),
-        };
-        let out = serde_json::json!({
-            "post_count": n,
-            "totals": {
-                "views": totals.views,
-                "likes": totals.likes,
-                "comments": totals.comments,
-                "shares": totals.shares,
-            },
-            "averages": averages,
-            "posts": posts.iter().map(PostStat::to_json).collect::<Vec<_>>(),
-        });
-        let pretty =
-            serde_json::to_string_pretty(&out).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_stats_json(&posts, &totals, n);
     }
-
     if n == 0 {
         println!("(no posts found)");
         return Ok(());
     }
+    print_stats_report(&posts, &totals, n);
+    Ok(())
+}
 
+fn print_stats_json(posts: &[PostStat], totals: &PostStat, n: u64) -> Result<(), String> {
+    let averages = match (
+        totals.views.checked_div(n),
+        totals.likes.checked_div(n),
+        totals.comments.checked_div(n),
+        totals.shares.checked_div(n),
+    ) {
+        (Some(v), Some(l), Some(c), Some(s)) => serde_json::json!({
+            "views": v,
+            "likes": l,
+            "comments": c,
+            "shares": s,
+        }),
+        _ => serde_json::json!({}),
+    };
+    let out = serde_json::json!({
+        "post_count": n,
+        "totals": {
+            "views": totals.views,
+            "likes": totals.likes,
+            "comments": totals.comments,
+            "shares": totals.shares,
+        },
+        "averages": averages,
+        "posts": posts.iter().map(PostStat::to_json).collect::<Vec<_>>(),
+    });
+    print_json(&out)
+}
+
+fn print_stats_report(posts: &[PostStat], totals: &PostStat, n: u64) {
     println!("Engagement across last {} posts", n);
     println!("---");
     println!("Totals:");
@@ -637,13 +628,14 @@ pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
     println!("  comments: {}", totals.comments / n);
     println!("  shares:   {}", totals.shares / n);
     println!();
+    print_top_posts(posts);
+}
 
-    // Show top 5 posts by views as context.
-    let mut ranked = posts.clone();
+fn print_top_posts(posts: &[PostStat]) {
+    let mut ranked = posts.to_vec();
     ranked.sort_by_key(|p| std::cmp::Reverse(p.views));
-    let top = ranked.iter().take(5);
     println!("Top posts by views:");
-    for (i, p) in top.enumerate() {
+    for (i, p) in ranked.iter().take(5).enumerate() {
         println!(
             "[{}] {} views, {} likes, {} comments, {} shares",
             i + 1,
@@ -656,8 +648,6 @@ pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
             println!("    {}", truncate_with_ellipsis(&p.preview, 100));
         }
     }
-
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -689,7 +679,7 @@ impl PostStat {
         )
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    fn to_json(&self) -> Value {
         serde_json::json!({
             "views": self.views,
             "likes": self.likes,
@@ -700,98 +690,20 @@ impl PostStat {
     }
 }
 
-fn extract_post_stat(item: &serde_json::Value) -> PostStat {
-    let update = item
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(item);
-
-    let counts = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"));
-
-    let get_u64 = |key: &str| -> u64 {
-        counts
-            .and_then(|c| c.get(key))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0)
-    };
-
-    let preview = update
-        .get("commentary")
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-
+fn extract_post_stat(item: &Value) -> PostStat {
+    let update = unwrap_update_v2(item);
     PostStat {
-        views: get_u64("numViews"),
-        likes: get_u64("numLikes"),
-        comments: get_u64("numComments"),
-        shares: get_u64("numShares"),
-        preview,
+        views: social_count(update, "numViews"),
+        likes: social_count(update, "numLikes"),
+        comments: social_count(update, "numComments"),
+        shares: social_count(update, "numShares"),
+        preview: commentary_text(update).to_string(),
     }
 }
 
-/// Handle `feed post <text> [--visibility ANYONE] [--yes] [--json]`.
-///
-/// Creates a new text-only post on the authenticated user's LinkedIn feed.
-/// Requires `--yes` to confirm, since this creates a REAL PUBLIC post.
-pub async fn cmd_feed_post(
-    text: &str,
-    visibility: &str,
-    confirmed: bool,
-    raw_json: bool,
-) -> Result<(), String> {
-    let vis_upper = visibility.to_uppercase();
-    if vis_upper != "ANYONE" && vis_upper != "CONNECTIONS_ONLY" {
-        return Err(format!(
-            "invalid visibility '{}'. Must be ANYONE or CONNECTIONS_ONLY",
-            visibility
-        ));
-    }
-
-    if !confirmed {
-        // Show what would be posted and require confirmation.
-        eprintln!("WARNING: This will create a REAL post on your LinkedIn account!");
-        eprintln!();
-        eprintln!("  Visibility: {}", vis_upper);
-        eprintln!("  Text: {}", truncate_with_ellipsis(text, 200));
-        eprintln!();
-        eprintln!("Use --yes to confirm and publish this post.");
-        return Err("post not confirmed (use --yes to publish)".to_string());
-    }
-
-    let (client, _path) = load_session_client()?;
-
-    eprintln!("Creating post (visibility: {})...", vis_upper);
-    let result = client
-        .create_post(text, &vis_upper)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
-
-    if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&result).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-    } else {
-        // Try to extract the share URN from the response.
-        let urn = result
-            .get("data")
-            .and_then(|d| d.get("createContentcreationDashShares"))
-            .and_then(|c| c.get("entityUrn"))
-            .and_then(|v| v.as_str())
-            .or_else(|| result.get("entityUrn").and_then(|v| v.as_str()))
-            .unwrap_or("(unknown)");
-        println!("Post created successfully!");
-        println!("  URN: {}", urn);
-        println!("  Visibility: {}", vis_upper);
-        println!("  Text: {}", truncate_with_ellipsis(text, 100));
-    }
-
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// URN helpers + feed cache
+// ---------------------------------------------------------------------------
 
 /// Pull the activity URN out of a notification cardAction URL like
 /// `/feed/update/urn:li:activity:7312345/?...` (URL- or percent-encoded).
@@ -811,15 +723,13 @@ pub fn extract_activity_urn_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Returns the path to the feed cache file.
 fn feed_cache_path() -> Result<std::path::PathBuf, String> {
     let data_dir =
         dirs::data_dir().ok_or_else(|| "could not determine data directory".to_string())?;
     Ok(data_dir.join("linkedin").join("last_feed.json"))
 }
 
-/// Save raw feed JSON to cache for `feed read` / index-based react/comment.
-fn save_feed_cache(value: &serde_json::Value) -> Result<(), String> {
+fn save_feed_cache(value: &Value) -> Result<(), String> {
     let path = feed_cache_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
@@ -830,8 +740,7 @@ fn save_feed_cache(value: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Load cached feed JSON. Returns an error if no cache exists.
-fn load_feed_cache() -> Result<serde_json::Value, String> {
+fn load_feed_cache() -> Result<Value, String> {
     let path = feed_cache_path()?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| "no cached feed. Run `feed list` or `feed my-posts` first.".to_string())?;
@@ -849,16 +758,10 @@ fn normalize_reactions_urn(input: &str) -> String {
 }
 
 /// Extract the right thread URN for the reactions endpoint from a cached feed
-/// element. LinkedIn's `socialDashReactionsByReactionType` is URN-type-picky:
-/// ugcPost-backed posts require the ugcPost URN, share-backed posts require
-/// the activity URN. `updateMetadata.shareUrn` carries the underlying object
-/// URN, so we use that when it's a `ugcPost:`; otherwise we fall back to the
-/// activity URN. See `re/reactions.md` for the investigation.
-fn extract_reactions_urn(element: &serde_json::Value) -> Option<String> {
-    let update = element
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(element);
+/// element. ugcPost-backed posts require the ugcPost URN, share-backed posts
+/// require the activity URN.
+fn extract_reactions_urn(element: &Value) -> Option<String> {
+    let update = unwrap_update_v2(element);
     let metadata = update.get("updateMetadata")?;
     let activity_urn = metadata.get("urn").and_then(|u| u.as_str());
     let share_urn = metadata.get("shareUrn").and_then(|u| u.as_str());
@@ -871,9 +774,18 @@ fn extract_reactions_urn(element: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Resolve a 1-based index from the last cached feed listing into a reactions
-/// thread URN.
 fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
+    let element = cached_feed_element(index)?;
+    extract_reactions_urn(&element).ok_or_else(|| {
+        format!(
+            "could not extract a reactions URN from cached item {}",
+            index
+        )
+    })
+}
+
+/// Load a 1-based feed-cache element by index. Used by reactions + comments.
+fn cached_feed_element(index: usize) -> Result<Value, String> {
     if index == 0 {
         return Err("index must be >= 1".to_string());
     }
@@ -882,26 +794,16 @@ fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
         .get("elements")
         .and_then(|e| e.as_array())
         .ok_or_else(|| "cached feed has no elements array".to_string())?;
-    let element = elements.get(index - 1).ok_or_else(|| {
+    elements.get(index - 1).cloned().ok_or_else(|| {
         format!(
             "index {} out of range (cached feed has {} items)",
             index,
             elements.len()
         )
-    })?;
-    extract_reactions_urn(element).ok_or_else(|| {
-        format!(
-            "could not extract a reactions URN from cached item {}",
-            index
-        )
     })
 }
 
 /// Extract the inner `urn:li:activity:XXXXX` from a feed element's entityUrn.
-///
-/// Feed entityUrns have formats like:
-///   `urn:li:fs_feedUpdate:(V2&FOLLOW_FEED,urn:li:activity:7312345678901234567)`
-///   `urn:li:activity:7312345678901234567`
 pub fn extract_activity_urn(feed_entity_urn: &str) -> Option<String> {
     if let Some(start) = feed_entity_urn.find("urn:li:activity:") {
         let rest = &feed_entity_urn[start..];
@@ -912,49 +814,16 @@ pub fn extract_activity_urn(feed_entity_urn: &str) -> Option<String> {
     }
 }
 
-/// Resolve a post URN from either a literal URN string or a 1-based feed index.
-///
-/// If `post_urn_or_index` parses as a positive integer, loads the feed cache
-/// and extracts the activity URN. Otherwise returns the string as-is.
 fn resolve_post_urn(post_urn_or_index: &str) -> Result<String, String> {
-    if let Ok(index) = post_urn_or_index.parse::<usize>() {
-        if index == 0 {
-            return Err("index must be >= 1".to_string());
-        }
-        let cache = load_feed_cache()?;
-        let feed: FeedResponse = serde_json::from_value(cache)
-            .map_err(|e| format!("failed to parse cached feed: {e}"))?;
-        let element = feed.elements.get(index - 1).ok_or_else(|| {
-            format!(
-                "index {} out of range (feed has {} items)",
-                index,
-                feed.elements.len()
-            )
-        })?;
-        let entity_urn = element
-            .get("entityUrn")
-            .or_else(|| element.get("urn"))
-            .and_then(|u| u.as_str())
-            .ok_or_else(|| "feed item has no entityUrn".to_string())?;
-        extract_activity_urn(entity_urn)
-            .ok_or_else(|| format!("could not extract activity URN from: {}", entity_urn))
-    } else {
-        Ok(post_urn_or_index.to_string())
-    }
-}
-
-/// Handle `feed read <index> [--json]`.
-///
-/// Shows full post details for item N from the last `feed list`.
-pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
+    let Ok(index) = post_urn_or_index.parse::<usize>() else {
+        return Ok(post_urn_or_index.to_string());
+    };
     if index == 0 {
         return Err("index must be >= 1".to_string());
     }
-
     let cache = load_feed_cache()?;
-    let feed: FeedResponse = serde_json::from_value(cache.clone())
-        .map_err(|e| format!("failed to parse cached feed: {e}"))?;
-
+    let feed: FeedResponse =
+        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached feed: {e}"))?;
     let element = feed.elements.get(index - 1).ok_or_else(|| {
         format!(
             "index {} out of range (feed has {} items)",
@@ -962,129 +831,100 @@ pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
             feed.elements.len()
         )
     })?;
+    let entity_urn = element
+        .get("entityUrn")
+        .or_else(|| element.get("urn"))
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| "feed item has no entityUrn".to_string())?;
+    extract_activity_urn(entity_urn)
+        .ok_or_else(|| format!("could not extract activity URN from: {}", entity_urn))
+}
 
-    if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(element).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+// ---------------------------------------------------------------------------
+// feed read / view (full view)
+// ---------------------------------------------------------------------------
+
+pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
+    if index == 0 {
+        return Err("index must be >= 1".to_string());
     }
-
+    let cache = load_feed_cache()?;
+    let feed: FeedResponse = serde_json::from_value(cache.clone())
+        .map_err(|e| format!("failed to parse cached feed: {e}"))?;
+    let element = feed.elements.get(index - 1).ok_or_else(|| {
+        format!(
+            "index {} out of range (feed has {} items)",
+            index,
+            feed.elements.len()
+        )
+    })?;
+    if raw_json {
+        return print_json(element);
+    }
     print_feed_item_full(index, element);
     Ok(())
 }
 
-/// Handle `feed view <activity_urn> [--json]`.
-///
-/// Fetches a single post by activity URN from the API and displays it.
 pub async fn cmd_feed_view(activity_urn: &str, raw_json: bool) -> Result<(), String> {
     let (client, _path) = load_session_client()?;
-
     let post = client
         .get_post(activity_urn)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
-
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&post).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&post);
     }
-
     print_feed_item_full(0, &post);
     Ok(())
 }
 
 /// Print full details of a single feed item (expanded view for `feed read`).
-fn print_feed_item_full(index: usize, item: &serde_json::Value) {
-    let update = item
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(item);
+fn print_feed_item_full(index: usize, item: &Value) {
+    let update = unwrap_update_v2(item);
+    print_full_header(index, item, update);
+    print_full_body(update);
+    print_full_media(update);
+    print_full_footer(item, update);
+}
 
-    let actor_name = update
-        .get("actor")
-        .and_then(|a| a.get("name"))
-        .and_then(|n| n.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("(unknown author)");
-
-    let actor_description = update
-        .get("actor")
-        .and_then(|a| a.get("description"))
-        .and_then(|d| d.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-
-    let commentary = update
-        .get("commentary")
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("(no text)");
-
-    let likes = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numLikes"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let comments = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numComments"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-    let shares = update
-        .get("socialDetail")
-        .and_then(|s| s.get("totalSocialActivityCounts"))
-        .and_then(|c| c.get("numShares"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0);
-
-    let entity_urn = item.get("entityUrn").and_then(|u| u.as_str()).unwrap_or("");
-    let permalink = item.get("permalink").and_then(|u| u.as_str()).unwrap_or("");
-    let activity_urn = extract_activity_urn(entity_urn).unwrap_or_default();
-
-    println!("[{}] {}", index, actor_name);
+fn print_full_header(index: usize, _item: &Value, update: &Value) {
+    println!("[{}] {}", index, actor_name(update));
+    let actor_description = nested_text(update, &["actor", "description", "text"]).unwrap_or("");
     if !actor_description.is_empty() {
         println!("    {}", actor_description);
     }
     println!();
+}
+
+fn print_full_body(update: &Value) {
+    let commentary = nested_text(update, &["commentary", "text", "text"]).unwrap_or("(no text)");
     println!("{}", commentary);
 
-    // Reshared post content: LinkedIn puts reshared content in several locations.
-    let reshared_update = update
+    let Some(reshared) = reshared_update(update) else {
+        return;
+    };
+    let orig_author = actor_name(reshared);
+    let orig_text = commentary_text(reshared);
+    println!();
+    println!("  [reshared from {}]", orig_author);
+    if !orig_text.is_empty() {
+        println!("  {}", truncate_with_ellipsis(orig_text, 300));
+    }
+}
+
+/// Find the reshared UpdateV2, checking each known location LinkedIn uses.
+fn reshared_update(update: &Value) -> Option<&Value> {
+    update
         .get("resharedUpdate")
         .or_else(|| update.get("content").and_then(|c| c.get("resharedUpdate")))
         .or_else(|| {
-            // Also check inside the UpdateV2 union value
             update
                 .get("content")
                 .and_then(|c| c.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        });
-    if let Some(reshared) = reshared_update {
-        let orig_author = reshared
-            .get("actor")
-            .and_then(|a| a.get("name"))
-            .and_then(|n| n.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("(unknown)");
-        let orig_text = reshared
-            .get("commentary")
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        println!();
-        println!("  [reshared from {}]", orig_author);
-        if !orig_text.is_empty() {
-            println!("  {}", truncate_with_ellipsis(orig_text, 300));
-        }
-    }
+        })
+}
 
-    // Article links: extract from content component.
+fn print_full_media(update: &Value) {
     if let Some(article) = extract_article_info(update) {
         println!();
         if !article.title.is_empty() {
@@ -1095,342 +935,312 @@ fn print_feed_item_full(index: usize, item: &serde_json::Value) {
         }
     }
 
-    // Media type labels + URLs.
     let media_label = extract_media_type_label(update);
     if !media_label.is_empty() {
         println!("Media: {}", media_label);
     }
-    let media_urls = extract_media_urls(update);
-    for url in &media_urls {
+    for url in extract_media_urls(update) {
         println!("  {}", url);
     }
+}
 
+fn print_full_footer(item: &Value, update: &Value) {
     println!();
     println!(
         "likes: {}  comments: {}  shares: {}",
-        likes, comments, shares
+        social_count(update, "numLikes"),
+        social_count(update, "numComments"),
+        social_count(update, "numShares"),
     );
+    let entity_urn = field_str(item, "entityUrn");
+    let activity_urn = extract_activity_urn(entity_urn).unwrap_or_default();
     if !activity_urn.is_empty() {
         println!("URN: {}", activity_urn);
     }
+    let permalink = field_str(item, "permalink");
     if !permalink.is_empty() {
         println!("Link: {}", permalink);
     }
 }
 
-/// Article info extracted from a feed item's content component.
+// ---------------------------------------------------------------------------
+// Article + media extraction
+// ---------------------------------------------------------------------------
+
 struct ArticleInfo {
     title: String,
     url: String,
 }
 
-/// Extract article title and URL from a feed item's content component.
-///
-/// LinkedIn wraps article content in several possible locations:
-/// - `content.articleComponent` (standard articles)
-/// - `content.navigationContext` (link previews)
-/// - `content["com.linkedin.voyager.feed.render.ArticleComponent"]` (Rest.li union)
-fn extract_article_info(update: &serde_json::Value) -> Option<ArticleInfo> {
+fn extract_article_info(update: &Value) -> Option<ArticleInfo> {
     let content = update.get("content")?;
-
-    // Try articleComponent first (most common for shared articles).
-    if let Some(article) = content
-        .get("articleComponent")
-        .or_else(|| content.get("com.linkedin.voyager.feed.render.ArticleComponent"))
-    {
-        let title = article
-            .get("title")
-            .and_then(|t| {
-                t.get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| t.as_str())
-            })
-            .unwrap_or("")
-            .to_string();
-        let url = article
-            .get("navigationContext")
-            .and_then(|n| n.get("actionTarget"))
-            .and_then(|v| v.as_str())
-            .or_else(|| article.get("url").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
-        if !title.is_empty() || !url.is_empty() {
-            return Some(ArticleInfo { title, url });
-        }
-    }
-
-    // Try top-level navigationContext on the content node.
-    if let Some(nav) = content.get("navigationContext") {
-        let title = nav
-            .get("accessibilityText")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let url = nav
-            .get("actionTarget")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !url.is_empty() {
-            return Some(ArticleInfo { title, url });
-        }
-    }
-
-    None
+    extract_article_from_component(content).or_else(|| extract_article_from_nav(content))
 }
 
-/// Determine the media type label for a feed item's content.
-///
-/// Returns a label like "image", "video", "document", "poll", "article",
-/// or an empty string if no media is detected.
-fn extract_media_type_label(update: &serde_json::Value) -> String {
-    let content = match update.get("content") {
-        Some(c) => c,
-        None => return String::new(),
+fn extract_article_from_component(content: &Value) -> Option<ArticleInfo> {
+    let article = content
+        .get("articleComponent")
+        .or_else(|| content.get("com.linkedin.voyager.feed.render.ArticleComponent"))?;
+    let title = article
+        .get("title")
+        .and_then(|t| {
+            t.get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| t.as_str())
+        })
+        .unwrap_or("")
+        .to_string();
+    let url = article
+        .get("navigationContext")
+        .and_then(|n| n.get("actionTarget"))
+        .and_then(|v| v.as_str())
+        .or_else(|| article.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if title.is_empty() && url.is_empty() {
+        return None;
+    }
+    Some(ArticleInfo { title, url })
+}
+
+fn extract_article_from_nav(content: &Value) -> Option<ArticleInfo> {
+    let nav = content.get("navigationContext")?;
+    let url = field_str(nav, "actionTarget").to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let title = field_str(nav, "accessibilityText").to_string();
+    Some(ArticleInfo { title, url })
+}
+
+/// Component union keys that map directly to a media-type label.
+const MEDIA_COMPONENT_LABELS: &[(&str, &str)] = &[
+    ("com.linkedin.voyager.feed.render.ImageComponent", "image"),
+    (
+        "com.linkedin.voyager.feed.render.LinkedInVideoComponent",
+        "video",
+    ),
+    (
+        "com.linkedin.voyager.feed.render.DocumentComponent",
+        "document",
+    ),
+    ("com.linkedin.voyager.feed.render.PollComponent", "poll"),
+    (
+        "com.linkedin.voyager.feed.render.ArticleComponent",
+        "article",
+    ),
+    (
+        "com.linkedin.voyager.feed.render.CelebrationComponent",
+        "celebration",
+    ),
+    (
+        "com.linkedin.voyager.feed.render.CarouselComponent",
+        "carousel",
+    ),
+    ("imageComponent", "image"),
+    ("videoComponent", "video"),
+    ("documentComponent", "document"),
+    ("pollComponent", "poll"),
+    ("articleComponent", "article"),
+    ("celebrationComponent", "celebration"),
+    ("carouselComponent", "carousel"),
+];
+
+/// Substring tokens used as a fallback when the response only carries
+/// `$type` rather than a typed component.
+const MEDIA_TYPE_TOKENS: &[(&str, &str)] = &[
+    ("Image", "image"),
+    ("Video", "video"),
+    ("Document", "document"),
+    ("Poll", "poll"),
+    ("Article", "article"),
+];
+
+fn extract_media_type_label(update: &Value) -> String {
+    let Some(content) = update.get("content") else {
+        return String::new();
     };
+    label_from_components(content)
+        .or_else(|| label_from_type_token(content))
+        .unwrap_or_default()
+}
 
-    // Check for specific component types (Rest.li union keys or direct fields).
-    let type_checks: &[(&str, &str)] = &[
-        ("com.linkedin.voyager.feed.render.ImageComponent", "image"),
-        (
-            "com.linkedin.voyager.feed.render.LinkedInVideoComponent",
-            "video",
-        ),
-        (
-            "com.linkedin.voyager.feed.render.DocumentComponent",
-            "document",
-        ),
-        ("com.linkedin.voyager.feed.render.PollComponent", "poll"),
-        (
-            "com.linkedin.voyager.feed.render.ArticleComponent",
-            "article",
-        ),
-        (
-            "com.linkedin.voyager.feed.render.CelebrationComponent",
-            "celebration",
-        ),
-        (
-            "com.linkedin.voyager.feed.render.CarouselComponent",
-            "carousel",
-        ),
-        ("imageComponent", "image"),
-        ("videoComponent", "video"),
-        ("documentComponent", "document"),
-        ("pollComponent", "poll"),
-        ("articleComponent", "article"),
-        ("celebrationComponent", "celebration"),
-        ("carouselComponent", "carousel"),
-    ];
+fn label_from_components(content: &Value) -> Option<String> {
+    MEDIA_COMPONENT_LABELS
+        .iter()
+        .find(|(key, _)| content.get(*key).is_some())
+        .map(|(_, label)| (*label).to_string())
+}
 
-    for (key, label) in type_checks {
-        if content.get(*key).is_some() {
-            return label.to_string();
-        }
-    }
-
-    // Check for $type field (some responses use this).
-    if let Some(type_str) = content.get("$type").and_then(|t| t.as_str()) {
-        if type_str.contains("Image") {
-            return "image".to_string();
-        }
-        if type_str.contains("Video") {
-            return "video".to_string();
-        }
-        if type_str.contains("Document") {
-            return "document".to_string();
-        }
-        if type_str.contains("Poll") {
-            return "poll".to_string();
-        }
-        if type_str.contains("Article") {
-            return "article".to_string();
-        }
-    }
-
-    String::new()
+fn label_from_type_token(content: &Value) -> Option<String> {
+    let type_str = content.get("$type").and_then(|t| t.as_str())?;
+    MEDIA_TYPE_TOKENS
+        .iter()
+        .find(|(token, _)| type_str.contains(token))
+        .map(|(_, label)| (*label).to_string())
 }
 
 /// Extract media URLs (images, videos, documents) from a feed item's content.
-///
-/// LinkedIn stores media URLs in various nested locations depending on type.
-/// Returns a vec of URL strings found.
-fn extract_media_urls(update: &serde_json::Value) -> Vec<String> {
+fn extract_media_urls(update: &Value) -> Vec<String> {
     let mut urls = Vec::new();
-    let content = match update.get("content") {
-        Some(c) => c,
-        None => return urls,
+    let Some(content) = update.get("content") else {
+        return urls;
     };
-
-    // Image URLs: look in imageComponent or the union variant.
-    let image_comp = content
-        .get("imageComponent")
-        .or_else(|| content.get("com.linkedin.voyager.feed.render.ImageComponent"));
-    if let Some(img) = image_comp {
-        // Images are in images[].attributes[].imageUrl or
-        // images[].attributes[].vectorImage.rootUrl + artifacts[].fileIdentifyingUrlPathSegment
-        collect_image_urls(img, &mut urls);
-    }
-
-    // Video URLs: look in videoComponent or the union variant.
-    let video_comp = content
-        .get("videoComponent")
-        .or_else(|| content.get("com.linkedin.voyager.feed.render.LinkedInVideoComponent"));
-    if let Some(vid) = video_comp {
-        // progressiveStreams[].streamingLocations[].url or videoPlayMetadata.progressiveStreams
-        if let Some(play_meta) = vid
-            .get("videoPlayMetadata")
-            .or_else(|| vid.get("videoPlay"))
-        {
-            if let Some(streams) = play_meta
-                .get("progressiveStreams")
-                .and_then(|s| s.as_array())
-            {
-                for stream in streams {
-                    if let Some(url) = stream
-                        .get("streamingLocations")
-                        .and_then(|sl| sl.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|loc| loc.get("url"))
-                        .and_then(|v| v.as_str())
-                    {
-                        urls.push(url.to_string());
-                        break; // One stream URL is enough.
-                    }
-                }
-            }
-            // Also try mediaUrl directly.
-            if let Some(url) = play_meta.get("media").and_then(|v| v.as_str()) {
-                urls.push(url.to_string());
-            }
-        }
-        // Try thumbnail/poster.
-        if let Some(poster) = vid.get("thumbnail").and_then(|t| {
-            t.get("url")
-                .and_then(|v| v.as_str())
-                .or_else(|| t.get("rootUrl").and_then(|v| v.as_str()))
-        }) {
-            if urls.is_empty() {
-                urls.push(format!("(thumbnail) {}", poster));
-            }
-        }
-    }
-
-    // Document URLs: look in documentComponent or the union variant.
-    let doc_comp = content
-        .get("documentComponent")
-        .or_else(|| content.get("com.linkedin.voyager.feed.render.DocumentComponent"));
-    if let Some(doc) = doc_comp {
-        if let Some(url) = doc
-            .get("document")
-            .and_then(|d| d.get("transcribedDocumentUrl").and_then(|v| v.as_str()))
-            .or_else(|| {
-                doc.get("document")
-                    .and_then(|d| d.get("downloadUrl").and_then(|v| v.as_str()))
-            })
-        {
-            urls.push(url.to_string());
-        }
-    }
-
-    // Carousel images.
-    let carousel_comp = content
-        .get("carouselComponent")
-        .or_else(|| content.get("com.linkedin.voyager.feed.render.CarouselComponent"));
-    if let Some(carousel) = carousel_comp {
-        if let Some(pages) = carousel.get("pages").and_then(|p| p.as_array()) {
-            for page in pages.iter().take(5) {
-                // Each page may have an imageComponent.
-                if let Some(img) = page.get("imageComponent") {
-                    collect_image_urls(img, &mut urls);
-                }
-            }
-        }
-    }
-
+    extract_image_urls_into(content, &mut urls);
+    extract_video_urls_into(content, &mut urls);
+    extract_document_urls_into(content, &mut urls);
+    extract_carousel_urls_into(content, &mut urls);
     urls
 }
 
-/// Collect image URLs from an image component into the urls vec.
-fn collect_image_urls(img: &serde_json::Value, urls: &mut Vec<String>) {
-    // Try images[].attributes[].imageUrl first.
-    if let Some(images) = img.get("images").and_then(|i| i.as_array()) {
-        for image in images {
-            if let Some(attrs) = image.get("attributes").and_then(|a| a.as_array()) {
-                for attr in attrs {
-                    if let Some(url) = attr.get("imageUrl").and_then(|v| v.as_str()) {
-                        urls.push(url.to_string());
-                        return;
-                    }
-                    // Try vectorImage: rootUrl + largest artifact.
-                    if let Some(vi) = attr.get("vectorImage") {
-                        if let Some(root) = vi.get("rootUrl").and_then(|v| v.as_str()) {
-                            let segment = vi
-                                .get("artifacts")
-                                .and_then(|a| a.as_array())
-                                .and_then(|arr| arr.last())
-                                .and_then(|a| {
-                                    a.get("fileIdentifyingUrlPathSegment")
-                                        .and_then(|v| v.as_str())
-                                })
-                                .unwrap_or("");
-                            urls.push(format!("{}{}", root, segment));
-                            return;
-                        }
-                    }
-                }
-            }
+fn extract_image_urls_into(content: &Value, urls: &mut Vec<String>) {
+    let Some(img) = component(content, "imageComponent", "ImageComponent") else {
+        return;
+    };
+    collect_image_urls(img, urls);
+}
+
+fn extract_video_urls_into(content: &Value, urls: &mut Vec<String>) {
+    let Some(vid) = component(content, "videoComponent", "LinkedInVideoComponent") else {
+        return;
+    };
+    if let Some(url) = first_video_stream_url(vid) {
+        urls.push(url);
+    }
+    if let Some(media) = vid
+        .get("videoPlayMetadata")
+        .or_else(|| vid.get("videoPlay"))
+        .and_then(|m| m.get("media"))
+        .and_then(|v| v.as_str())
+    {
+        urls.push(media.to_string());
+    }
+    if urls.is_empty() {
+        if let Some(thumb) = video_thumbnail_url(vid) {
+            urls.push(format!("(thumbnail) {}", thumb));
         }
     }
-    // Fallback: try a direct url field.
+}
+
+fn first_video_stream_url(vid: &Value) -> Option<String> {
+    let play_meta = vid
+        .get("videoPlayMetadata")
+        .or_else(|| vid.get("videoPlay"))?;
+    let streams = play_meta
+        .get("progressiveStreams")
+        .and_then(|s| s.as_array())?;
+    streams.iter().find_map(|stream| {
+        stream
+            .get("streamingLocations")
+            .and_then(|sl| sl.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|loc| loc.get("url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
+}
+
+fn video_thumbnail_url(vid: &Value) -> Option<&str> {
+    let thumbnail = vid.get("thumbnail")?;
+    thumbnail
+        .get("url")
+        .and_then(|v| v.as_str())
+        .or_else(|| thumbnail.get("rootUrl").and_then(|v| v.as_str()))
+}
+
+fn extract_document_urls_into(content: &Value, urls: &mut Vec<String>) {
+    let Some(doc) = component(content, "documentComponent", "DocumentComponent") else {
+        return;
+    };
+    let url = doc.get("document").and_then(|d| {
+        d.get("transcribedDocumentUrl")
+            .and_then(|v| v.as_str())
+            .or_else(|| d.get("downloadUrl").and_then(|v| v.as_str()))
+    });
+    if let Some(u) = url {
+        urls.push(u.to_string());
+    }
+}
+
+fn extract_carousel_urls_into(content: &Value, urls: &mut Vec<String>) {
+    let Some(carousel) = component(content, "carouselComponent", "CarouselComponent") else {
+        return;
+    };
+    let Some(pages) = carousel.get("pages").and_then(|p| p.as_array()) else {
+        return;
+    };
+    for page in pages.iter().take(5) {
+        if let Some(img) = page.get("imageComponent") {
+            collect_image_urls(img, urls);
+        }
+    }
+}
+
+/// Look up a feed content component by its short name, falling back to the
+/// fully-qualified Rest.li union key.
+fn component<'a>(content: &'a Value, short: &str, type_name: &str) -> Option<&'a Value> {
+    content
+        .get(short)
+        .or_else(|| content.get(format!("com.linkedin.voyager.feed.render.{}", type_name).as_str()))
+}
+
+/// Collect image URLs from an image component into the urls vec.
+fn collect_image_urls(img: &Value, urls: &mut Vec<String>) {
+    if let Some(url) = first_image_attribute_url(img) {
+        urls.push(url);
+        return;
+    }
     if let Some(url) = img.get("url").and_then(|v| v.as_str()) {
         urls.push(url.to_string());
     }
 }
 
-/// Handle `feed comments <index> [--count N] [--json]`.
-///
-/// Fetches comments on a post by index from the cached feed.
-pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Result<(), String> {
-    if index == 0 {
-        return Err("index must be >= 1".to_string());
+/// Walk `images[].attributes[]` and return the first imageUrl or
+/// vectorImage-derived URL found.
+fn first_image_attribute_url(img: &Value) -> Option<String> {
+    let images = img.get("images").and_then(|i| i.as_array())?;
+    images
+        .iter()
+        .filter_map(|image| image.get("attributes").and_then(|a| a.as_array()))
+        .flatten()
+        .find_map(image_attribute_url)
+}
+
+fn image_attribute_url(attr: &Value) -> Option<String> {
+    if let Some(url) = attr.get("imageUrl").and_then(|v| v.as_str()) {
+        return Some(url.to_string());
     }
+    let vi = attr.get("vectorImage")?;
+    let root = vi.get("rootUrl").and_then(|v| v.as_str())?;
+    let segment = vi
+        .get("artifacts")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|a| {
+            a.get("fileIdentifyingUrlPathSegment")
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    Some(format!("{}{}", root, segment))
+}
 
-    let cache = load_feed_cache()?;
-    let feed: FeedResponse =
-        serde_json::from_value(cache).map_err(|e| format!("failed to parse cached feed: {e}"))?;
+// ---------------------------------------------------------------------------
+// feed comments
+// ---------------------------------------------------------------------------
 
-    let element = feed.elements.get(index - 1).ok_or_else(|| {
-        format!(
-            "index {} out of range (feed has {} items)",
-            index,
-            feed.elements.len()
-        )
-    })?;
-
-    // Extract the socialDetail URN needed for the comments API.
-    let update = element
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(element);
-
-    let social_detail_urn = update
-        .get("socialDetail")
-        .and_then(|sd| sd.get("dashEntityUrn").or_else(|| sd.get("entityUrn")))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| "feed item has no socialDetail URN".to_string())?;
+/// Handle `feed comments <index> [--count N] [--json]`.
+pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Result<(), String> {
+    let element = cached_feed_element(index)?;
+    let social_detail_urn = social_detail_urn(&element)?;
 
     let (client, _path) = load_session_client()?;
-
     let value = client
-        .get_comments(social_detail_urn, 0, count)
+        .get_comments(&social_detail_urn, 0, count)
         .await
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&value);
     }
 
     let elements = value
@@ -1438,7 +1248,6 @@ pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Resu
         .and_then(|e| e.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
-
     if elements.is_empty() {
         println!("(no comments)");
         return Ok(());
@@ -1446,47 +1255,61 @@ pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Resu
 
     println!("Comments on post [{}]:", index);
     println!("---");
-
     for (i, comment) in elements.iter().enumerate() {
-        let commenter = comment
-            .get("commenter")
-            .and_then(|c| {
-                // Try title.text first, then fall back to accessibilityText
-                c.get("title")
-                    .and_then(|t| t.get("text"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| c.get("accessibilityText").and_then(|v| v.as_str()))
-            })
-            .unwrap_or("(unknown)");
-
-        // Commentary text is directly at commentary.text (not nested)
-        let text = comment
-            .get("commentary")
-            .and_then(|c| {
-                c.get("text").and_then(|t| {
-                    // Could be a string directly or a nested {text: "..."} object
-                    t.as_str()
-                        .or_else(|| t.get("text").and_then(|v| v.as_str()))
-                })
-            })
-            .unwrap_or("");
-
-        let likes = comment
-            .get("socialDetail")
-            .and_then(|sd| sd.get("totalSocialActivityCounts"))
-            .and_then(|c| c.get("numLikes"))
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-
-        println!("[{}] {}", i + 1, commenter);
-        println!("    {}", text);
-        if likes > 0 {
-            println!("    likes: {}", likes);
-        }
-        println!();
+        print_comment(i + 1, comment);
     }
-
     Ok(())
+}
+
+fn social_detail_urn(element: &Value) -> Result<String, String> {
+    let update = unwrap_update_v2(element);
+    update
+        .get("socialDetail")
+        .and_then(|sd| sd.get("dashEntityUrn").or_else(|| sd.get("entityUrn")))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "feed item has no socialDetail URN".to_string())
+}
+
+fn print_comment(index: usize, comment: &Value) {
+    let commenter = comment_author(comment);
+    let text = comment_text(comment);
+    let likes = comment
+        .get("socialDetail")
+        .and_then(|sd| sd.get("totalSocialActivityCounts"))
+        .and_then(|c| c.get("numLikes"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    println!("[{}] {}", index, commenter);
+    println!("    {}", text);
+    if likes > 0 {
+        println!("    likes: {}", likes);
+    }
+    println!();
+}
+
+fn comment_author(comment: &Value) -> &str {
+    comment
+        .get("commenter")
+        .and_then(|c| {
+            c.get("title")
+                .and_then(|t| t.get("text"))
+                .and_then(|v| v.as_str())
+                .or_else(|| c.get("accessibilityText").and_then(|v| v.as_str()))
+        })
+        .unwrap_or("(unknown)")
+}
+
+fn comment_text(comment: &Value) -> &str {
+    comment
+        .get("commentary")
+        .and_then(|c| {
+            c.get("text").and_then(|t| {
+                t.as_str()
+                    .or_else(|| t.get("text").and_then(|v| v.as_str()))
+            })
+        })
+        .unwrap_or("")
 }
 
 #[cfg(test)]
@@ -1537,50 +1360,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_reactions_urn_prefers_ugcpost_sharureurn() {
-        // UGC-backed post (e.g. an own text post): reactions endpoint
-        // requires the ugcPost URN, not the activity URN.
-        let element = json!({
+    /// Build a wrapped UpdateV2 element with the given activity + share URNs
+    /// in `updateMetadata`. Mirrors the live `feed list` response shape.
+    fn wrapped_metadata_element(activity_urn: &str, share_urn: &str) -> Value {
+        json!({
             "value": {
                 "com.linkedin.voyager.feed.render.UpdateV2": {
                     "updateMetadata": {
-                        "urn": "urn:li:activity:7450891298279972864",
-                        "shareUrn": "urn:li:ugcPost:7450888187100639232"
+                        "urn": activity_urn,
+                        "shareUrn": share_urn,
                     }
                 }
             }
-        });
-        assert_eq!(
-            extract_reactions_urn(&element),
-            Some("urn:li:ugcPost:7450888187100639232".to_string())
-        );
+        })
     }
 
     #[test]
-    fn extract_reactions_urn_uses_activity_for_share_backed() {
-        // Share-backed post (reshare): reactions endpoint requires the
-        // activity URN; passing the share URN silently returns total=0.
-        let element = json!({
-            "value": {
-                "com.linkedin.voyager.feed.render.UpdateV2": {
-                    "updateMetadata": {
-                        "urn": "urn:li:activity:7450895500045598720",
-                        "shareUrn": "urn:li:share:7450895499496202240"
-                    }
-                }
-            }
-        });
-        assert_eq!(
-            extract_reactions_urn(&element),
-            Some("urn:li:activity:7450895500045598720".to_string())
-        );
+    fn extract_reactions_urn_picks_correct_urn_per_post_backing() {
+        // (activity, share, expected) — exercises the URN-type-picky branch
+        // of `extract_reactions_urn`. ugcPost shareUrn wins over activity;
+        // share-backed posts fall through to the activity URN.
+        let cases = [
+            (
+                "urn:li:activity:7450891298279972864",
+                "urn:li:ugcPost:7450888187100639232",
+                "urn:li:ugcPost:7450888187100639232",
+            ),
+            (
+                "urn:li:activity:7450895500045598720",
+                "urn:li:share:7450895499496202240",
+                "urn:li:activity:7450895500045598720",
+            ),
+        ];
+        for (activity, share, expected) in cases {
+            let element = wrapped_metadata_element(activity, share);
+            assert_eq!(
+                extract_reactions_urn(&element),
+                Some(expected.to_string()),
+                "activity={activity} share={share}"
+            );
+        }
     }
 
     #[test]
     fn extract_reactions_urn_handles_unwrapped_update_element() {
-        // `feed my-posts` returns elements without the `value.UpdateV2`
-        // wrapper — the updateMetadata sits at the root.
         let element = json!({
             "updateMetadata": {
                 "urn": "urn:li:activity:7450808005048094720",

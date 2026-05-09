@@ -32,7 +32,7 @@ use events::{cmd_event_attendees, cmd_event_view};
 use feed::{
     cmd_feed_comment, cmd_feed_comments, cmd_feed_list, cmd_feed_my_posts, cmd_feed_post,
     cmd_feed_react, cmd_feed_reactions, cmd_feed_read, cmd_feed_stats, cmd_feed_unreact,
-    cmd_feed_view,
+    cmd_feed_view, FeedListOptions, FeedReactionsOptions,
 };
 use messages::{
     cmd_inbox, cmd_messages_list, cmd_messages_read, cmd_messages_reply, cmd_messages_send, cmd_who,
@@ -135,9 +135,16 @@ async fn dispatch_feed(action: FeedAction) {
             author,
             keyword,
             json,
-        } => exit_on_err(
-            cmd_feed_list(start, count, author.as_deref(), keyword.as_deref(), json).await,
-        ),
+        } => {
+            let opts = FeedListOptions {
+                start,
+                count,
+                author_filter: author.as_deref(),
+                keyword_filter: keyword.as_deref(),
+                raw_json: json,
+            };
+            exit_on_err(cmd_feed_list(opts).await);
+        }
         FeedAction::Comments { index, count, json } => {
             exit_on_err(cmd_feed_comments(index, count, json).await)
         }
@@ -154,9 +161,16 @@ async fn dispatch_feed(action: FeedAction) {
             count,
             start,
             json,
-        } => exit_on_err(
-            cmd_feed_reactions(post_urn.as_deref(), from_list, start, count, json).await,
-        ),
+        } => {
+            let opts = FeedReactionsOptions {
+                post_urn: post_urn.as_deref(),
+                from_list,
+                start,
+                count,
+                raw_json: json,
+            };
+            exit_on_err(cmd_feed_reactions(opts).await);
+        }
         FeedAction::Stats { json } => exit_on_err(cmd_feed_stats(json).await),
         other => dispatch_feed_write(other).await,
     }
