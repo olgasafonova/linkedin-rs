@@ -1,7 +1,31 @@
 use chrono::Datelike;
+use serde_json::Value;
 
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
+
+/// Pretty-print a JSON value to stdout.
+fn print_json(value: &Value) -> Result<(), String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+/// Walk a nested object path, returning the final string if every step
+/// resolves and the leaf is a string.
+fn nested_text<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(key)?;
+    }
+    current.as_str()
+}
+
+/// Read a string field directly under `value`.
+fn field_str<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
 
 /// Handle `profile me [--json]`.
 ///
@@ -17,9 +41,7 @@ pub async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&me).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&me)?;
     } else {
         print_me_summary(&me);
     }
@@ -44,14 +66,9 @@ pub async fn cmd_profile_view(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if summary {
-        let summary_value = extract_profile_summary(&profile);
-        let pretty = serde_json::to_string_pretty(&summary_value)
-            .map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&extract_profile_summary(&profile))?;
     } else if raw_json {
-        let pretty = serde_json::to_string_pretty(&profile)
-            .map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&profile)?;
     } else {
         print_profile_summary(&profile);
     }
@@ -137,11 +154,8 @@ pub async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), St
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty = serde_json::to_string_pretty(&profile)
-            .map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
+        print_json(&profile)?;
     } else {
-        // Extract basic info to confirm which profile was visited.
         let first = profile
             .get("firstName")
             .and_then(|v| v.as_str())
@@ -150,10 +164,7 @@ pub async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), St
             .get("lastName")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let headline = profile
-            .get("headline")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let headline = field_str(&profile, "headline");
         println!("Visited: {} {}", first, last);
         if !headline.is_empty() {
             println!("  {}", headline);
@@ -177,10 +188,7 @@ pub async fn cmd_profile_viewers(raw_json: bool) -> Result<(), String> {
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&value);
     }
 
     print_profile_viewers(&value);
@@ -443,16 +451,13 @@ fn check_location(profile: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
-fn print_audit_json(public_id: &str, findings: &[serde_json::Value]) -> Result<(), String> {
+fn print_audit_json(public_id: &str, findings: &[Value]) -> Result<(), String> {
     let output = serde_json::json!({
         "publicId": public_id,
         "findings": findings,
         "score": if findings.is_empty() { "complete" } else { "needs_attention" }
     });
-    let pretty =
-        serde_json::to_string_pretty(&output).map_err(|e| format!("JSON format error: {e}"))?;
-    println!("{}", pretty);
-    Ok(())
+    print_json(&output)
 }
 
 fn print_audit_report(public_id: &str, findings: &[serde_json::Value]) {
@@ -492,6 +497,16 @@ fn print_audit_report(public_id: &str, findings: &[serde_json::Value]) {
     );
 }
 
+// Rest.li union keys used by the wvmpCards response.
+const WVMP_VIEWERS_CARD: &str = "com.linkedin.voyager.identity.me.wvmpOverview.WvmpViewersCard";
+const WVMP_SUMMARY_CARD: &str =
+    "com.linkedin.voyager.identity.me.wvmpOverview.WvmpSummaryInsightCard";
+const WVMP_PROFILE_VIEW: &str = "com.linkedin.voyager.identity.me.WvmpProfileViewCard";
+const WVMP_PRIVATE_VIEWER: &str = "com.linkedin.voyager.identity.me.PrivateProfileViewer";
+const WVMP_GENERIC_CARD: &str = "com.linkedin.voyager.identity.me.WvmpGenericCard";
+const WVMP_ANON_CARD: &str = "com.linkedin.voyager.identity.me.WvmpAnonymousProfileViewCard";
+const WVMP_PREMIUM_UPSELL: &str = "com.linkedin.voyager.identity.me.WvmpPremiumUpsellCard";
+
 /// Print a human-readable summary of the wvmpCards response.
 ///
 /// The response has a deeply nested Rest.li union structure:
@@ -499,145 +514,27 @@ fn print_audit_report(public_id: &str, findings: &[serde_json::Value]) {
 /// - Each insight card has `value["...WvmpSummaryInsightCard"]` with:
 ///   - `numViewsChangeInPercentage` -- week-over-week view change
 ///   - `cards[]` -- individual viewer entries, each with a union value
-fn print_profile_viewers(data: &serde_json::Value) {
-    let elements = match data.get("elements").and_then(|e| e.as_array()) {
-        Some(arr) => arr,
-        None => {
-            println!("(no viewer data)");
-            return;
-        }
+fn print_profile_viewers(data: &Value) {
+    let Some(elements) = data.get("elements").and_then(|e| e.as_array()) else {
+        println!("(no viewer data)");
+        return;
     };
 
     let mut viewer_index = 0;
-
-    for element in elements {
-        // Unwrap Rest.li union: value["com.linkedin.voyager.identity.me.wvmpOverview.WvmpViewersCard"]
-        let viewers_card = element
-            .get("value")
-            .and_then(|v| v.get("com.linkedin.voyager.identity.me.wvmpOverview.WvmpViewersCard"));
-
-        let viewers_card = match viewers_card {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let insight_cards = match viewers_card.get("insightCards").and_then(|i| i.as_array()) {
-            Some(arr) => arr,
-            None => continue,
-        };
-
-        for insight_card in insight_cards {
-            // Unwrap: value["...WvmpSummaryInsightCard"]
-            let summary = insight_card.get("value").and_then(|v| {
-                v.get("com.linkedin.voyager.identity.me.wvmpOverview.WvmpSummaryInsightCard")
-            });
-
-            let summary = match summary {
-                Some(s) => s,
-                None => continue,
+    for summary in iter_wvmp_summary_cards(elements) {
+        print_view_change_header(summary);
+        let cards = summary
+            .get("cards")
+            .and_then(|c| c.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        for card in cards {
+            let Some(card_value) = card.get("value") else {
+                continue;
             };
-
-            // Print view change percentage header.
-            let pct_change = summary
-                .get("numViewsChangeInPercentage")
-                .and_then(|n| n.as_f64());
-            match pct_change {
-                Some(pct) => {
-                    let sign = if pct >= 0.0 { "+" } else { "" };
-                    println!("Profile viewers (change: {}{}%)", sign, pct as i64);
-                }
-                None => {
-                    println!("Profile viewers");
-                }
-            }
-            println!("---");
-
-            // Iterate individual viewer cards.
-            let cards = match summary.get("cards").and_then(|c| c.as_array()) {
-                Some(arr) => arr,
-                None => continue,
-            };
-
-            for card in cards {
-                let card_value = match card.get("value") {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                viewer_index += 1;
-
-                // Case 1: Named viewer (WvmpProfileViewCard)
-                if let Some(profile_card) =
-                    card_value.get("com.linkedin.voyager.identity.me.WvmpProfileViewCard")
-                {
-                    let (name, occupation) = extract_viewer_profile(profile_card);
-                    println!("[{}] {}", viewer_index, name);
-                    if !occupation.is_empty() {
-                        println!("    {}", occupation);
-                    }
-                    continue;
-                }
-
-                // Case 2: Private viewer (PrivateProfileViewer)
-                if let Some(private_card) =
-                    card_value.get("com.linkedin.voyager.identity.me.PrivateProfileViewer")
-                {
-                    let headline = private_card
-                        .get("headline")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or("Private viewer");
-                    println!("[{}] (private) {}", viewer_index, headline);
-                    continue;
-                }
-
-                // Case 3: Aggregated/generic (WvmpGenericCard)
-                // The headline field is a TextViewModel with shape {text: "..."}.
-                if let Some(generic_card) =
-                    card_value.get("com.linkedin.voyager.identity.me.WvmpGenericCard")
-                {
-                    let text = generic_card
-                        .get("headline")
-                        .and_then(|h| h.get("text"))
-                        .and_then(|t| t.as_str())
-                        .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
-                        .unwrap_or("Anonymous viewer(s)");
-                    println!("[{}] (aggregated) {}", viewer_index, text);
-                    continue;
-                }
-
-                // Case 4: Anonymous viewers (WvmpAnonymousProfileViewCard)
-                if let Some(anon_card) =
-                    card_value.get("com.linkedin.voyager.identity.me.WvmpAnonymousProfileViewCard")
-                {
-                    let num = anon_card
-                        .get("numViewers")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(1);
-                    let label = if num == 1 {
-                        "1 anonymous viewer".to_string()
-                    } else {
-                        format!("{} anonymous viewers", num)
-                    };
-                    println!("[{}] (anonymous) {}", viewer_index, label);
-                    continue;
-                }
-
-                // Case 5: Premium upsell card -- skip, not a real viewer.
-                if card_value
-                    .get("com.linkedin.voyager.identity.me.WvmpPremiumUpsellCard")
-                    .is_some()
-                {
-                    viewer_index -= 1; // don't count as a viewer entry
-                    continue;
-                }
-
-                // Fallback: unknown card type -- print the union key.
-                if let Some(obj) = card_value.as_object() {
-                    let key = obj.keys().next().unwrap_or(&String::new()).clone();
-                    println!("[{}] (unknown: {})", viewer_index, key);
-                } else {
-                    println!("[{}] (unknown card)", viewer_index);
-                }
+            viewer_index += 1;
+            if !print_wvmp_viewer_card(viewer_index, card_value) {
+                viewer_index -= 1; // upsell or unrecognised, don't count
             }
         }
     }
@@ -647,6 +544,81 @@ fn print_profile_viewers(data: &serde_json::Value) {
         println!("---");
         println!("(no viewers found)");
     }
+}
+
+/// Walk wvmp `elements` -> `WvmpViewersCard.insightCards[].WvmpSummaryInsightCard`.
+fn iter_wvmp_summary_cards(elements: &[Value]) -> impl Iterator<Item = &Value> {
+    elements
+        .iter()
+        .filter_map(|el| el.get("value").and_then(|v| v.get(WVMP_VIEWERS_CARD)))
+        .filter_map(|vc| vc.get("insightCards").and_then(|i| i.as_array()))
+        .flatten()
+        .filter_map(|ic| ic.get("value").and_then(|v| v.get(WVMP_SUMMARY_CARD)))
+}
+
+fn print_view_change_header(summary: &Value) {
+    let pct = summary
+        .get("numViewsChangeInPercentage")
+        .and_then(|n| n.as_f64());
+    match pct {
+        Some(p) => {
+            let sign = if p >= 0.0 { "+" } else { "" };
+            println!("Profile viewers (change: {}{}%)", sign, p as i64);
+        }
+        None => println!("Profile viewers"),
+    }
+    println!("---");
+}
+
+/// Render a single viewer card. Returns true if the entry was countable
+/// (a real viewer), false for upsell/skipped cards.
+fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
+    if let Some(profile_card) = card_value.get(WVMP_PROFILE_VIEW) {
+        let (name, occupation) = extract_viewer_profile(profile_card);
+        println!("[{}] {}", index, name);
+        if !occupation.is_empty() {
+            println!("    {}", occupation);
+        }
+        return true;
+    }
+    if let Some(private_card) = card_value.get(WVMP_PRIVATE_VIEWER) {
+        let headline = private_card
+            .get("headline")
+            .and_then(|h| h.as_str())
+            .unwrap_or("Private viewer");
+        println!("[{}] (private) {}", index, headline);
+        return true;
+    }
+    if let Some(generic_card) = card_value.get(WVMP_GENERIC_CARD) {
+        let text = nested_text(generic_card, &["headline", "text"])
+            .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
+            .unwrap_or("Anonymous viewer(s)");
+        println!("[{}] (aggregated) {}", index, text);
+        return true;
+    }
+    if let Some(anon_card) = card_value.get(WVMP_ANON_CARD) {
+        let num = anon_card
+            .get("numViewers")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(1);
+        let label = if num == 1 {
+            "1 anonymous viewer".to_string()
+        } else {
+            format!("{} anonymous viewers", num)
+        };
+        println!("[{}] (anonymous) {}", index, label);
+        return true;
+    }
+    if card_value.get(WVMP_PREMIUM_UPSELL).is_some() {
+        return false;
+    }
+    if let Some(obj) = card_value.as_object() {
+        let key = obj.keys().next().cloned().unwrap_or_default();
+        println!("[{}] (unknown: {})", index, key);
+    } else {
+        println!("[{}] (unknown card)", index);
+    }
+    true
 }
 
 /// Extract name and occupation from a WvmpProfileViewCard.
@@ -701,144 +673,141 @@ fn extract_viewer_profile(profile_card: &serde_json::Value) -> (String, String) 
 /// REST endpoint (e.g., `profilePositionGroups` instead of `positions`,
 /// `dateRange` with `start`/`end` instead of `timePeriod` with
 /// `startDate`/`endDate`).
-fn print_profile_summary(profile: &serde_json::Value) {
-    // Name.
-    let first = profile
-        .get("firstName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let last = profile
-        .get("lastName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+fn print_profile_summary(profile: &Value) {
+    print_summary_name(profile);
+    print_summary_simple_fields(profile);
+    print_summary_about(profile);
+    print_summary_network(profile);
+    print_summary_urn(profile);
+    print_summary_positions(profile);
+    print_summary_education(profile);
+}
+
+fn print_summary_name(profile: &Value) {
+    let first = field_str(profile, "firstName");
+    let last = field_str(profile, "lastName");
     if !first.is_empty() || !last.is_empty() {
         println!("Name: {} {}", first, last);
     }
+}
 
-    // Public identifier.
+/// Print the single-line, top-level fields: public ID, headline, location,
+/// industry. Each prints only if present.
+fn print_summary_simple_fields(profile: &Value) {
     if let Some(pub_id) = profile.get("publicIdentifier").and_then(|v| v.as_str()) {
         println!("Public ID: {}", pub_id);
     }
-
-    // Headline.
     if let Some(headline) = profile.get("headline").and_then(|v| v.as_str()) {
         println!("Headline: {}", headline);
     }
-
-    // Location -- Dash uses geoLocation.geo.defaultLocalizedName.
-    let geo_name = profile
-        .get("geoLocation")
-        .and_then(|g| g.get("geo"))
-        .and_then(|g| g.get("defaultLocalizedName"))
-        .and_then(|v| v.as_str());
-    if let Some(loc) = geo_name {
+    if let Some(loc) = nested_text(profile, &["geoLocation", "geo", "defaultLocalizedName"]) {
         println!("Location: {}", loc);
     }
-
-    // Industry -- Dash uses industry.name.
-    let industry_name = profile
-        .get("industry")
-        .and_then(|i| i.get("name"))
-        .and_then(|v| v.as_str());
-    if let Some(industry) = industry_name {
+    if let Some(industry) = nested_text(profile, &["industry", "name"]) {
         println!("Industry: {}", industry);
     }
+}
 
-    // Summary / About.
+fn print_summary_about(profile: &Value) {
     if let Some(summary) = profile.get("summary").and_then(|v| v.as_str()) {
         println!("About: {}", truncate_with_ellipsis(summary, 200));
     }
+}
 
-    // Connection/follower count -- may be in networkInfo, memberRelationship, or at top level.
-    let connections = profile
+fn print_summary_network(profile: &Value) {
+    let connections = connection_count(profile);
+    let followers = follower_count(profile);
+    match (connections, followers) {
+        (Some(c), Some(f)) => println!("Connections: {}  |  Followers: {}", c, f),
+        (Some(c), None) => println!("Connections: {}", c),
+        (None, Some(f)) => println!("Followers: {}", f),
+        (None, None) => {}
+    }
+}
+
+/// Try `networkInfo.connectionsCount`, then `memberRelationship.connectionsCount`,
+/// then top-level `connectionsCount`.
+fn connection_count(profile: &Value) -> Option<u64> {
+    profile
         .get("networkInfo")
-        .and_then(|n| n.get("connectionsCount").and_then(|v| v.as_u64()))
+        .and_then(|n| n.get("connectionsCount"))
+        .and_then(|v| v.as_u64())
         .or_else(|| {
             profile
                 .get("memberRelationship")
-                .and_then(|m| m.get("connectionsCount").and_then(|v| v.as_u64()))
+                .and_then(|m| m.get("connectionsCount"))
+                .and_then(|v| v.as_u64())
         })
-        .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()));
-    let followers = profile
+        .or_else(|| profile.get("connectionsCount").and_then(|v| v.as_u64()))
+}
+
+fn follower_count(profile: &Value) -> Option<u64> {
+    profile
         .get("networkInfo")
-        .and_then(|n| n.get("followersCount").and_then(|v| v.as_u64()))
-        .or_else(|| profile.get("followersCount").and_then(|v| v.as_u64()));
+        .and_then(|n| n.get("followersCount"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| profile.get("followersCount").and_then(|v| v.as_u64()))
+}
 
-    if let Some(count) = connections {
-        print!("Connections: {}", count);
-        if let Some(f) = followers {
-            print!("  |  Followers: {}", f);
-        }
-        println!();
-    } else if let Some(f) = followers {
-        println!("Followers: {}", f);
-    }
-
-    // Entity URN.
+fn print_summary_urn(profile: &Value) {
     if let Some(urn) = profile.get("entityUrn").and_then(|v| v.as_str()) {
         println!("URN: {}", urn);
     }
+}
 
-    // Positions -- Dash uses profilePositionGroups.elements[].profilePositionInPositionGroup.elements[].
-    if let Some(groups) = profile
-        .get("profilePositionGroups")
-        .and_then(|p| p.get("elements"))
-        .and_then(|e| e.as_array())
-    {
-        let mut printed_header = false;
-        for group in groups {
-            let positions = group
-                .get("profilePositionInPositionGroup")
-                .and_then(|p| p.get("elements"))
-                .and_then(|e| e.as_array());
-            if let Some(pos_list) = positions {
-                for pos in pos_list {
-                    if !printed_header {
-                        println!("\nPositions:");
-                        printed_header = true;
-                    }
-                    let title = pos.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let company = pos
-                        .get("companyName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let period = format_date_range(pos.get("dateRange"));
-                    if !title.is_empty() || !company.is_empty() {
-                        println!("  - {} at {}{}", title, company, period);
-                    }
-                }
-            }
+fn print_summary_positions(profile: &Value) {
+    let mut printed_header = false;
+    for pos in iter_positions(profile) {
+        let title = field_str(pos, "title");
+        let company = field_str(pos, "companyName");
+        if title.is_empty() && company.is_empty() {
+            continue;
         }
+        if !printed_header {
+            println!("\nPositions:");
+            printed_header = true;
+        }
+        let period = format_date_range(pos.get("dateRange"));
+        println!("  - {} at {}{}", title, company, period);
     }
+}
 
-    // Education -- Dash uses profileEducations.elements[].
-    if let Some(edu_list) = profile
+fn print_summary_education(profile: &Value) {
+    let educations: Vec<&Value> = iter_educations(profile).collect();
+    if educations.is_empty() {
+        return;
+    }
+    println!("\nEducation:");
+    for edu in educations {
+        print_education_entry(edu);
+    }
+}
+
+/// Iterate over `profileEducations.elements`. Empty when missing.
+fn iter_educations(profile: &Value) -> impl Iterator<Item = &Value> {
+    profile
         .get("profileEducations")
         .and_then(|e| e.get("elements"))
         .and_then(|e| e.as_array())
-    {
-        if !edu_list.is_empty() {
-            println!("\nEducation:");
-            for edu in edu_list {
-                let school = edu.get("schoolName").and_then(|v| v.as_str()).unwrap_or("");
-                let degree = edu.get("degreeName").and_then(|v| v.as_str()).unwrap_or("");
-                let field = edu
-                    .get("fieldOfStudy")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let period = format_date_range(edu.get("dateRange"));
-                let degree_field = match (degree.is_empty(), field.is_empty()) {
-                    (true, true) => String::new(),
-                    (false, true) => format!(", {}", degree),
-                    (true, false) => format!(", {}", field),
-                    (false, false) => format!(", {} in {}", degree, field),
-                };
-                if !school.is_empty() {
-                    println!("  - {}{}{}", school, degree_field, period);
-                }
-            }
-        }
+        .into_iter()
+        .flatten()
+}
+
+fn print_education_entry(edu: &Value) {
+    let school = field_str(edu, "schoolName");
+    if school.is_empty() {
+        return;
     }
+    let degree = field_str(edu, "degreeName");
+    let field = field_str(edu, "fieldOfStudy");
+    let period = format_date_range(edu.get("dateRange"));
+    let degree_field = match (degree.is_empty(), field.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(", {}", degree),
+        (true, false) => format!(", {}", field),
+        (false, false) => format!(", {} in {}", degree, field),
+    };
+    println!("  - {}{}{}", school, degree_field, period);
 }
 
 /// Format a `dateRange` object into a human-readable string like " (2020 - 2023)".
@@ -886,41 +855,41 @@ fn format_date_range(date_range: Option<&serde_json::Value>) -> String {
 /// Extracts known fields from the response and prints them. The exact
 /// response structure depends on LinkedIn's API version, so this is
 /// best-effort. Unknown fields are skipped rather than causing errors.
-fn print_me_summary(me: &serde_json::Value) {
+fn print_me_summary(me: &Value) {
     if let Some(mini) = me.get("miniProfile") {
-        let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");
-        let last = mini.get("lastName").and_then(|v| v.as_str()).unwrap_or("");
-        if !first.is_empty() || !last.is_empty() {
-            println!("Name: {} {}", first, last);
-        }
-
-        if let Some(occ) = mini.get("occupation").and_then(|v| v.as_str()) {
-            println!("Headline: {}", occ);
-        }
-
-        if let Some(urn) = mini.get("entityUrn").and_then(|v| v.as_str()) {
-            println!("URN: {}", urn);
-        }
-
-        if let Some(vanity) = mini.get("publicIdentifier").and_then(|v| v.as_str()) {
-            println!("Public ID: {}", vanity);
-        }
+        print_me_mini(mini);
     }
-
     if let Some(id) = me.get("plainId").and_then(|v| v.as_i64()) {
         println!("Member ID: {}", id);
     }
-
     if let Some(premium) = me.get("premiumSubscriber").and_then(|v| v.as_bool()) {
         println!("Premium: {}", if premium { "yes" } else { "no" });
     }
+    print_me_response_keys(me);
+}
 
-    // Print top-level keys for discoverability.
-    if let Some(obj) = me.as_object() {
-        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-        if !keys.is_empty() {
-            println!("Response keys: {}", keys.join(", "));
-        }
+fn print_me_mini(mini: &Value) {
+    let first = field_str(mini, "firstName");
+    let last = field_str(mini, "lastName");
+    if !first.is_empty() || !last.is_empty() {
+        println!("Name: {} {}", first, last);
+    }
+    print_labeled_field(mini, "occupation", "Headline");
+    print_labeled_field(mini, "entityUrn", "URN");
+    print_labeled_field(mini, "publicIdentifier", "Public ID");
+}
+
+fn print_labeled_field(value: &Value, key: &str, label: &str) {
+    if let Some(v) = value.get(key).and_then(|v| v.as_str()) {
+        println!("{}: {}", label, v);
+    }
+}
+
+fn print_me_response_keys(me: &Value) {
+    let Some(obj) = me.as_object() else { return };
+    let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    if !keys.is_empty() {
+        println!("Response keys: {}", keys.join(", "));
     }
 }
 
