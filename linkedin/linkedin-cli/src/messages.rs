@@ -111,8 +111,7 @@ fn print_unread_messages_section(conversations: &Value, show_all: bool) {
         .filter(|c| is_unread_conversation(c))
         .collect();
 
-    let (displayed, spam_count) =
-        filter_spam(unread.as_slice(), show_all, |c| is_spam_conversation(c));
+    let (displayed, spam_count) = filter_spam(unread.as_slice(), show_all, is_spam_conversation);
 
     println!("Unread Messages ({})", displayed.len());
     println!("---");
@@ -207,8 +206,7 @@ fn first_message_body(conv: &Value) -> Option<String> {
 
 fn print_pending_invitations_section(invitations: &Value, show_all: bool) {
     let inv_refs: Vec<&Value> = elements_slice(invitations).iter().collect();
-    let (displayed, spam_count) =
-        filter_spam(inv_refs.as_slice(), show_all, |i| is_spam_invitation(i));
+    let (displayed, spam_count) = filter_spam(inv_refs.as_slice(), show_all, is_spam_invitation);
 
     println!("Pending Invitations ({})", displayed.len());
     println!("---");
