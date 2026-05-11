@@ -45,9 +45,24 @@ pub async fn cmd_company_followers(
     let company_id = extract_company_id(&company)?;
 
     match client.get_company_followers(company_id, start, count).await {
-        Ok(value) => print_followers_primary(&company, company_name, &value, start, raw_json),
+        Ok(value) => print_followers_primary(FollowersPrintArgs {
+            company: &company,
+            company_name,
+            value: &value,
+            start,
+            raw_json,
+        }),
         Err(_) => print_followers_fallback(&company, company_name, raw_json),
     }
+}
+
+/// Bundled inputs for [`print_followers_primary`].
+struct FollowersPrintArgs<'a> {
+    company: &'a Value,
+    company_name: &'a str,
+    value: &'a Value,
+    start: u32,
+    raw_json: bool,
 }
 
 /// Pull the numeric company ID from the response. Prefers the trailing
@@ -68,25 +83,19 @@ fn extract_company_id(company: &Value) -> Result<&str, String> {
 
 /// Print the result of the admin follower endpoint. Branches on
 /// list-vs-analytics shape; either path may emit JSON.
-fn print_followers_primary(
-    company: &Value,
-    company_name: &str,
-    value: &Value,
-    start: u32,
-    raw_json: bool,
-) -> Result<(), String> {
-    if raw_json {
-        return print_json(value);
+fn print_followers_primary(args: FollowersPrintArgs<'_>) -> Result<(), String> {
+    if args.raw_json {
+        return print_json(args.value);
     }
 
-    if let Some(elements) = value.get("elements").and_then(|e| e.as_array()) {
-        let total = follower_total(company);
-        print_followers_list(company_name, total, elements, start);
+    if let Some(elements) = args.value.get("elements").and_then(|e| e.as_array()) {
+        let total = follower_total(args.company);
+        print_followers_list(args.company_name, total, elements, args.start);
         return Ok(());
     }
 
-    println!("Follower analytics for {}:", company_name);
-    print_json(value)
+    println!("Follower analytics for {}:", args.company_name);
+    print_json(args.value)
 }
 
 /// Print a numbered follower list with a header and optional total.
