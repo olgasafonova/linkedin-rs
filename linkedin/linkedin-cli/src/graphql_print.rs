@@ -158,7 +158,7 @@ fn format_delivered_at(msg: &serde_json::Value) -> String {
 
 fn sender_display_name(msg: &serde_json::Value) -> String {
     let sender = msg.get("sender");
-    if let Some(name) = sender.and_then(sender_member_name) {
+    if let Some(name) = sender.and_then(participant_full_name) {
         return name;
     }
     sender
@@ -167,18 +167,6 @@ fn sender_display_name(msg: &serde_json::Value) -> String {
         .and_then(|u| u.strip_prefix("urn:li:fsd_profile:"))
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn sender_member_name(sender: &serde_json::Value) -> Option<String> {
-    let member = sender
-        .get("participantType")
-        .and_then(|pt| pt.get("member"))?;
-    let first = member_text_field(member, "firstName");
-    let last = member_text_field(member, "lastName");
-    if first.is_empty() && last.is_empty() {
-        return None;
-    }
-    Some(format!("{} {}", first, last).trim().to_string())
 }
 
 /// Message bodies arrive as either a bare string or `{text: "..."}`.

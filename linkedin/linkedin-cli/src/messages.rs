@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use linkedin_api::client::LinkedInClient;
-use linkedin_api::models::ConnectionsResponse;
+use linkedin_api::models::{ConnectionsResponse, Paging};
 
 use crate::graphql_print::{print_graphql_conversation, print_graphql_message};
 use crate::session::load_session_client;
@@ -444,24 +444,35 @@ async fn scan_connections_at(
         let resp: ConnectionsResponse =
             serde_json::from_value(value).map_err(|e| format!("parse error: {e}"))?;
 
-        for element in &resp.elements {
-            if let Some(m) = match_connection_at(element, name_lower, slug_lower) {
-                matches.push(m);
-            }
-        }
+        matches.extend(
+            resp.elements
+                .iter()
+                .filter_map(|el| match_connection_at(el, name_lower, slug_lower)),
+        );
 
         let page_count = resp.elements.len() as u32;
-        if page_count < page_size {
+        if scan_page_exhausted(page_count, page_size, offset, resp.paging.as_ref()) {
             break;
-        }
-        if let Some(total) = resp.paging.as_ref().and_then(|p| p.total) {
-            if offset + page_count >= total {
-                break;
-            }
         }
         offset += page_count;
     }
     Ok(matches)
+}
+
+/// True when the current page is the last one: either short (fewer rows than
+/// `page_size`) or we've reached `paging.total`.
+fn scan_page_exhausted(
+    page_count: u32,
+    page_size: u32,
+    offset: u32,
+    paging: Option<&Paging>,
+) -> bool {
+    if page_count < page_size {
+        return true;
+    }
+    paging
+        .and_then(|p| p.total)
+        .is_some_and(|total| offset + page_count >= total)
 }
 
 fn match_connection_at(
