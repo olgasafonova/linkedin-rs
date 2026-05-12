@@ -17,7 +17,7 @@ use serde_json::Value;
 ///
 /// Returned as `paging` in all collection endpoints. See
 /// `re/restli_protocol.md` section 7.2.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Paging {
     /// 0-based offset of the current page.
@@ -43,7 +43,7 @@ pub struct Paging {
 /// Wraps a standard Rest.li collection of `UpdateV2` items.
 /// See `re/restli_protocol.md` section 7.1 for the generic structure
 /// and `re/pegasus_models.md` for the `UpdateV2` model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeedResponse {
     /// Array of feed update items. Each element is an `UpdateV2` record,
@@ -72,7 +72,7 @@ pub struct FeedResponse {
 /// else is captured as `Option<Value>` so we don't drop unknown fields.
 ///
 /// Reference: `re/pegasus_models.md` -- `UpdateV2 (voyager.feed.render)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateV2 {
     /// URN identifying this feed update.
@@ -124,7 +124,7 @@ pub struct UpdateV2 {
 /// Social engagement metadata for a feed item.
 ///
 /// Reference: `re/pegasus_models.md` -- `SocialDetail (voyager.feed)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocialDetail {
     /// URN for the social detail.
@@ -155,7 +155,7 @@ pub struct SocialDetail {
 /// Aggregated social activity counts.
 ///
 /// Reference: `re/pegasus_models.md` -- `SocialActivityCounts (voyager.feed.shared)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocialActivityCounts {
     /// Number of likes.
@@ -183,7 +183,7 @@ pub struct SocialActivityCounts {
 ///
 /// Reference: `re/pegasus_models.md` -- `MiniProfile (voyager.identity.shared)`.
 /// Appears inside `Me`, `Profile`, `Conversation` participants, etc.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniProfile {
     /// Entity URN, e.g. `urn:li:fs_miniProfile:ACoAABxxxxxx`.
@@ -233,7 +233,7 @@ pub struct MiniProfile {
 /// Returned by `GET /voyager/api/identity/profiles/{id}` with decoration.
 /// Fields kept as `Option` since we haven't validated all shapes against
 /// the live API yet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
     /// Entity URN.
@@ -327,7 +327,7 @@ pub struct Profile {
 /// Work experience entry.
 ///
 /// Reference: `re/pegasus_models.md` -- `Position (voyager.identity.profile)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     /// Entity URN.
@@ -382,7 +382,7 @@ pub struct Position {
 /// Education entry.
 ///
 /// Reference: `re/pegasus_models.md` -- `Education (voyager.identity.profile)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Education {
     /// Entity URN.
@@ -443,7 +443,7 @@ pub struct Education {
 /// Wraps a standard Rest.li collection of `Conversation` items.
 /// See `re/api_endpoint_catalog.md` section 6 and `re/pegasus_models.md`
 /// for the `Conversation` model definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationsResponse {
     /// Array of conversation items.
@@ -463,7 +463,7 @@ pub struct ConversationsResponse {
 ///
 /// Reference: `re/pegasus_models.md` -- `Conversation (voyager.messaging)`.
 /// Fields kept as `Option` since we haven't validated against live API yet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
     /// URN identifying this conversation, e.g. `urn:li:messagingThread:...`.
@@ -545,7 +545,7 @@ pub struct Conversation {
 /// A single messaging event (message, participant change, etc.).
 ///
 /// Reference: `re/pegasus_models.md` -- `Event (voyager.messaging)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagingEvent {
     /// URN identifying this event.
@@ -597,7 +597,7 @@ pub struct MessagingEvent {
 /// Top-level response from the `messaging/conversations/{id}/events` endpoint.
 ///
 /// Wraps a standard Rest.li collection of `MessagingEvent` items.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationEventsResponse {
     /// Array of event items.
@@ -618,7 +618,7 @@ pub struct ConversationEventsResponse {
 /// Wraps a standard Rest.li collection of `Connection` items.
 /// See `re/api_endpoint_catalog.md` section 8 and `re/pegasus_models.md`
 /// for the `Connection` model definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionsResponse {
     /// Array of connection items.
@@ -638,7 +638,7 @@ pub struct ConnectionsResponse {
 ///
 /// Reference: `re/pegasus_models.md` -- `Connection (voyager.relationships.shared.connection)`.
 /// Fields kept as `Option` since we haven't validated against live API yet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Connection {
     /// URN identifying this connection, e.g. `urn:li:fs_connection:ACoAABxxxxxx`.
@@ -680,7 +680,7 @@ pub struct Connection {
 /// Wraps a standard Rest.li collection of `NotificationCard` items.
 /// See `re/api_endpoint_catalog.md` section 11 and `re/pegasus_models.md`
 /// section 3.8 for the `Card` (NotificationCard) model definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationCardsResponse {
     /// Array of notification card items.
@@ -702,7 +702,7 @@ pub struct NotificationCardsResponse {
 /// Fields kept as `Option` since we haven't validated against live API yet.
 /// The `headline` and `subHeadline` fields use LinkedIn's `TextViewModel`
 /// wrapper, which typically has a `text` field containing the display string.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationCard {
     /// Entity URN identifying this notification card.
@@ -806,7 +806,7 @@ pub struct NotificationCard {
 /// or flat `SearchHit` elements (when using `search/hits`). We keep `elements`
 /// as `Vec<Value>` because the hit payloads use Rest.li unions (`hitInfo`)
 /// that are polymorphic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
     /// Array of search result items (SearchHit or SearchCluster).
@@ -829,7 +829,7 @@ pub struct SearchResponse {
 /// The `hit_info` field is a Rest.li union -- exactly one member is present,
 /// discriminated by a type key (e.g. `com.linkedin.voyager.search.SearchProfile`).
 /// We keep it as `Value` until we've validated the live response shapes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     /// Tracking identifier for analytics.
@@ -855,6 +855,14 @@ pub struct SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    // `#[serde(flatten)] extra: Option<HashMap<...>>` always deserializes to
+    // `Some(HashMap::new())` when no extra keys are present, never `None`.
+    // Expected struct literals below use this helper to match that shape.
+    fn empty_extra() -> Option<HashMap<String, Value>> {
+        Some(HashMap::new())
+    }
 
     #[test]
     fn paging_deserializes_minimal() {
@@ -895,10 +903,15 @@ mod tests {
     fn social_activity_counts_deserializes() {
         let json = r#"{"numLikes": 42, "numComments": 5, "liked": true}"#;
         let counts: SocialActivityCounts = serde_json::from_str(json).unwrap();
-        assert_eq!(counts.num_likes, Some(42));
-        assert_eq!(counts.num_comments, Some(5));
-        assert_eq!(counts.liked, Some(true));
-        assert!(counts.num_shares.is_none());
+        assert_eq!(
+            counts,
+            SocialActivityCounts {
+                num_likes: Some(42),
+                num_comments: Some(5),
+                liked: Some(true),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -922,13 +935,18 @@ mod tests {
         }"#;
         let conv: Conversation = serde_json::from_str(json).unwrap();
         assert_eq!(
-            conv.entity_urn.as_deref(),
-            Some("urn:li:messagingThread:2-abc123")
+            conv,
+            Conversation {
+                entity_urn: Some("urn:li:messagingThread:2-abc123".to_string()),
+                read: Some(true),
+                unread_count: Some(0),
+                total_event_count: Some(15),
+                name: Some("Test Group".to_string()),
+                participants: Some(vec![]),
+                extra: empty_extra(),
+                ..Default::default()
+            },
         );
-        assert_eq!(conv.read, Some(true));
-        assert_eq!(conv.unread_count, Some(0));
-        assert_eq!(conv.total_event_count, Some(15));
-        assert_eq!(conv.name.as_deref(), Some("Test Group"));
     }
 
     #[test]
@@ -953,10 +971,19 @@ mod tests {
             }
         }"#;
         let event: MessagingEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.entity_urn.as_deref(), Some("urn:li:fs_event:abc123"));
-        assert_eq!(event.created_at, Some(1711234567890));
-        assert_eq!(event.subtype.as_deref(), Some("MEMBER_TO_MEMBER"));
-        assert!(event.event_content.is_some());
+        assert_eq!(
+            event,
+            MessagingEvent {
+                entity_urn: Some("urn:li:fs_event:abc123".to_string()),
+                created_at: Some(1711234567890),
+                subtype: Some("MEMBER_TO_MEMBER".to_string()),
+                event_content: Some(serde_json::json!({
+                    "com.linkedin.voyager.messaging.event.MessageEvent": {"body": "Hello!"}
+                })),
+                extra: empty_extra(),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -995,13 +1022,16 @@ mod tests {
         }"#;
         let mp: MiniProfile = serde_json::from_str(json).unwrap();
         assert_eq!(
-            mp.entity_urn.as_deref(),
-            Some("urn:li:fs_miniProfile:ACoAABxxxxxx")
+            mp,
+            MiniProfile {
+                entity_urn: Some("urn:li:fs_miniProfile:ACoAABxxxxxx".to_string()),
+                first_name: Some("Jane".to_string()),
+                last_name: Some("Doe".to_string()),
+                public_identifier: Some("jane-doe-42".to_string()),
+                occupation: Some("Software Engineer at Acme".to_string()),
+                ..Default::default()
+            },
         );
-        assert_eq!(mp.first_name.as_deref(), Some("Jane"));
-        assert_eq!(mp.last_name.as_deref(), Some("Doe"));
-        assert_eq!(mp.public_identifier.as_deref(), Some("jane-doe-42"));
-        assert_eq!(mp.occupation.as_deref(), Some("Software Engineer at Acme"));
     }
 
     #[test]
@@ -1027,13 +1057,20 @@ mod tests {
         }"#;
         let p: Profile = serde_json::from_str(json).unwrap();
         assert_eq!(
-            p.entity_urn.as_deref(),
-            Some("urn:li:fs_profile:ACoAABxxxxxx")
+            p,
+            Profile {
+                entity_urn: Some("urn:li:fs_profile:ACoAABxxxxxx".to_string()),
+                first_name: Some("Jane".to_string()),
+                last_name: Some("Doe".to_string()),
+                headline: Some("Senior Engineer".to_string()),
+                summary: Some("Building great software.".to_string()),
+                industry_name: Some("Computer Software".to_string()),
+                location_name: Some("San Francisco Bay Area".to_string()),
+                student: Some(false),
+                extra: empty_extra(),
+                ..Default::default()
+            },
         );
-        assert_eq!(p.headline.as_deref(), Some("Senior Engineer"));
-        assert_eq!(p.summary.as_deref(), Some("Building great software."));
-        assert_eq!(p.industry_name.as_deref(), Some("Computer Software"));
-        assert_eq!(p.student, Some(false));
     }
 
     #[test]
@@ -1048,10 +1085,20 @@ mod tests {
             }
         }"#;
         let pos: Position = serde_json::from_str(json).unwrap();
-        assert_eq!(pos.title.as_deref(), Some("Staff Engineer"));
-        assert_eq!(pos.company_name.as_deref(), Some("Acme Corp"));
-        assert_eq!(pos.location_name.as_deref(), Some("Remote"));
-        assert!(pos.time_period.is_some());
+        assert_eq!(
+            pos,
+            Position {
+                title: Some("Staff Engineer".to_string()),
+                company_name: Some("Acme Corp".to_string()),
+                location_name: Some("Remote".to_string()),
+                time_period: Some(serde_json::json!({
+                    "startDate": {"year": 2020, "month": 3},
+                    "endDate": {"year": 2023, "month": 12}
+                })),
+                extra: empty_extra(),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -1066,10 +1113,20 @@ mod tests {
             }
         }"#;
         let edu: Education = serde_json::from_str(json).unwrap();
-        assert_eq!(edu.school_name.as_deref(), Some("MIT"));
-        assert_eq!(edu.degree_name.as_deref(), Some("BS"));
-        assert_eq!(edu.field_of_study.as_deref(), Some("Computer Science"));
-        assert!(edu.time_period.is_some());
+        assert_eq!(
+            edu,
+            Education {
+                school_name: Some("MIT".to_string()),
+                degree_name: Some("BS".to_string()),
+                field_of_study: Some("Computer Science".to_string()),
+                time_period: Some(serde_json::json!({
+                    "startDate": {"year": 2010},
+                    "endDate": {"year": 2014}
+                })),
+                extra: empty_extra(),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -1095,14 +1152,19 @@ mod tests {
         }"#;
         let conn: Connection = serde_json::from_str(json).unwrap();
         assert_eq!(
-            conn.entity_urn.as_deref(),
-            Some("urn:li:fs_connection:ACoAABxxxxxx")
-        );
-        assert!(conn.mini_profile.is_some());
-        assert_eq!(conn.created_at, Some(1711234567890));
-        assert_eq!(
-            conn.primary_email_address.as_deref(),
-            Some("alice@example.com")
+            conn,
+            Connection {
+                entity_urn: Some("urn:li:fs_connection:ACoAABxxxxxx".to_string()),
+                mini_profile: Some(serde_json::json!({
+                    "firstName": "Alice",
+                    "lastName": "Smith",
+                    "occupation": "Engineer at Acme"
+                })),
+                created_at: Some(1711234567890),
+                primary_email_address: Some("alice@example.com".to_string()),
+                extra: empty_extra(),
+                ..Default::default()
+            },
         );
     }
 
@@ -1124,12 +1186,14 @@ mod tests {
 
     #[test]
     fn notification_card_deserializes_minimal() {
-        let json = r#"{}"#;
-        let card: NotificationCard = serde_json::from_str(json).unwrap();
-        assert!(card.entity_urn.is_none());
-        assert!(card.headline.is_none());
-        assert!(card.published_at.is_none());
-        assert!(card.read.is_none());
+        let card: NotificationCard = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            card,
+            NotificationCard {
+                extra: empty_extra(),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -1145,15 +1209,19 @@ mod tests {
         }"#;
         let card: NotificationCard = serde_json::from_str(json).unwrap();
         assert_eq!(
-            card.entity_urn.as_deref(),
-            Some("urn:li:fs_notificationCard:abc123")
+            card,
+            NotificationCard {
+                entity_urn: Some("urn:li:fs_notificationCard:abc123".to_string()),
+                headline: Some(serde_json::json!({"text": "Someone viewed your profile"})),
+                sub_headline: Some(serde_json::json!({"text": "John Doe and 2 others"})),
+                kicker: Some(serde_json::json!({"text": "2h ago"})),
+                content_type: Some("PROFILE_VIEW".to_string()),
+                published_at: Some(1711234567890),
+                read: Some(false),
+                extra: empty_extra(),
+                ..Default::default()
+            },
         );
-        assert!(card.headline.is_some());
-        assert!(card.sub_headline.is_some());
-        assert!(card.kicker.is_some());
-        assert_eq!(card.content_type.as_deref(), Some("PROFILE_VIEW"));
-        assert_eq!(card.published_at, Some(1711234567890));
-        assert_eq!(card.read, Some(false));
     }
 
     #[test]
