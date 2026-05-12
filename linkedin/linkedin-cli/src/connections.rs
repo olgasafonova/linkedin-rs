@@ -342,18 +342,14 @@ pub async fn cmd_connections_invite_batch(
     let mut fail_count = 0usize;
 
     for (i, target) in targets.iter().enumerate() {
-        if i > 0 && pacing_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
-        }
+        pace_between_rows(i, pacing_ms).await;
 
         match invite_one(&client, target, message).await {
             BatchRowResult::Ok => ok_count += 1,
-            BatchRowResult::Fail(reason) => {
-                fail_count += 1;
-                if stop_on_error {
-                    return Err(format!("stopped at #{} ({}): {}", i + 1, target, reason));
-                }
+            BatchRowResult::Fail(reason) if stop_on_error => {
+                return Err(format!("stopped at #{} ({}): {}", i + 1, target, reason));
             }
+            BatchRowResult::Fail(_) => fail_count += 1,
         }
     }
 
@@ -362,6 +358,14 @@ pub async fn cmd_connections_invite_batch(
         ok_count, fail_count, total
     );
     Ok(())
+}
+
+/// Sleep `pacing_ms` between batch rows. No-op on the first row or when
+/// pacing is disabled.
+async fn pace_between_rows(i: usize, pacing_ms: u64) {
+    if i > 0 && pacing_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
+    }
 }
 
 /// Handle `connections invitations [--count N] [--start N] [--json]`.

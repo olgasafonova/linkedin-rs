@@ -1,3 +1,6 @@
+use linkedin_api::client::LinkedInClient;
+use serde_json::Value;
+
 use crate::session::load_session_client;
 
 pub async fn cmd_event_view(event_id: &str, raw_json: bool) -> Result<(), String> {
@@ -92,77 +95,109 @@ pub async fn cmd_event_attendees(
         .map_err(|e| format!("API call failed: {e}"))?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&resp).map_err(|e| format!("JSON format error: {e}"))?;
-        println!("{}", pretty);
-        return Ok(());
+        return print_json(&resp);
     }
 
-    let elements = resp
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
-
-    let total = resp
-        .pointer("/paging/total")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let mut idx = start;
-    let mut printed = 0u32;
-
-    for cluster in elements {
-        let items = cluster
-            .get("items")
-            .and_then(|i| i.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        for item_wrapper in items {
-            // REST.li search uses `itemUnion.entityResult`.
-            let entity = item_wrapper
-                .get("itemUnion")
-                .and_then(|iu| iu.get("entityResult"))
-                .or_else(|| item_wrapper.get("item").and_then(|i| i.get("entityResult")));
-            if let Some(entity) = entity {
-                idx += 1;
-                printed += 1;
-                let name = entity
-                    .pointer("/title/text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let headline = entity
-                    .pointer("/primarySubtitle/text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                println!("{:3}. {} — {}", idx, name, headline);
-            }
-        }
-    }
+    let printed = print_attendee_list(&resp, start);
 
     if printed == 0 {
-        match client.get_event(event_id).await {
-            Ok(_) => {
-                eprintln!("Warning: the event exists but no attendees were returned.");
-                eprintln!(
-                    "This usually means your LinkedIn session has expired. \
-                     Browse LinkedIn in Chrome to refresh cookies, then run \
-                     `li auth login` to update the session."
-                );
-            }
-            Err(_) => {
-                println!("(no attendees found)");
-            }
-        }
+        report_no_attendees(&client, event_id).await;
     } else {
-        println!("---");
-        println!(
-            "Showing {}-{} of {} attendees",
-            start + 1,
-            start + printed,
-            total
-        );
+        print_attendee_summary(start, printed, attendee_total(&resp));
     }
 
     Ok(())
+}
+
+fn print_json(value: &Value) -> Result<(), String> {
+    let pretty =
+        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+    println!("{}", pretty);
+    Ok(())
+}
+
+/// Walk the clustered attendee response and print one numbered line per
+/// entity. Returns the number of entities printed.
+fn print_attendee_list(resp: &Value, start: u32) -> u32 {
+    let mut idx = start;
+    let mut printed = 0u32;
+    for entity in iter_attendee_entities(resp) {
+        idx += 1;
+        printed += 1;
+        print_attendee_line(entity, idx);
+    }
+    printed
+}
+
+/// Flatten the `elements[*].items[*].itemUnion.entityResult` (or `item.entityResult`)
+/// path into a single iterator of entity values.
+fn iter_attendee_entities(resp: &Value) -> impl Iterator<Item = &Value> {
+    resp.get("elements")
+        .and_then(|e| e.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .flat_map(|cluster| {
+            cluster
+                .get("items")
+                .and_then(|i| i.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        })
+        .filter_map(entity_from_item)
+}
+
+/// REST.li search responses wrap entities as `itemUnion.entityResult`; some
+/// older paths use `item.entityResult`. Try both.
+fn entity_from_item(item_wrapper: &Value) -> Option<&Value> {
+    item_wrapper
+        .get("itemUnion")
+        .and_then(|iu| iu.get("entityResult"))
+        .or_else(|| item_wrapper.get("item").and_then(|i| i.get("entityResult")))
+}
+
+fn print_attendee_line(entity: &Value, idx: u32) {
+    let name = entity
+        .pointer("/title/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let headline = entity
+        .pointer("/primarySubtitle/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    println!("{:3}. {} — {}", idx, name, headline);
+}
+
+fn attendee_total(resp: &Value) -> u64 {
+    resp.pointer("/paging/total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+fn print_attendee_summary(start: u32, printed: u32, total: u64) {
+    println!("---");
+    println!(
+        "Showing {}-{} of {} attendees",
+        start + 1,
+        start + printed,
+        total
+    );
+}
+
+/// Distinguish "event exists but session likely expired" from "event not
+/// found at all".
+async fn report_no_attendees(client: &LinkedInClient, event_id: &str) {
+    match client.get_event(event_id).await {
+        Ok(_) => {
+            eprintln!("Warning: the event exists but no attendees were returned.");
+            eprintln!(
+                "This usually means your LinkedIn session has expired. \
+                 Browse LinkedIn in Chrome to refresh cookies, then run \
+                 `li auth login` to update the session."
+            );
+        }
+        Err(_) => {
+            println!("(no attendees found)");
+        }
+    }
 }
