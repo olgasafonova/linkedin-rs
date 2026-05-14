@@ -307,7 +307,9 @@ impl LinkedInClient {
 
         let mut builder = reqwest::Client::builder()
             .cookie_provider(jar.clone())
-            .default_headers(default_headers);
+            .default_headers(default_headers)
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30));
 
         if let Some(proxy_url) = options.proxy_url.as_deref() {
             builder = builder.proxy(reqwest::Proxy::all(proxy_url).map_err(|e| {
@@ -1530,6 +1532,30 @@ impl LinkedInClient {
     }
 
     /// Upload an image/GIF/video/PDF to LinkedIn media storage and return upload metadata.
+    /// Build a lightweight HTTP client for CDN uploads.
+    ///
+    /// LinkedIn's `dms-uploads` CDN endpoint rejects or mishandles the Android
+    /// app default headers (User-Agent, X-RestLi, Accept, etc.).  This client
+    /// is a bare reqwest instance with only a timeout and optional proxy — no
+    /// cookie jar, no default headers.
+    fn cdn_upload_client(&self) -> Result<reqwest::Client, Error> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30));
+        if let Some(proxy_url) = ClientOptions::from_env().proxy_url {
+            builder = builder.proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| {
+                Error::Auth(format!("invalid proxy URL for CDN upload: {e}"))
+            })?);
+        }
+        builder.build().map_err(|e| Error::Auth(format!("failed to build CDN client: {e}")))
+    }
+
+    /// Upload an image/GIF/video/PDF to LinkedIn media storage and return upload metadata.
+    ///
+    /// Handles both single-part and multi-part uploads. LinkedIn's CDN returns
+    /// `partUploadRequests` for files that exceed the single-upload threshold
+    /// (observed around 3 MB for GIFs). When that field is present the file is
+    /// split into parts and each part is PUT to its own pre-signed URL.
     pub async fn upload_media(&self, media_path: &Path) -> Result<Value, Error> {
         if !media_path.is_file() {
             return Err(Error::InvalidInput(format!(
@@ -1544,6 +1570,10 @@ impl LinkedInClient {
         let (upload_type, content_type) = linkedin_media_upload_type(filename)?;
         let bytes = std::fs::read(media_path)
             .map_err(|e| Error::InvalidInput(format!("failed to read media file: {e}")))?;
+
+        // Request single-part upload first. LinkedIn may respond with
+        // `partUploadRequests` for larger files, in which case we switch to
+        // multi-part.
         let body = serde_json::json!({
             "mediaUploadType": upload_type,
             "fileSize": bytes.len(),
@@ -1558,6 +1588,19 @@ impl LinkedInClient {
             status: 200,
             body: format!("missing upload metadata value: {meta}"),
         })?;
+
+        let cdn = self.cdn_upload_client()?;
+
+        // Check if LinkedIn returned part upload requests (multi-part flow).
+        if let Some(parts) = value.get("partUploadRequests").and_then(|v| v.as_array()) {
+            if !parts.is_empty() {
+                return self
+                    .upload_multipart(&cdn, &value, &bytes, content_type, upload_type, media_path, parts)
+                    .await;
+            }
+        }
+
+        // Single-part upload.
         let upload_url = value
             .get("singleUploadUrl")
             .and_then(|v| v.as_str())
@@ -1565,8 +1608,8 @@ impl LinkedInClient {
                 status: 200,
                 body: format!("missing singleUploadUrl: {value}"),
             })?;
-        let mut req = self
-            .http
+
+        let mut req = cdn
             .put(upload_url)
             .header(reqwest::header::CONTENT_TYPE, content_type);
         if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
@@ -1576,18 +1619,89 @@ impl LinkedInClient {
                 }
             }
         }
-        let put = req.body(bytes).send().await?;
+        let put = req.body(bytes.clone()).send().await?;
         let put_status = put.status().as_u16();
         if !put.status().is_success() {
+            let err_body = put.text().await.unwrap_or_default();
             return Err(Error::Api {
                 status: put_status,
-                body: put.text().await.unwrap_or_default(),
+                body: format!(
+                    "CDN single-upload failed ({} bytes, status {put_status}): {err_body}",
+                    bytes.len()
+                ),
             });
         }
         let mut out = value;
         out["media_upload_type"] = serde_json::json!(upload_type);
         out["content_type"] = serde_json::json!(content_type);
         out["singleUploadStatus"] = serde_json::json!(put_status);
+        out["media_path"] = serde_json::json!(media_path.display().to_string());
+        Ok(out)
+    }
+
+    /// Upload file parts to LinkedIn's CDN using pre-signed URLs.
+    ///
+    /// Each element in `parts` contains a `partUploadUrl` and optional
+    /// `partUploadHeaders`. Bytes are sliced according to `byteRange`
+    /// (e.g. `"bytes 0-4194303"`).
+    async fn upload_multipart(
+        &self,
+        cdn: &reqwest::Client,
+        value: &Value,
+        bytes: &[u8],
+        content_type: &str,
+        upload_type: &str,
+        media_path: &Path,
+        parts: &[Value],
+    ) -> Result<Value, Error> {
+        let mut part_statuses = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let url = part
+                .get("partUploadUrl")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Api {
+                    status: 200,
+                    body: format!("part {i} missing partUploadUrl: {part}"),
+                })?;
+
+            // Parse byte range like "bytes 0-4194303" → (start, end) inclusive.
+            let (start, end) = parse_byte_range(
+                part.get("byteRange").and_then(|v| v.as_str()).unwrap_or(""),
+                bytes.len(),
+            )?;
+
+            let mut req = cdn
+                .put(url)
+                .header(reqwest::header::CONTENT_TYPE, content_type);
+            if let Some(headers) = part.get("partUploadHeaders").and_then(|v| v.as_object()) {
+                for (name, val) in headers {
+                    if let Some(val) = val.as_str() {
+                        req = req.header(name.as_str(), val);
+                    }
+                }
+            }
+            let slice = bytes[start..=end].to_vec();
+            let put = req.body(slice).send().await?;
+            let status = put.status().as_u16();
+            if !put.status().is_success() {
+                let err_body = put.text().await.unwrap_or_default();
+                return Err(Error::Api {
+                    status,
+                    body: format!(
+                        "CDN multipart part {i} failed (bytes {start}-{end}, status {status}): {err_body}"
+                    ),
+                });
+            }
+            part_statuses.push(serde_json::json!({
+                "part": i,
+                "status": status,
+                "byteRange": format!("{start}-{end}"),
+            }));
+        }
+        let mut out = value.clone();
+        out["media_upload_type"] = serde_json::json!(upload_type);
+        out["content_type"] = serde_json::json!(content_type);
+        out["multipartParts"] = serde_json::json!(part_statuses);
         out["media_path"] = serde_json::json!(media_path.display().to_string());
         Ok(out)
     }
@@ -2255,6 +2369,29 @@ fn normalize_share_urn(share_urn: &str) -> String {
         .strip_prefix("urn:li:fsd_share:")
         .unwrap_or(share_urn)
         .to_string()
+}
+
+/// Parse a LinkedIn byte-range string like `"bytes 0-4194303"` into `(start, end)`
+/// inclusive indices. Falls back to `(0, total - 1)` if the range cannot be parsed.
+fn parse_byte_range(range: &str, total: usize) -> Result<(usize, usize), Error> {
+    if range.is_empty() {
+        return Ok((0, total.saturating_sub(1)));
+    }
+    // Strip optional "bytes " prefix
+    let stripped = range.strip_prefix("bytes ").unwrap_or(range);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    if parts.len() != 2 {
+        return Err(Error::InvalidInput(format!(
+            "invalid byte range '{range}', expected 'start-end'"
+        )));
+    }
+    let start: usize = parts[0]
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid byte range start '{}'", parts[0])))?;
+    let end: usize = parts[1]
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid byte range end '{}'", parts[1])))?;
+    Ok((start, end.min(total.saturating_sub(1))))
 }
 
 /// Encode a string using Rest.li's AsciiHex encoding for use in Rest.li
