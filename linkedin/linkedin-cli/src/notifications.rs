@@ -150,10 +150,7 @@ fn print_mentions_report(activity_urn: &str, mentions: &[serde_json::Value]) {
 /// payload version. Returns one JSON object per mention with `urn` and
 /// optional `text` (the @mention literal as it appears in the post).
 fn collect_post_mentions(post: &serde_json::Value) -> Vec<serde_json::Value> {
-    let update = post
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(post);
+    let update = linkedin_api::restli::unwrap_update_v2(post);
 
     let commentary = match update.get("commentary").and_then(|c| c.get("text")) {
         Some(c) => c,

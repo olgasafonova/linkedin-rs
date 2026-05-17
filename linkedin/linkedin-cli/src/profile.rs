@@ -497,15 +497,12 @@ fn print_audit_report(public_id: &str, findings: &[serde_json::Value]) {
     );
 }
 
-// Rest.li union keys used by the wvmpCards response.
-const WVMP_VIEWERS_CARD: &str = "com.linkedin.voyager.identity.me.wvmpOverview.WvmpViewersCard";
-const WVMP_SUMMARY_CARD: &str =
-    "com.linkedin.voyager.identity.me.wvmpOverview.WvmpSummaryInsightCard";
-const WVMP_PROFILE_VIEW: &str = "com.linkedin.voyager.identity.me.WvmpProfileViewCard";
-const WVMP_PRIVATE_VIEWER: &str = "com.linkedin.voyager.identity.me.PrivateProfileViewer";
-const WVMP_GENERIC_CARD: &str = "com.linkedin.voyager.identity.me.WvmpGenericCard";
-const WVMP_ANON_CARD: &str = "com.linkedin.voyager.identity.me.WvmpAnonymousProfileViewCard";
-const WVMP_PREMIUM_UPSELL: &str = "com.linkedin.voyager.identity.me.WvmpPremiumUpsellCard";
+// Rest.li union keys used by the wvmpCards response — all live in
+// linkedin_api::restli so the typename strings aren't duplicated.
+use linkedin_api::restli::{
+    FULL_PROFILE_VIEWER, WVMP_ANON_CARD, WVMP_GENERIC_CARD, WVMP_PREMIUM_UPSELL,
+    WVMP_PRIVATE_VIEWER, WVMP_PROFILE_VIEW, WVMP_SUMMARY_CARD, WVMP_VIEWERS_CARD,
+};
 
 /// Print a human-readable summary of the wvmpCards response.
 ///
@@ -629,7 +626,7 @@ fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
 fn extract_viewer_profile(profile_card: &serde_json::Value) -> (String, String) {
     // Try the full union path first.
     let mini_profile = profile_card.get("viewer").and_then(|v| {
-        v.get("com.linkedin.voyager.identity.me.FullProfileViewer")
+        v.get(FULL_PROFILE_VIEWER)
             .and_then(|fp| fp.get("profile"))
             .and_then(|p| p.get("miniProfile"))
             .or_else(|| v.get("miniProfile"))

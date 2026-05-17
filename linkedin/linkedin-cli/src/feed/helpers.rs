@@ -30,14 +30,7 @@ pub(super) fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     nested_text(value, &[key, "text"])
 }
 
-/// Strip the optional `value.com.linkedin.voyager.feed.render.UpdateV2`
-/// wrapper that wraps feed elements in the live response shape.
-pub(super) fn unwrap_update_v2(element: &Value) -> &Value {
-    element
-        .get("value")
-        .and_then(|v| v.get("com.linkedin.voyager.feed.render.UpdateV2"))
-        .unwrap_or(element)
-}
+pub(super) use linkedin_api::restli::unwrap_update_v2;
 
 /// Read commentary text. The shape is `commentary.text.text`.
 pub(super) fn commentary_text(update: &Value) -> &str {

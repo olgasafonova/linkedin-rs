@@ -86,9 +86,9 @@ fn reshared_update(update: &Value) -> Option<&Value> {
         .get("resharedUpdate")
         .or_else(|| update.get("content").and_then(|c| c.get("resharedUpdate")))
         .or_else(|| {
-            update
-                .get("content")
-                .and_then(|c| c.get("com.linkedin.voyager.feed.render.UpdateV2"))
+            update.get("content").and_then(|c| {
+                linkedin_api::restli::unwrap_union(c, linkedin_api::restli::UPDATE_V2_KEY)
+            })
         })
 }
 
