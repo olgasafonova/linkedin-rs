@@ -314,10 +314,7 @@ struct PositionsSummary {
     newest_end_year: Option<u64>,
 }
 
-fn summarize_positions(
-    positions: &[&serde_json::Value],
-    current_year: u64,
-) -> PositionsSummary {
+fn summarize_positions(positions: &[&serde_json::Value], current_year: u64) -> PositionsSummary {
     let mut summary = PositionsSummary {
         findings: Vec::new(),
         has_current_role: false,
@@ -329,11 +326,7 @@ fn summarize_positions(
     summary
 }
 
-fn ingest_position(
-    summary: &mut PositionsSummary,
-    pos: &serde_json::Value,
-    current_year: u64,
-) {
+fn ingest_position(summary: &mut PositionsSummary, pos: &serde_json::Value, current_year: u64) {
     let date_range = pos.get("dateRange");
     let end_year = position_year(date_range, "end");
     let start_year = position_year(date_range, "start");
