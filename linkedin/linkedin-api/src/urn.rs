@@ -28,15 +28,20 @@ pub fn extract_activity_urn_from_url(url: &str) -> Option<String> {
 }
 
 /// Extract the inner `urn:li:activity:XXXXX` from a feed element's entityUrn
-/// (which looks like `urn:li:fs_updateV2:(urn:li:activity:NNN,…)`).
+/// (which looks like `urn:li:fs_updateV2:(urn:li:activity:NNN,SUFFIX,…)`).
+///
+/// The end of the URN is detected as the first character that can't appear in
+/// a URN — comma, closing paren, whitespace, etc. The earlier version of this
+/// function only stopped on `)`, which left trailing `,MEMBER_SHARES,…` in
+/// the result; callers (notably `feed/my_posts.rs`) had to strip it
+/// themselves with `.split(',').next()`.
 pub fn extract_activity_urn(feed_entity_urn: &str) -> Option<String> {
-    if let Some(start) = feed_entity_urn.find("urn:li:activity:") {
-        let rest = &feed_entity_urn[start..];
-        let end = rest.find(')').unwrap_or(rest.len());
-        Some(rest[..end].to_string())
-    } else {
-        None
-    }
+    let start = feed_entity_urn.find("urn:li:activity:")?;
+    let rest = &feed_entity_urn[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.')))
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 /// Normalize a user-supplied reactions URN. Accepts full URNs (any type) or a
@@ -113,13 +118,29 @@ mod tests {
 
     #[test]
     fn extract_activity_urn_stops_at_paren() {
-        // The function stops at ')' — note that this means the URN+suffix
-        // shape `(urn:li:activity:NNN,MEMBER_SHARES)` returns
-        // `urn:li:activity:NNN,MEMBER_SHARES`, not `urn:li:activity:NNN`.
-        // Existing behavior preserved as-is on the move; see follow-up bead
-        // for the comma-stripping question.
         assert_eq!(
             extract_activity_urn("/path/urn:li:activity:7312345)"),
+            Some("urn:li:activity:7312345".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_activity_urn_strips_member_shares_suffix() {
+        // The real Voyager entityUrn shape: a wrapped fs_updateV2 with the
+        // activity URN as the first comma-separated field. We want only the
+        // activity URN, not the comma-tail of trackers / backing-types.
+        assert_eq!(
+            extract_activity_urn(
+                "urn:li:fs_updateV2:(urn:li:activity:7312345,MEMBER_SHARES,DEFAULT,false)"
+            ),
+            Some("urn:li:activity:7312345".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_activity_urn_stops_at_whitespace() {
+        assert_eq!(
+            extract_activity_urn("see urn:li:activity:7312345 for details"),
             Some("urn:li:activity:7312345".to_string())
         );
     }

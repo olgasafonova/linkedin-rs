@@ -51,9 +51,7 @@ pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> CliRes
 fn print_my_post(index: usize, item: &Value) {
     let update = unwrap_update_v2(item);
     let entity_urn = field_str(item, "entityUrn");
-    let activity_urn = extract_activity_urn(entity_urn)
-        .map(|u| u.split(',').next().unwrap_or(&u).to_string())
-        .unwrap_or_default();
+    let activity_urn = extract_activity_urn(entity_urn).unwrap_or_default();
     let display_urn = if !activity_urn.is_empty() {
         activity_urn.as_str()
     } else {
