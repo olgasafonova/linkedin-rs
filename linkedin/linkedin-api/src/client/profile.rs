@@ -54,6 +54,7 @@ impl LinkedInClient {
                     "unexpected GraphQL response shape (missing elements[0] in identityDashProfilesByMemberIdentity): {}",
                     serde_json::to_string(&raw).unwrap_or_default()
                 ),
+            correlation_id: None,
             })
     }
 
@@ -76,6 +77,7 @@ impl LinkedInClient {
                         status: 0,
                         body: "could not extract miniProfile.dashEntityUrn from /me response"
                             .to_string(),
+                        correlation_id: None,
                     })
             })
             .await
@@ -111,6 +113,7 @@ impl LinkedInClient {
                 "could not extract entityUrn from any profile endpoint for '{}'",
                 public_id
             ),
+            correlation_id: None,
         })
     }
 
@@ -167,6 +170,7 @@ impl LinkedInClient {
                     "preload page returned non-success for vanityName={}",
                     public_id
                 ),
+                correlation_id: None,
             });
         }
 
@@ -177,6 +181,7 @@ impl LinkedInClient {
                 "preload page did not contain an fsd_profile URN paired with publicIdentifier={}",
                 public_id
             ),
+            correlation_id: None,
         })
     }
 }

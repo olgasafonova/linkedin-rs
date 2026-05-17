@@ -60,6 +60,7 @@ impl LinkedInClient {
                  and update get_post() with the captured path.",
                 urn, urn
             ),
+            correlation_id: None,
         })
     }
 

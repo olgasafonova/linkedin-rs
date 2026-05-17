@@ -67,6 +67,7 @@ pub(super) fn unwrap_graphql(raw: &Value, data_key: &str) -> Result<Value, Error
                 data_key,
                 serde_json::to_string(raw).unwrap_or_default()
             ),
+            correlation_id: None,
         })
 }
 
@@ -85,12 +86,14 @@ pub(super) fn check_graphql_errors(json: &Value) -> Result<(), Error> {
     Err(Error::Api {
         status: 200,
         body: format!("GraphQL errors: {}", messages.join("; ")),
+        correlation_id: None,
     })
 }
 
 /// Check an HTTP response for error status codes and parse the body as JSON.
 /// On 401, returns [`Error::Auth`]. On other non-success status codes,
-/// returns [`Error::Api`].
+/// returns [`Error::Api`] with the LinkedIn correlation ID attached when
+/// the response carried one.
 pub(super) async fn check_response(resp: reqwest::Response) -> Result<Value, Error> {
     let status = resp.status();
     if status.is_success() {
@@ -98,15 +101,21 @@ pub(super) async fn check_response(resp: reqwest::Response) -> Result<Value, Err
         return Ok(json);
     }
     let status_code = status.as_u16();
+    let correlation_id = crate::error::extract_correlation_id(resp.headers());
     let body = resp.text().await.unwrap_or_default();
     if status_code == 401 {
+        let suffix = correlation_id
+            .as_deref()
+            .map(|id| format!(" (request_id={id})"))
+            .unwrap_or_default();
         return Err(Error::Auth(format!(
-            "session expired or invalid (HTTP 401): {body}"
+            "session expired or invalid (HTTP 401{suffix}): {body}"
         )));
     }
     Err(Error::Api {
         status: status_code,
         body,
+        correlation_id,
     })
 }
 

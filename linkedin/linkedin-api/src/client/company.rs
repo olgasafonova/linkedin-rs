@@ -34,6 +34,7 @@ impl LinkedInClient {
         let mut last_err = Error::Api {
             status: 0,
             body: "no follower endpoints succeeded".to_string(),
+            correlation_id: None,
         };
         for path in &paths {
             match self.get(path).await {

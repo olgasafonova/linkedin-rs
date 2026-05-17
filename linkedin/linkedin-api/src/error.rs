@@ -33,13 +33,20 @@ pub enum Error {
     /// The Display impl truncates the body to at most [`MAX_DISPLAY_BODY_LEN`]
     /// bytes and masks LinkedIn URNs and email-shaped substrings. The raw
     /// `body` field remains accessible for programmatic use (e.g. the GraphQL
-    /// retry classifier substring-matches on it).
-    #[error("API error (HTTP {status}): {}", ApiBodyDisplay(.body))]
+    /// retry classifier substring-matches on it). When a correlation ID is
+    /// known, it's surfaced as `request_id=<id>` in the rendered message —
+    /// useful when reporting an issue against LinkedIn so they can trace the
+    /// specific server-side request.
+    #[error("API error (HTTP {status}{}): {}", ApiCorrelationDisplay(.correlation_id), ApiBodyDisplay(.body))]
     Api {
         /// HTTP status code.
         status: u16,
         /// Response body (may be JSON error or empty). Raw — not sanitized.
         body: String,
+        /// Correlation ID from the LinkedIn response headers, when known.
+        /// `None` for synthesised errors (validation, unexpected shape, etc.)
+        /// or when LinkedIn didn't send a recognisable correlation header.
+        correlation_id: Option<String>,
     },
 
     /// Invalid input provided by the caller.
@@ -54,6 +61,47 @@ impl fmt::Display for ApiBodyDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", sanitize_body(self.0))
     }
+}
+
+/// Display wrapper that renders `, request_id=<id>` when the correlation ID
+/// is present, and nothing at all when it isn't.
+struct ApiCorrelationDisplay<'a>(&'a Option<String>);
+
+impl fmt::Display for ApiCorrelationDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(id) = self.0 {
+            write!(f, ", request_id={}", id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Candidate response-header names that LinkedIn uses to carry a
+/// per-request correlation ID. The order matters — we return the first
+/// match. The list isn't documented; it's based on observed behavior, so
+/// adding more candidates is fine.
+pub(crate) const CORRELATION_HEADER_CANDIDATES: &[&str] = &[
+    "x-li-uuid",
+    "x-li-tracker-uuid",
+    "x-li-tracking-id",
+    "x-li-fabric",
+];
+
+/// Pluck the first available correlation-ID-shaped header from a reqwest
+/// response header map. Returns `None` when none of the known headers are
+/// present.
+pub(crate) fn extract_correlation_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    for name in CORRELATION_HEADER_CANDIDATES {
+        if let Some(value) = headers.get(*name) {
+            if let Ok(s) = value.to_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Display wrapper that sanitizes the message when an `Error::Auth` is rendered.
@@ -188,6 +236,8 @@ fn truncate_display(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    // ----- sanitize_body helpers below -----
+
     #[test]
     fn sanitize_strips_member_urn() {
         let raw = r#"{"message":"viewer urn:li:fsd_profile:ACoAAAJqB-cBb1234 not allowed"}"#;
@@ -256,11 +306,68 @@ mod tests {
         let err = Error::Api {
             status: 403,
             body: "blocked viewer urn:li:fsd_profile:ACoAAAJqB-cBb1234".to_string(),
+            correlation_id: None,
         };
         let rendered = format!("{err}");
         assert!(rendered.starts_with("API error (HTTP 403)"));
         assert!(!rendered.contains("ACoAAAJqB-cBb1234"), "got: {rendered}");
         assert!(rendered.contains("[…]"), "got: {rendered}");
+        // No correlation ID → no `request_id=…` segment.
+        assert!(!rendered.contains("request_id"), "got: {rendered}");
+    }
+
+    #[test]
+    fn display_for_api_includes_request_id_when_present() {
+        let err = Error::Api {
+            status: 500,
+            body: "server error".to_string(),
+            correlation_id: Some("AbCdEf1234567890".to_string()),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("request_id=AbCdEf1234567890"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn extract_correlation_id_returns_first_match() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-li-uuid",
+            reqwest::header::HeaderValue::from_static("first-id"),
+        );
+        headers.insert(
+            "x-li-tracker-uuid",
+            reqwest::header::HeaderValue::from_static("second-id"),
+        );
+        assert_eq!(extract_correlation_id(&headers), Some("first-id".into()));
+    }
+
+    #[test]
+    fn extract_correlation_id_falls_back_through_candidates() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-li-tracking-id",
+            reqwest::header::HeaderValue::from_static("third-id"),
+        );
+        assert_eq!(extract_correlation_id(&headers), Some("third-id".into()));
+    }
+
+    #[test]
+    fn extract_correlation_id_returns_none_when_absent() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(extract_correlation_id(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_correlation_id_skips_empty_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-li-uuid",
+            reqwest::header::HeaderValue::from_static("   "),
+        );
+        assert!(extract_correlation_id(&headers).is_none());
     }
 
     #[test]
@@ -282,6 +389,7 @@ mod tests {
             status: 200,
             body: "GraphQL errors: Internal error fetching data from downstream urn:li:fs_post:abc"
                 .to_string(),
+            correlation_id: None,
         };
         match &err {
             Error::Api { body, .. } => {

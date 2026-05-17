@@ -77,7 +77,9 @@ impl CliError {
                 "Hint: rate limited. Wait a few minutes; consider lowering --pacing-ms below 2000 \
                  only if you've checked your quota.",
             ),
-            CliError::Api(ApiError::Api { status: 200, body }) => {
+            CliError::Api(ApiError::Api {
+                status: 200, body, ..
+            }) => {
                 if body.contains("Internal error fetching data from downstream")
                     || body.contains("Failed to get response from server")
                 {
@@ -129,6 +131,7 @@ mod tests {
         CliError::Api(ApiError::Api {
             status,
             body: body.to_string(),
+            correlation_id: None,
         })
     }
 
@@ -208,6 +211,7 @@ mod tests {
         let lib_err = ApiError::Api {
             status: 429,
             body: "rate limited".to_string(),
+            correlation_id: None,
         };
         let cli_err: CliError = lib_err.into();
         assert_eq!(cli_err.exit_code(), exit_code::API);

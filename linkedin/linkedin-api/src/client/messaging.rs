@@ -70,6 +70,7 @@ impl LinkedInClient {
             .ok_or_else(|| Error::Api {
                 status: 0,
                 body: "no conversations found".to_string(),
+                correlation_id: None,
             })?;
 
         let recipient_urns = elements
@@ -90,6 +91,7 @@ impl LinkedInClient {
                     "could not find conversation '{}' or extract participant URNs",
                     conversation_id
                 ),
+                correlation_id: None,
             });
         }
 

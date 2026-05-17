@@ -451,22 +451,30 @@ async fn decode_graphql_post_success(resp: reqwest::Response) -> GraphqlPostResu
 
 async fn decode_graphql_post_error(resp: reqwest::Response) -> GraphqlPostResult {
     let status_code = resp.status().as_u16();
+    let correlation_id = crate::error::extract_correlation_id(resp.headers());
     let body_text = resp.text().await.unwrap_or_default();
     if status_code == 401 {
+        let suffix = correlation_id
+            .as_deref()
+            .map(|id| format!(" (request_id={id})"))
+            .unwrap_or_default();
         return GraphqlPostResult::Err(Error::Auth(format!(
-            "session expired or invalid (HTTP 401): {body_text}"
+            "session expired or invalid (HTTP 401{suffix}): {body_text}"
         )));
     }
     GraphqlPostResult::Err(Error::Api {
         status: status_code,
         body: body_text,
+        correlation_id,
     })
 }
 
 /// Decide whether a GraphQL-shaped error is worth retrying.
 fn is_retriable_graphql_error(err: &Error) -> bool {
     match err {
-        Error::Api { status: 200, body } => {
+        Error::Api {
+            status: 200, body, ..
+        } => {
             body.contains("Internal error fetching data from downstream")
                 || body.contains("Failed to get response from server")
         }
@@ -555,11 +563,16 @@ async fn check_response_retryable(resp: reqwest::Response, attempt: u32) -> Retr
     }
     let status_code = status.as_u16();
     let retry_after = parse_retry_after(&resp);
+    let correlation_id = crate::error::extract_correlation_id(resp.headers());
     let body = resp.text().await.unwrap_or_default();
 
     if status_code == 401 {
+        let suffix = correlation_id
+            .as_deref()
+            .map(|id| format!(" (request_id={id})"))
+            .unwrap_or_default();
         return RetryResult::Err(Error::Auth(format!(
-            "session expired or invalid (HTTP 401): {body}"
+            "session expired or invalid (HTTP 401{suffix}): {body}"
         )));
     }
 
@@ -568,6 +581,7 @@ async fn check_response_retryable(resp: reqwest::Response, attempt: u32) -> Retr
         return RetryResult::Err(Error::Api {
             status: status_code,
             body,
+            correlation_id,
         });
     }
 
@@ -699,6 +713,7 @@ mod tests {
         let err = Error::Api {
             status: 200,
             body: "GraphQL errors: Internal error fetching data from downstream.".to_string(),
+            correlation_id: None,
         };
         assert!(is_retriable_graphql_error(&err));
     }
@@ -708,6 +723,7 @@ mod tests {
         let err = Error::Api {
             status: 200,
             body: "GraphQL errors: Failed to get response from server for URI https://[2a04:f547:93:21b::86e1]:5485/voyager/api/voyagerStoriesDashProfileVideoPreviews".to_string(),
+        correlation_id: None,
         };
         assert!(is_retriable_graphql_error(&err));
     }
@@ -717,6 +733,7 @@ mod tests {
         let err = Error::Api {
             status: 200,
             body: "GraphQL errors: Cannot query field 'foo' on type 'Bar'".to_string(),
+            correlation_id: None,
         };
         assert!(!is_retriable_graphql_error(&err));
     }
@@ -726,6 +743,7 @@ mod tests {
         let err = Error::Api {
             status: 500,
             body: "Internal Server Error".to_string(),
+            correlation_id: None,
         };
         assert!(!is_retriable_graphql_error(&err));
     }
