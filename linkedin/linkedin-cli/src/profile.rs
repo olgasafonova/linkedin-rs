@@ -574,6 +574,20 @@ fn render_generic(index: usize, generic_card: &Value) {
     println!("[{}] (aggregated) {}", index, text);
 }
 
+/// Render a `WvmpAnonCard`: a count of anonymous viewers.
+fn render_anon(index: usize, anon_card: &Value) {
+    let num = anon_card
+        .get("numViewers")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1);
+    let label = if num == 1 {
+        "1 anonymous viewer".to_string()
+    } else {
+        format!("{} anonymous viewers", num)
+    };
+    println!("[{}] (anonymous) {}", index, label);
+}
+
 /// Render a single viewer card. Returns true if the entry was countable
 /// (a real viewer), false for upsell/skipped cards.
 fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
@@ -590,16 +604,7 @@ fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
         return true;
     }
     if let Some(anon_card) = card_value.get(WVMP_ANON_CARD) {
-        let num = anon_card
-            .get("numViewers")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(1);
-        let label = if num == 1 {
-            "1 anonymous viewer".to_string()
-        } else {
-            format!("{} anonymous viewers", num)
-        };
-        println!("[{}] (anonymous) {}", index, label);
+        render_anon(index, anon_card);
         return true;
     }
     if card_value.get(WVMP_PREMIUM_UPSELL).is_some() {
