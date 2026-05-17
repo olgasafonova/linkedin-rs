@@ -150,35 +150,19 @@ impl LinkedInClient {
             if batch == 0 {
                 break;
             }
-            let params = format!(
-                "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
-                batch, current_start, encoded_urn
-            );
-            let result = self.graphql_get(&params).await?;
-            let page = unwrap_graphql(&result, "socialDashReactionsByReactionType")?;
+            let (elements, page_total) = self
+                .fetch_reactions_page(&encoded_urn, current_start, batch)
+                .await?;
+            total = total.or(page_total);
 
-            if total.is_none() {
-                total = page
-                    .get("paging")
-                    .and_then(|p| p.get("total"))
-                    .and_then(|t| t.as_u64());
-            }
-
-            let elements = page
-                .get("elements")
-                .and_then(|e| e.as_array())
-                .cloned()
-                .unwrap_or_default();
             if elements.is_empty() {
                 break;
             }
             all_elements.extend(elements);
             current_start += batch;
 
-            if let Some(t) = total {
-                if current_start as u64 >= t {
-                    break;
-                }
+            if total.is_some_and(|t| current_start as u64 >= t) {
+                break;
             }
         }
 
@@ -190,6 +174,34 @@ impl LinkedInClient {
                 "total": total.unwrap_or(all_elements.len() as u64)
             }
         }))
+    }
+
+    /// Fetch one page of reactors. Returns the page's elements and the
+    /// `paging.total` field if present. Pure orchestration glue around
+    /// the GraphQL endpoint — does not mutate caller state.
+    async fn fetch_reactions_page(
+        &self,
+        encoded_urn: &str,
+        start: u32,
+        count: u32,
+    ) -> Result<(Vec<Value>, Option<u64>), Error> {
+        let params = format!(
+            "variables=(count:{},start:{},threadUrn:{})&queryId=voyagerSocialDashReactions.41ebf31a9f4c4a84e35a49d5abc9010b",
+            count, start, encoded_urn
+        );
+        let result = self.graphql_get(&params).await?;
+        let page = unwrap_graphql(&result, "socialDashReactionsByReactionType")?;
+
+        let total = page
+            .get("paging")
+            .and_then(|p| p.get("total"))
+            .and_then(|t| t.as_u64());
+        let elements = page
+            .get("elements")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok((elements, total))
     }
 
     /// React to a post or activity with a specific reaction type.
