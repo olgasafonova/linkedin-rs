@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::urn::ProfileUrn;
 
 use super::internal::{graphql_params, restli_encode_string, unwrap_graphql};
 use super::{LinkedInClient, BASE_URL};
@@ -92,16 +93,16 @@ impl LinkedInClient {
     /// Resolve a public identifier (vanity URL slug) to an `fsd_profile` URN.
     /// Tries the REST miniprofile endpoint, the REST profile endpoint, the
     /// GraphQL profile endpoint, and finally the preload-page scraper.
-    pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<String, Error> {
+    pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<ProfileUrn, Error> {
         if let Some(urn) = self.resolve_via_miniprofile(public_id).await {
-            return Ok(urn);
+            return Ok(ProfileUrn::new(urn));
         }
         if let Some(urn) = self.resolve_via_rest_profile(public_id).await {
-            return Ok(urn);
+            return Ok(ProfileUrn::new(urn));
         }
         if let Ok(profile) = self.get_profile(public_id).await {
             if let Some(urn) = profile.get("entityUrn").and_then(|v| v.as_str()) {
-                return Ok(urn.to_string());
+                return Ok(ProfileUrn::new(urn));
             }
         }
         if let Ok(urn) = self.resolve_profile_urn_via_preload(public_id).await {
@@ -149,7 +150,10 @@ impl LinkedInClient {
     /// Resolve a slug → fsd_profile URN by scraping the
     /// `/preload/custom-invite/?vanityName=<slug>` page. Used as a fallback
     /// after REST/GraphQL paths exhaust their retries.
-    pub async fn resolve_profile_urn_via_preload(&self, public_id: &str) -> Result<String, Error> {
+    pub async fn resolve_profile_urn_via_preload(
+        &self,
+        public_id: &str,
+    ) -> Result<ProfileUrn, Error> {
         let encoded_slug =
             url::form_urlencoded::byte_serialize(public_id.as_bytes()).collect::<String>();
         let url = format!(
@@ -175,14 +179,16 @@ impl LinkedInClient {
         }
 
         let html = resp.text().await?;
-        extract_profile_urn_from_preload_html(&html, public_id).ok_or_else(|| Error::Api {
-            status: 200,
-            body: format!(
-                "preload page did not contain an fsd_profile URN paired with publicIdentifier={}",
-                public_id
-            ),
-            correlation_id: None,
-        })
+        extract_profile_urn_from_preload_html(&html, public_id)
+            .map(ProfileUrn::new)
+            .ok_or_else(|| Error::Api {
+                status: 200,
+                body: format!(
+                    "preload page did not contain an fsd_profile URN paired with publicIdentifier={}",
+                    public_id
+                ),
+                correlation_id: None,
+            })
     }
 }
 

@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{ConnectionsResponse, Paging};
+use linkedin_api::urn::{ConversationUrn, ProfileUrn};
 
 use crate::error::{CliError, CliResult};
 use crate::graphql_print::{print_graphql_conversation, print_graphql_message};
@@ -831,9 +832,10 @@ pub async fn cmd_messages_read(
     raw_json: bool,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
+    let conv_urn = ConversationUrn::from(conversation_id);
 
     let value = client
-        .get_conversation_events(conversation_id, created_before)
+        .get_conversation_events(&conv_urn, created_before)
         .await?;
 
     if raw_json {
@@ -912,13 +914,13 @@ fn send_confirmation_error(recipient: &str, message: &str) -> String {
 
 /// Resolve a `messages send` recipient. Accepts a URN, a vanity slug, or
 /// a "First Last" name (fuzzy-matched against connections).
-async fn resolve_send_recipient(client: &LinkedInClient, recipient: &str) -> CliResult<String> {
+async fn resolve_send_recipient(client: &LinkedInClient, recipient: &str) -> CliResult<ProfileUrn> {
     if PROFILE_URN_PREFIXES
         .iter()
         .any(|p| recipient.starts_with(p))
     {
         eprintln!("Using provided URN directly.");
-        return Ok(recipient.to_string());
+        return Ok(ProfileUrn::from(recipient));
     }
     if recipient.contains(' ') {
         eprintln!("Searching connections for '{}'...", recipient);
@@ -945,7 +947,7 @@ struct NameMatch {
 /// given name (case-insensitive substring match on first+last). If
 /// multiple matches are found, lists them and asks the user to be more
 /// specific.
-async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> CliResult<String> {
+async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> CliResult<ProfileUrn> {
     let matches = scan_connections_for_name(client, &name.to_lowercase()).await?;
     pick_unique_match(client, name, matches).await
 }
@@ -1015,7 +1017,7 @@ async fn pick_unique_match(
     client: &LinkedInClient,
     name: &str,
     matches: Vec<NameMatch>,
-) -> CliResult<String> {
+) -> CliResult<ProfileUrn> {
     match matches.len() {
         0 => Err(CliError::Other(format!(
             "no connection found matching '{}'. Try a vanity slug instead.",
@@ -1026,10 +1028,12 @@ async fn pick_unique_match(
     }
 }
 
-async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> CliResult<String> {
+async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> CliResult<ProfileUrn> {
     eprintln!("Matched: {} ({})", m.name, m.slug);
     if !m.urn.is_empty() {
-        return Ok(m.urn.replace("fs_miniProfile", "fsd_profile"));
+        return Ok(ProfileUrn::from(
+            m.urn.replace("fs_miniProfile", "fsd_profile"),
+        ));
     }
     if !m.slug.is_empty() {
         return client
@@ -1068,9 +1072,10 @@ pub async fn cmd_messages_reply(
     }
 
     let (client, _path) = load_session_client()?;
+    let conv_urn = ConversationUrn::from(conversation_id);
     eprintln!("Replying to conversation {}...", conversation_id);
     let value = client
-        .reply_to_conversation(conversation_id, message)
+        .reply_to_conversation(&conv_urn, message)
         .await
         .map_err(|e| CliError::Other(format!("failed to send reply: {e}")))?;
 
@@ -1084,8 +1089,9 @@ pub async fn cmd_messages_reply(
 
 async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
+    let conv_urn = ConversationUrn::from(conversation_id);
     let events = client
-        .get_conversation_events(conversation_id, None)
+        .get_conversation_events(&conv_urn, None)
         .await
         .map_err(|e| CliError::Other(format!("failed to load conversation: {e}")))?;
     let elements = elements_slice(&events);

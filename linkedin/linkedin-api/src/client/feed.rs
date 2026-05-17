@@ -6,6 +6,7 @@
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::urn::{ActivityUrn, SocialDetailUrn};
 
 use super::internal::{
     check_graphql_errors, check_response, graphql_params, restli_encode_string, unwrap_graphql,
@@ -36,18 +37,14 @@ impl LinkedInClient {
     /// Locate a feed update by activity URN inside the current top-of-feed
     /// window. Falls back to the highlighted-feed finder, then 404s with a
     /// devtools-capture hint.
-    pub async fn get_post(&self, activity_urn: &str) -> Result<Value, Error> {
-        let urn = if activity_urn.starts_with("urn:li:activity:") {
-            activity_urn.to_string()
-        } else {
-            format!("urn:li:activity:{}", activity_urn)
-        };
-        let activity_id = urn.strip_prefix("urn:li:activity:").unwrap_or(&urn);
+    pub async fn get_post(&self, activity_urn: &ActivityUrn) -> Result<Value, Error> {
+        let activity_id = activity_urn.activity_id();
+        let urn = activity_urn.as_str();
 
         if let Some(found) = self.find_post_in_feed(activity_id).await? {
             return Ok(found);
         }
-        if let Some(found) = self.find_post_via_highlighted(&urn, activity_id).await {
+        if let Some(found) = self.find_post_via_highlighted(urn, activity_id).await {
             return Ok(found);
         }
         Err(Error::Api {
@@ -106,11 +103,11 @@ impl LinkedInClient {
     /// Fetch comments on a post by its socialDetail URN.
     pub async fn get_comments(
         &self,
-        social_detail_urn: &str,
+        social_detail_urn: &SocialDetailUrn,
         start: u32,
         count: u32,
     ) -> Result<Value, Error> {
-        let encoded_urn = restli_encode_string(social_detail_urn);
+        let encoded_urn = restli_encode_string(social_detail_urn.as_str());
         let variables = format!(
             "(count:{count},socialDetailUrn:{encoded_urn},sortOrder:RELEVANCE,start:{start})"
         );
@@ -138,11 +135,11 @@ impl LinkedInClient {
     /// batches of 10 (LinkedIn's per-page cap on this endpoint).
     pub async fn get_post_reactions(
         &self,
-        activity_urn: &str,
+        activity_urn: &ActivityUrn,
         start: u32,
         count: u32,
     ) -> Result<Value, Error> {
-        let encoded_urn = restli_encode_string(activity_urn);
+        let encoded_urn = restli_encode_string(activity_urn.as_str());
         let page_size = 10u32;
         let mut all_elements = Vec::new();
         let mut current_start = start;
@@ -198,11 +195,11 @@ impl LinkedInClient {
     /// React to a post or activity with a specific reaction type.
     pub async fn react_to_post(
         &self,
-        thread_urn: &str,
+        thread_urn: &ActivityUrn,
         reaction_type: &str,
     ) -> Result<Value, Error> {
         let rt = validate_reaction_type(reaction_type)?;
-        let thread = normalize_activity_urn(thread_urn);
+        let thread = thread_urn.as_str();
 
         // INTENTIONAL DUPLICATION: threadUrn and reactionType appear both at
         // the top level AND inside `entity`. This matches the decompiled
@@ -227,11 +224,11 @@ impl LinkedInClient {
     /// Remove a reaction from a post or activity.
     pub async fn unreact_from_post(
         &self,
-        thread_urn: &str,
+        thread_urn: &ActivityUrn,
         reaction_type: &str,
     ) -> Result<Value, Error> {
         let rt = validate_reaction_type(reaction_type)?;
-        let thread = normalize_activity_urn(thread_urn);
+        let thread = thread_urn.as_str();
 
         let variables = serde_json::json!({
             "threadUrn": thread,
@@ -246,8 +243,12 @@ impl LinkedInClient {
     }
 
     /// Comment on a feed post.
-    pub async fn comment_on_post(&self, post_urn: &str, text: &str) -> Result<Value, Error> {
-        let thread = normalize_activity_urn(post_urn);
+    pub async fn comment_on_post(
+        &self,
+        post_urn: &ActivityUrn,
+        text: &str,
+    ) -> Result<Value, Error> {
+        let thread = post_urn.as_str();
         let variables = serde_json::json!({
             "entity": {
                 "commentary": { "text": text },
@@ -299,16 +300,6 @@ impl LinkedInClient {
         let json = check_response(resp).await?;
         check_graphql_errors(&json)?;
         Ok(json)
-    }
-}
-
-/// Normalize a thread/post URN: full URN passes through, bare activity ID
-/// gets wrapped as `urn:li:activity:<id>`.
-fn normalize_activity_urn(input: &str) -> String {
-    if input.starts_with("urn:li:") {
-        input.to_string()
-    } else {
-        format!("urn:li:activity:{}", input)
     }
 }
 

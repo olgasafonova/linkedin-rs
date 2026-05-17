@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::urn::{InvitationUrn, ProfileUrn};
 
 use super::internal::{graphql_params, unwrap_graphql};
 use super::LinkedInClient;
@@ -21,13 +22,13 @@ impl LinkedInClient {
     /// MemberRelationships `verifyQuotaAndCreateV2` action.
     pub async fn send_connection_request(
         &self,
-        profile_urn: &str,
+        profile_urn: &ProfileUrn,
         message: Option<&str>,
     ) -> Result<Value, Error> {
         let mut payload = serde_json::json!({
             "invitee": {
                 "inviteeUnion": {
-                    "memberProfile": profile_urn
+                    "memberProfile": profile_urn.as_str()
                 }
             }
         });
@@ -58,7 +59,7 @@ impl LinkedInClient {
     /// Accept a pending connection invitation.
     pub async fn accept_invitation(
         &self,
-        invitation_urn: &str,
+        invitation_urn: &InvitationUrn,
         shared_secret: &str,
     ) -> Result<Value, Error> {
         self.invitation_action(invitation_urn, shared_secret, "accept")
@@ -68,7 +69,7 @@ impl LinkedInClient {
     /// Withdraw a sent (pending) connection invitation.
     pub async fn withdraw_invitation(
         &self,
-        invitation_urn: &str,
+        invitation_urn: &InvitationUrn,
         shared_secret: &str,
     ) -> Result<Value, Error> {
         self.invitation_action(invitation_urn, shared_secret, "withdraw")
@@ -79,7 +80,7 @@ impl LinkedInClient {
     /// action segment differs.
     async fn invitation_action(
         &self,
-        invitation_urn: &str,
+        invitation_urn: &InvitationUrn,
         shared_secret: &str,
         action: &str,
     ) -> Result<Value, Error> {
@@ -88,7 +89,7 @@ impl LinkedInClient {
             invitation_urn, action
         );
         let body = serde_json::json!({
-            "invitationUrn": invitation_urn,
+            "invitationUrn": invitation_urn.as_str(),
             "sharedSecret": shared_secret
         });
         self.post(&path, &body).await

@@ -10,7 +10,7 @@ use super::helpers::{print_json, unwrap_update_v2};
 
 pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> CliResult<()> {
     let element = cached_feed_element(index)?;
-    let social_detail_urn = social_detail_urn(&element)?;
+    let social_detail_urn = linkedin_api::urn::SocialDetailUrn::from(social_detail_urn(&element)?);
 
     let (client, _path) = load_session_client()?;
     let value = client.get_comments(&social_detail_urn, 0, count).await?;

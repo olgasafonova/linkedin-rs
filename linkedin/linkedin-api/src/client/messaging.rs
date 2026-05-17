@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::urn::{ConversationUrn, ProfileUrn};
 
 use super::internal::{graphql_params, restli_encode_string, unwrap_graphql};
 use super::LinkedInClient;
@@ -38,11 +39,11 @@ impl LinkedInClient {
     /// Send a message to a LinkedIn member via the Dash createMessage endpoint.
     pub async fn send_message(
         &self,
-        recipient_profile_urn: &str,
+        recipient_profile_urn: &ProfileUrn,
         message_body: &str,
     ) -> Result<Value, Error> {
         let my_urn = self.my_profile_urn().await?;
-        let recipients = vec![recipient_profile_urn.to_string()];
+        let recipients = vec![recipient_profile_urn.as_str().to_string()];
         let payload = build_create_message_payload(my_urn, &recipients, message_body);
 
         self.post(
@@ -57,12 +58,12 @@ impl LinkedInClient {
     /// recipient set matches.
     pub async fn reply_to_conversation(
         &self,
-        conversation_id: &str,
+        conversation_id: &ConversationUrn,
         message_body: &str,
     ) -> Result<Value, Error> {
         let conv_data = self.get_conversations(20, None).await?;
         let my_urn = self.my_profile_urn().await?;
-        let thread_id = strip_messaging_thread_prefix(conversation_id);
+        let thread_id = strip_messaging_thread_prefix(conversation_id.as_str());
 
         let elements = conv_data
             .get("elements")
@@ -106,13 +107,14 @@ impl LinkedInClient {
     /// Fetch events (messages) within a specific conversation.
     pub async fn get_conversation_events(
         &self,
-        conversation_urn: &str,
+        conversation_urn: &ConversationUrn,
         created_before: Option<u64>,
     ) -> Result<Value, Error> {
-        let full_urn = if conversation_urn.starts_with("urn:li:msg_conversation:") {
-            conversation_urn.to_string()
+        let raw = conversation_urn.as_str();
+        let full_urn = if raw.starts_with("urn:li:msg_conversation:") {
+            raw.to_string()
         } else {
-            let thread_id = strip_messaging_thread_prefix(conversation_urn);
+            let thread_id = strip_messaging_thread_prefix(raw);
             let profile_urn = self.my_profile_urn().await?;
             format!("urn:li:msg_conversation:({},{})", profile_urn, thread_id)
         };

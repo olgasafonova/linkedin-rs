@@ -230,10 +230,11 @@ fn nth_cached_item(cache_kind: &str, item_kind: &str, index: usize) -> CliResult
 }
 
 /// Extract the Nth post's activity URN from cached search results.
-fn resolve_search_post_urn(index: usize) -> CliResult<String> {
+fn resolve_search_post_urn(index: usize) -> CliResult<linkedin_api::urn::ActivityUrn> {
     let sfu = nth_cached_item("posts", "searchFeedUpdate", index)?;
     let update = sfu.get("update").unwrap_or(&sfu);
     activity_urn_from_update(update)
+        .map(linkedin_api::urn::ActivityUrn::from)
         .ok_or_else(|| CliError::Other(format!("search result {} has no activity URN", index)))
 }
 

@@ -4,10 +4,149 @@
 //! string-walking activity URNs, recursing through profile-URN trees,
 //! reading `updateMetadata` from a feed element. None of it depends on the
 //! CLI or on any I/O.
+//!
+//! Also defines transparent newtype wrappers around LinkedIn URN strings
+//! (`ActivityUrn`, `ProfileUrn`, etc.) so per-resource client methods can
+//! take a typed argument instead of `&str`. Construction normalizes where
+//! a normalization rule exists (e.g. activity URNs accept a bare numeric id
+//! and wrap it as `urn:li:activity:<id>`); other newtypes are pass-through.
+
+use std::fmt;
 
 use serde_json::Value;
 
 use crate::restli::unwrap_update_v2;
+
+macro_rules! pass_through_urn {
+    ($(#[$attr:meta])* $name:ident) => {
+        $(#[$attr])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Self {
+                Self(s.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                Self::new(s)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                Self::new(s.to_string())
+            }
+        }
+    };
+}
+
+/// Activity URN. Accepts a full `urn:li:activity:N` URN, any other
+/// `urn:li:` URN (passed through unchanged — the reactions endpoint also
+/// accepts `urn:li:ugcPost:N` and `urn:li:share:N`), or a bare numeric id
+/// (wrapped as `urn:li:activity:<id>`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActivityUrn(String);
+
+impl ActivityUrn {
+    /// Construct from any string-like input, normalizing bare numeric ids
+    /// to `urn:li:activity:<id>`.
+    pub fn new(s: impl AsRef<str>) -> Self {
+        let raw = s.as_ref();
+        let normalized = if raw.starts_with("urn:li:") {
+            raw.to_string()
+        } else {
+            format!("urn:li:activity:{}", raw)
+        };
+        Self(normalized)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Strip the `urn:li:activity:` prefix if present. Used by callers that
+    /// need the bare numeric id (e.g. `get_post` searches by id within the
+    /// feed window).
+    pub fn activity_id(&self) -> &str {
+        self.0.strip_prefix("urn:li:activity:").unwrap_or(&self.0)
+    }
+}
+
+impl AsRef<str> for ActivityUrn {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ActivityUrn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for ActivityUrn {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<&str> for ActivityUrn {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+pass_through_urn! {
+    /// `urn:li:fsd_profile:<id>` — modern profile URN used for messaging
+    /// recipients, connection requests, mailbox identification.
+    ProfileUrn
+}
+
+pass_through_urn! {
+    /// `urn:li:msg_conversation:(<profile>,<thread>)` or a bare messaging
+    /// thread id (`2-abc123...`). Both forms are accepted because LinkedIn
+    /// surfaces the bare thread id in several places and clients normalize
+    /// it back to a full URN before issuing GraphQL queries.
+    ConversationUrn
+}
+
+pass_through_urn! {
+    /// `urn:li:invitation:<id>` — pending connection invitations.
+    InvitationUrn
+}
+
+pass_through_urn! {
+    /// `urn:li:fs_socialDetail:(<activity>,...)` — passed to the comments
+    /// finder. Used as-is, no normalization.
+    SocialDetailUrn
+}
 
 /// Pull an activity URN out of a URL like
 /// `/feed/update/urn:li:activity:7312345/?...` (URL- or percent-encoded).
@@ -42,16 +181,6 @@ pub fn extract_activity_urn(feed_entity_urn: &str) -> Option<String> {
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.')))
         .unwrap_or(rest.len());
     Some(rest[..end].to_string())
-}
-
-/// Normalize a user-supplied reactions URN. Accepts full URNs (any type) or a
-/// bare activity ID (digits only), which is wrapped as `urn:li:activity:...`.
-pub fn normalize_reactions_urn(input: &str) -> String {
-    if input.starts_with("urn:li:") {
-        input.to_string()
-    } else {
-        format!("urn:li:activity:{}", input)
-    }
 }
 
 /// Recursively search a JSON value for a string that starts with
@@ -146,26 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_reactions_urn_passes_full_urn_through() {
-        assert_eq!(
-            normalize_reactions_urn("urn:li:activity:7450808005048094720"),
-            "urn:li:activity:7450808005048094720"
-        );
-        assert_eq!(
-            normalize_reactions_urn("urn:li:ugcPost:7450808001881534464"),
-            "urn:li:ugcPost:7450808001881534464"
-        );
-    }
-
-    #[test]
-    fn normalize_reactions_urn_wraps_bare_id_as_activity() {
-        assert_eq!(
-            normalize_reactions_urn("7450808005048094720"),
-            "urn:li:activity:7450808005048094720"
-        );
-    }
-
-    #[test]
     fn find_fsd_profile_urn_walks_nested_shapes() {
         let v = json!({
             "outer": {
@@ -238,5 +347,85 @@ mod tests {
     fn extract_reactions_urn_returns_none_when_metadata_missing() {
         let element = json!({"foo": "bar"});
         assert_eq!(extract_reactions_urn(&element), None);
+    }
+
+    #[test]
+    fn activity_urn_passes_full_urn_through() {
+        assert_eq!(
+            ActivityUrn::new("urn:li:activity:7450808005048094720").as_str(),
+            "urn:li:activity:7450808005048094720"
+        );
+    }
+
+    #[test]
+    fn activity_urn_passes_ugcpost_urn_through() {
+        // The reactions endpoint accepts ugcPost URNs as threadUrn.
+        assert_eq!(
+            ActivityUrn::new("urn:li:ugcPost:7450808001881534464").as_str(),
+            "urn:li:ugcPost:7450808001881534464"
+        );
+    }
+
+    #[test]
+    fn activity_urn_wraps_bare_numeric_id() {
+        assert_eq!(
+            ActivityUrn::new("7450808005048094720").as_str(),
+            "urn:li:activity:7450808005048094720"
+        );
+    }
+
+    #[test]
+    fn activity_urn_activity_id_strips_prefix() {
+        let urn = ActivityUrn::new("urn:li:activity:7450808005048094720");
+        assert_eq!(urn.activity_id(), "7450808005048094720");
+    }
+
+    #[test]
+    fn activity_urn_activity_id_returns_inner_for_non_activity_urn() {
+        let urn = ActivityUrn::new("urn:li:ugcPost:1234");
+        assert_eq!(urn.activity_id(), "urn:li:ugcPost:1234");
+    }
+
+    #[test]
+    fn activity_urn_display_matches_as_str() {
+        let urn = ActivityUrn::new("urn:li:activity:42");
+        assert_eq!(format!("{}", urn), urn.as_str());
+    }
+
+    #[test]
+    fn profile_urn_passes_through_unchanged() {
+        let p = ProfileUrn::new("urn:li:fsd_profile:ACoAAA111");
+        assert_eq!(p.as_str(), "urn:li:fsd_profile:ACoAAA111");
+        assert_eq!(format!("{}", p), "urn:li:fsd_profile:ACoAAA111");
+    }
+
+    #[test]
+    fn conversation_urn_accepts_full_urn_or_bare_id() {
+        assert_eq!(
+            ConversationUrn::new("urn:li:msg_conversation:(urn:li:fsd_profile:X,2-abc)").as_str(),
+            "urn:li:msg_conversation:(urn:li:fsd_profile:X,2-abc)"
+        );
+        assert_eq!(ConversationUrn::new("2-abc123").as_str(), "2-abc123");
+    }
+
+    #[test]
+    fn invitation_urn_passes_through() {
+        assert_eq!(
+            InvitationUrn::new("urn:li:invitation:7000").as_str(),
+            "urn:li:invitation:7000"
+        );
+    }
+
+    #[test]
+    fn social_detail_urn_passes_through() {
+        let s = "urn:li:fs_socialDetail:(urn:li:activity:42,urn:li:activity:42,EMPTY)";
+        assert_eq!(SocialDetailUrn::new(s).as_str(), s);
+    }
+
+    #[test]
+    fn from_str_and_string_construct_equivalently() {
+        let a: ActivityUrn = "urn:li:activity:1".into();
+        let b: ActivityUrn = String::from("urn:li:activity:1").into();
+        assert_eq!(a, b);
     }
 }

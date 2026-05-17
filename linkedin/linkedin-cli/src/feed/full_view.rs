@@ -41,7 +41,8 @@ pub fn cmd_feed_read(index: usize, raw_json: bool) -> CliResult<()> {
 
 pub async fn cmd_feed_view(activity_urn: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
-    let post = client.get_post(activity_urn).await?;
+    let urn = linkedin_api::urn::ActivityUrn::from(activity_urn);
+    let post = client.get_post(&urn).await?;
     if raw_json {
         return print_json(&post);
     }

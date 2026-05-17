@@ -1,6 +1,6 @@
 //! `feed reactions` command.
 
-use linkedin_api::urn::extract_reactions_urn;
+use linkedin_api::urn::{extract_reactions_urn, ActivityUrn};
 use serde_json::Value;
 
 use crate::error::{CliError, CliResult};
@@ -9,7 +9,6 @@ use crate::util::truncate_with_ellipsis;
 
 use super::cache::cached_feed_element;
 use super::helpers::{print_json, reaction_emoji, text_field};
-use super::urn::normalize_reactions_urn;
 
 /// Options for `feed reactions`. Bundles the five-argument call into a struct.
 pub struct FeedReactionsOptions<'a> {
@@ -22,7 +21,7 @@ pub struct FeedReactionsOptions<'a> {
 
 pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> CliResult<()> {
     let urn = match (opts.post_urn, opts.from_list) {
-        (Some(u), None) => normalize_reactions_urn(u),
+        (Some(u), None) => ActivityUrn::from(u),
         (None, Some(index)) => reactions_urn_from_cache(index)?,
         (None, None) => {
             return Err(CliError::Input(
@@ -58,7 +57,7 @@ pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> CliResult<()>
 
     if elements.is_empty() {
         println!("(no reactions)");
-        print_reactions_empty_hint(&urn, opts.from_list);
+        print_reactions_empty_hint(urn.as_str(), opts.from_list);
         return Ok(());
     }
 
@@ -101,12 +100,14 @@ fn print_reactions_empty_hint(urn: &str, from_list: Option<usize>) {
     );
 }
 
-fn reactions_urn_from_cache(index: usize) -> CliResult<String> {
+fn reactions_urn_from_cache(index: usize) -> CliResult<ActivityUrn> {
     let element = cached_feed_element(index)?;
-    extract_reactions_urn(&element).ok_or_else(|| {
-        CliError::Cache(format!(
-            "could not extract a reactions URN from cached item {}",
-            index
-        ))
-    })
+    extract_reactions_urn(&element)
+        .map(ActivityUrn::from)
+        .ok_or_else(|| {
+            CliError::Cache(format!(
+                "could not extract a reactions URN from cached item {}",
+                index
+            ))
+        })
 }

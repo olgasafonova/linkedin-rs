@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{ConnectionsResponse, Paging};
+use linkedin_api::urn::{InvitationUrn, ProfileUrn};
 
 use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
@@ -231,9 +232,9 @@ pub async fn cmd_connections_invite(
 async fn resolve_invite_target(
     client: &LinkedInClient,
     public_id_or_urn: &str,
-) -> CliResult<String> {
+) -> CliResult<ProfileUrn> {
     if public_id_or_urn.starts_with("urn:li:") {
-        return Ok(public_id_or_urn.to_string());
+        return Ok(ProfileUrn::from(public_id_or_urn));
     }
     eprintln!("Resolving profile URN for '{}'...", public_id_or_urn);
     client
@@ -283,7 +284,7 @@ async fn invite_one(
     message: Option<&str>,
 ) -> BatchRowResult {
     let profile_urn = if target.starts_with("urn:li:") {
-        target.to_string()
+        ProfileUrn::from(target)
     } else {
         match client.resolve_profile_urn(target).await {
             Ok(u) => u,
@@ -441,7 +442,7 @@ async fn invitation_op(
     op: InvitationOp,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
-    let invitation_urn = build_invitation_urn(invitation_id);
+    let invitation_urn = InvitationUrn::from(build_invitation_urn(invitation_id));
 
     let value = match op {
         InvitationOp::Accept => {

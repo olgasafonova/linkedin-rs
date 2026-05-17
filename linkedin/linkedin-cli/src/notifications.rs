@@ -63,7 +63,7 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> CliResu
 
     let cache = load_notifications_cache()?;
     let card = cached_notification_at(&cache, index)?;
-    let activity_urn = activity_urn_for_card(card, index)?;
+    let activity_urn = linkedin_api::urn::ActivityUrn::from(activity_urn_for_card(card, index)?);
 
     let (client, _path) = load_session_client()?;
     let post = client
@@ -73,9 +73,9 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> CliResu
     let mentions = collect_post_mentions(&post);
 
     if raw_json {
-        return print_mentions_json(&activity_urn, &mentions);
+        return print_mentions_json(activity_urn.as_str(), &mentions);
     }
-    print_mentions_report(&activity_urn, &mentions);
+    print_mentions_report(activity_urn.as_str(), &mentions);
     Ok(())
 }
 
