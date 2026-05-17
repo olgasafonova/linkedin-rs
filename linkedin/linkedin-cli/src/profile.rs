@@ -557,6 +557,15 @@ fn render_profile_view(index: usize, profile_card: &Value) {
     }
 }
 
+/// Render a `WvmpPrivateViewerCard`: a private viewer with only a headline.
+fn render_private_viewer(index: usize, private_card: &Value) {
+    let headline = private_card
+        .get("headline")
+        .and_then(|h| h.as_str())
+        .unwrap_or("Private viewer");
+    println!("[{}] (private) {}", index, headline);
+}
+
 /// Render a single viewer card. Returns true if the entry was countable
 /// (a real viewer), false for upsell/skipped cards.
 fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
@@ -565,11 +574,7 @@ fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
         return true;
     }
     if let Some(private_card) = card_value.get(WVMP_PRIVATE_VIEWER) {
-        let headline = private_card
-            .get("headline")
-            .and_then(|h| h.as_str())
-            .unwrap_or("Private viewer");
-        println!("[{}] (private) {}", index, headline);
+        render_private_viewer(index, private_card);
         return true;
     }
     if let Some(generic_card) = card_value.get(WVMP_GENERIC_CARD) {
