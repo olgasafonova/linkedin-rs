@@ -548,15 +548,20 @@ fn print_view_change_header(summary: &Value) {
     println!("---");
 }
 
+/// Render a `WvmpProfileViewCard`: a real named viewer entry.
+fn render_profile_view(index: usize, profile_card: &Value) {
+    let (name, occupation) = extract_viewer_profile(profile_card);
+    println!("[{}] {}", index, name);
+    if !occupation.is_empty() {
+        println!("    {}", occupation);
+    }
+}
+
 /// Render a single viewer card. Returns true if the entry was countable
 /// (a real viewer), false for upsell/skipped cards.
 fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
     if let Some(profile_card) = card_value.get(WVMP_PROFILE_VIEW) {
-        let (name, occupation) = extract_viewer_profile(profile_card);
-        println!("[{}] {}", index, name);
-        if !occupation.is_empty() {
-            println!("    {}", occupation);
-        }
+        render_profile_view(index, profile_card);
         return true;
     }
     if let Some(private_card) = card_value.get(WVMP_PRIVATE_VIEWER) {
