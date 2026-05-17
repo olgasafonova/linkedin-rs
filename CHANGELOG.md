@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- **API errors** — `Error::Api` and `Error::Auth` now sanitize their Display output: LinkedIn URNs collapse to `urn:li:<type>:[…]`, email-shaped substrings collapse to `[email]`, and the body truncates to 200 bytes (at a UTF-8 char boundary) with a `…[N more bytes]` suffix. The raw `body` field on `Error::Api` remains unsanitized for programmatic inspection (the GraphQL retry classifier substring-matches on it). LinkedIn 4xx/5xx bodies routinely include connection names, conversation snippets, and member URNs; the CLI's `format!("API call failed: {e}")` no longer leaks them.
 - **Auth** — browser cookies are now resolved from the session directory (`<data_dir>/linkedin/browser_cookies.json`), not the current working directory. Set `LINKEDIN_COOKIES_FILE` to override. Running `li` from a directory that happens to contain `secrets/browser_cookies.json` no longer silently swaps in those cookies. The "Using browser cookies from ..." log message now prints the absolute path so the active identity is verifiable.
 - **Auth** — `LinkedInClient::with_browser_cookies` now validates cookie names against `[A-Za-z0-9_-]+` before passing them into the cookie jar. Names containing semicolons, equals signs, commas, control characters, or whitespace are silently skipped. Defense-in-depth posture; reqwest already rejected most malformed cookies in practice.
 
