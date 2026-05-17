@@ -588,8 +588,25 @@ fn render_anon(index: usize, anon_card: &Value) {
     println!("[{}] (anonymous) {}", index, label);
 }
 
+/// Render a card whose union key isn't one of the recognised WVMP variants.
+/// Logs the first key when the value is a JSON object, or a generic label
+/// otherwise. Used as the dispatch fallback.
+fn render_unknown(index: usize, card_value: &Value) {
+    if let Some(obj) = card_value.as_object() {
+        let key = obj.keys().next().cloned().unwrap_or_default();
+        println!("[{}] (unknown: {})", index, key);
+    } else {
+        println!("[{}] (unknown card)", index);
+    }
+}
+
 /// Render a single viewer card. Returns true if the entry was countable
 /// (a real viewer), false for upsell/skipped cards.
+///
+/// Dispatches to one of `render_profile_view`, `render_private_viewer`,
+/// `render_generic`, `render_anon`, or `render_unknown` based on which
+/// Rest.li union key the card carries. `WVMP_PREMIUM_UPSELL` is the only
+/// recognised but non-countable variant.
 fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
     if let Some(profile_card) = card_value.get(WVMP_PROFILE_VIEW) {
         render_profile_view(index, profile_card);
@@ -610,12 +627,7 @@ fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
     if card_value.get(WVMP_PREMIUM_UPSELL).is_some() {
         return false;
     }
-    if let Some(obj) = card_value.as_object() {
-        let key = obj.keys().next().cloned().unwrap_or_default();
-        println!("[{}] (unknown: {})", index, key);
-    } else {
-        println!("[{}] (unknown card)", index);
-    }
+    render_unknown(index, card_value);
     true
 }
 
