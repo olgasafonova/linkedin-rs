@@ -1,18 +1,16 @@
 use serde_json::Value;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
 /// Handle `company view <slug> [--json]`.
 ///
 /// Fetches company info by universal name (URL slug) and prints a summary.
-pub async fn cmd_company_view(slug: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_company_view(slug: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let company = client
-        .get_company(slug)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let company = client.get_company(slug).await?;
 
     if raw_json {
         print_json(&company)?;
@@ -33,13 +31,13 @@ pub async fn cmd_company_followers(
     start: u32,
     count: u32,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     let company = client
         .get_company(slug)
         .await
-        .map_err(|e| format!("failed to fetch company: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to fetch company: {e}")))?;
 
     let company_name = company.get("name").and_then(|v| v.as_str()).unwrap_or(slug);
     let company_id = extract_company_id(&company)?;
@@ -67,7 +65,7 @@ struct FollowersPrintArgs<'a> {
 
 /// Pull the numeric company ID from the response. Prefers the trailing
 /// segment of `entityUrn`; falls back to a non-empty `companyId` field.
-fn extract_company_id(company: &Value) -> Result<&str, String> {
+fn extract_company_id(company: &Value) -> CliResult<&str> {
     company
         .get("entityUrn")
         .and_then(|v| v.as_str())
@@ -78,12 +76,12 @@ fn extract_company_id(company: &Value) -> Result<&str, String> {
                 .and_then(|v| v.as_u64())
                 .map(|_| "")
         })
-        .ok_or_else(|| "could not extract company ID from response".to_string())
+        .ok_or_else(|| CliError::Other("could not extract company ID from response".to_string()))
 }
 
 /// Print the result of the admin follower endpoint. Branches on
 /// list-vs-analytics shape; either path may emit JSON.
-fn print_followers_primary(args: FollowersPrintArgs<'_>) -> Result<(), String> {
+fn print_followers_primary(args: FollowersPrintArgs<'_>) -> CliResult<()> {
     if args.raw_json {
         return print_json(args.value);
     }
@@ -146,11 +144,7 @@ fn person_full_name(value: Option<&Value>) -> Option<String> {
 /// Print the fallback view when the admin follower endpoint is
 /// unavailable: total follower count plus any first-degree connections
 /// that follow the page.
-fn print_followers_fallback(
-    company: &Value,
-    company_name: &str,
-    raw_json: bool,
-) -> Result<(), String> {
+fn print_followers_fallback(company: &Value, company_name: &str, raw_json: bool) -> CliResult<()> {
     let first_degree = company
         .get("firstDegreeConnectionsThatFollow")
         .and_then(|v| v.as_array());
@@ -191,9 +185,8 @@ fn print_followers_fallback(
 }
 
 /// Pretty-print a JSON value to stdout.
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }

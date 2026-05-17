@@ -3,6 +3,7 @@
 use linkedin_api::urn::extract_reactions_urn;
 use serde_json::Value;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
@@ -19,15 +20,15 @@ pub struct FeedReactionsOptions<'a> {
     pub raw_json: bool,
 }
 
-pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> Result<(), String> {
+pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> CliResult<()> {
     let urn = match (opts.post_urn, opts.from_list) {
         (Some(u), None) => normalize_reactions_urn(u),
         (None, Some(index)) => reactions_urn_from_cache(index)?,
         (None, None) => {
-            return Err(
+            return Err(CliError::Input(
                 "provide a post URN or use --from-list N after `feed list`/`feed my-posts`"
                     .to_string(),
-            );
+            ));
         }
         (Some(_), Some(_)) => unreachable!("clap conflicts_with guards this"),
     };
@@ -35,8 +36,7 @@ pub async fn cmd_feed_reactions(opts: FeedReactionsOptions<'_>) -> Result<(), St
     let (client, _path) = load_session_client()?;
     let value = client
         .get_post_reactions(&urn, opts.start, opts.count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+        .await?;
 
     if opts.raw_json {
         return print_json(&value);
@@ -101,12 +101,12 @@ fn print_reactions_empty_hint(urn: &str, from_list: Option<usize>) {
     );
 }
 
-fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
+fn reactions_urn_from_cache(index: usize) -> CliResult<String> {
     let element = cached_feed_element(index)?;
     extract_reactions_urn(&element).ok_or_else(|| {
-        format!(
+        CliError::Cache(format!(
             "could not extract a reactions URN from cached item {}",
             index
-        )
+        ))
     })
 }

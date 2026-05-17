@@ -1,13 +1,13 @@
 use chrono::Datelike;
 use serde_json::Value;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
 /// Pretty-print a JSON value to stdout.
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }
@@ -32,13 +32,10 @@ fn field_str<'a>(value: &'a Value, key: &str) -> &'a str {
 /// Loads the session, creates a client, calls GET /voyager/api/me, and
 /// prints the result. With `--json`, outputs raw pretty-printed JSON.
 /// Without `--json`, outputs a human-readable summary.
-pub async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
+pub async fn cmd_profile_me(raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let me = client
-        .get_me()
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let me = client.get_me().await?;
 
     if raw_json {
         print_json(&me)?;
@@ -53,17 +50,10 @@ pub async fn cmd_profile_me(raw_json: bool) -> Result<(), String> {
 ///
 /// Loads the session, creates a client, calls the identity/profiles endpoint
 /// with decoration for full field projection, and prints the result.
-pub async fn cmd_profile_view(
-    public_id: &str,
-    raw_json: bool,
-    summary: bool,
-) -> Result<(), String> {
+pub async fn cmd_profile_view(public_id: &str, raw_json: bool, summary: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let profile = client
-        .get_profile(public_id)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let profile = client.get_profile(public_id).await?;
 
     if summary {
         print_json(&extract_profile_summary(&profile))?;
@@ -144,14 +134,11 @@ fn extract_profile_summary(profile: &serde_json::Value) -> serde_json::Value {
 /// Visits a profile so the target sees you in "who viewed my profile".
 /// Uses the web client's GraphQL query ID which registers the view as a
 /// side effect. See `re/profile_visit.md` for the mechanism.
-pub async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     eprintln!("Visiting profile '{}'...", public_id);
-    let profile = client
-        .visit_profile(public_id)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let profile = client.visit_profile(public_id).await?;
 
     if raw_json {
         print_json(&profile)?;
@@ -179,13 +166,10 @@ pub async fn cmd_profile_visit(public_id: &str, raw_json: bool) -> Result<(), St
 ///
 /// Loads the session, calls GET /voyager/api/identity/wvmpCards, and prints
 /// profile viewer data. The response uses deeply nested Rest.li union encoding.
-pub async fn cmd_profile_viewers(raw_json: bool) -> Result<(), String> {
+pub async fn cmd_profile_viewers(raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_profile_viewers()
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_profile_viewers().await?;
 
     if raw_json {
         return print_json(&value);
@@ -201,19 +185,16 @@ pub async fn cmd_profile_viewers(raw_json: bool) -> Result<(), String> {
 /// staleness signals: missing headline, empty about section, stale
 /// positions (no current role or current role older than 2 years without
 /// updates), missing education, low connection count.
-pub async fn cmd_profile_audit(raw_json: bool) -> Result<(), String> {
+pub async fn cmd_profile_audit(raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let me = client
-        .get_me()
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let me = client.get_me().await?;
 
     let mini = me.get("miniProfile");
     let public_id = mini
         .and_then(|m| m.get("publicIdentifier"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "could not determine your public profile ID".to_string())?;
+        .ok_or_else(|| CliError::Other("could not determine your public profile ID".to_string()))?;
 
     // Try full profile; fall back to /me data if LinkedIn's backend chokes.
     let (profile, full_profile) = match client.get_profile(public_id).await {
@@ -451,7 +432,7 @@ fn check_location(profile: &serde_json::Value) -> Option<serde_json::Value> {
     }))
 }
 
-fn print_audit_json(public_id: &str, findings: &[Value]) -> Result<(), String> {
+fn print_audit_json(public_id: &str, findings: &[Value]) -> CliResult<()> {
     let output = serde_json::json!({
         "publicId": public_id,
         "findings": findings,

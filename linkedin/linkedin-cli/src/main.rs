@@ -4,6 +4,7 @@ mod auth;
 mod cli;
 mod company;
 mod connections;
+mod error;
 mod events;
 mod feed;
 mod graphql_print;

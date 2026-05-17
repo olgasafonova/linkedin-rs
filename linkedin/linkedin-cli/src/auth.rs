@@ -3,6 +3,7 @@ use std::fs;
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 
+use crate::error::{CliError, CliResult};
 use crate::util::truncate;
 
 /// Handle `auth login --li-at <value>`.
@@ -10,7 +11,7 @@ use crate::util::truncate;
 /// Resolves the li_at value from the CLI flag or the `LINKEDIN_LI_AT`
 /// environment variable. Generates a fresh JSESSIONID, creates a Session,
 /// and saves it to the default path.
-pub async fn cmd_auth_login(li_at_flag: Option<String>) -> Result<(), String> {
+pub async fn cmd_auth_login(li_at_flag: Option<String>) -> CliResult<()> {
     let li_at = li_at_flag
         .or_else(|| std::env::var("LINKEDIN_LI_AT").ok())
         .ok_or_else(|| {
@@ -19,16 +20,21 @@ pub async fn cmd_auth_login(li_at_flag: Option<String>) -> Result<(), String> {
         })?;
 
     if li_at.trim().is_empty() {
-        return Err("li_at cookie value must not be empty".to_string());
+        return Err(CliError::Other(
+            "li_at cookie value must not be empty".to_string(),
+        ));
     }
 
     // Generate a fresh JSESSIONID for this session.
-    let client = LinkedInClient::new().map_err(|e| format!("failed to create client: {e}"))?;
+    let client = LinkedInClient::new()
+        .map_err(|e| CliError::Other(format!("failed to create client: {e}")))?;
     let jsessionid = client.jsessionid().to_string();
 
     let session = Session::new(li_at, jsessionid);
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
-    session.save(&path).map_err(|e| format!("{e}"))?;
+    let path = Session::default_path().map_err(|e| CliError::Other(format!("{e}")))?;
+    session
+        .save(&path)
+        .map_err(|e| CliError::Other(format!("{e}")))?;
 
     println!("Session saved to {}", path.display());
     println!("JSESSIONID: {}...", truncate(&session.jsessionid, 10));
@@ -41,8 +47,8 @@ pub async fn cmd_auth_login(li_at_flag: Option<String>) -> Result<(), String> {
 /// Without `--local`, loads the session and calls GET /voyager/api/me to verify
 /// the session is still valid server-side. With `--local`, only checks the
 /// session file on disk (no network request).
-pub async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
+pub async fn cmd_auth_status(local_only: bool) -> CliResult<()> {
+    let path = Session::default_path().map_err(|e| CliError::Other(format!("{e}")))?;
 
     if !path.exists() {
         println!("No session found at {}", path.display());
@@ -50,7 +56,7 @@ pub async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let session = Session::load(&path).map_err(|e| format!("{e}"))?;
+    let session = Session::load(&path).map_err(|e| CliError::Other(format!("{e}")))?;
 
     println!("Session file: {}", path.display());
     println!("Created at: {}", session.created_at);
@@ -69,8 +75,8 @@ pub async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
 
     // Hit the live API to verify the session is actually valid.
     println!("Checking session against LinkedIn API...");
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let client = LinkedInClient::with_session(&session)
+        .map_err(|e| CliError::Other(format!("client error: {e}")))?;
 
     match client.get_me().await {
         Ok(me) => {
@@ -99,15 +105,16 @@ pub async fn cmd_auth_status(local_only: bool) -> Result<(), String> {
 /// Handle `auth logout`.
 ///
 /// Deletes the session file from disk.
-pub fn cmd_auth_logout() -> Result<(), String> {
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
+pub fn cmd_auth_logout() -> CliResult<()> {
+    let path = Session::default_path().map_err(|e| CliError::Other(format!("{e}")))?;
 
     if !path.exists() {
         println!("No session file found at {}", path.display());
         return Ok(());
     }
 
-    fs::remove_file(&path).map_err(|e| format!("failed to remove session file: {e}"))?;
+    fs::remove_file(&path)
+        .map_err(|e| CliError::Other(format!("failed to remove session file: {e}")))?;
     println!("Session removed: {}", path.display());
     Ok(())
 }

@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use linkedin_api::models::FeedResponse;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
 
@@ -23,13 +24,10 @@ pub struct FeedListOptions<'a> {
 }
 
 /// Handle `feed list [--count N] [--start N] [--json]`.
-pub async fn cmd_feed_list(opts: FeedListOptions<'_>) -> Result<(), String> {
+pub async fn cmd_feed_list(opts: FeedListOptions<'_>) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_feed(opts.start, opts.count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_feed(opts.start, opts.count).await?;
 
     if let Err(e) = save_feed_cache(&value) {
         eprintln!("warning: failed to cache feed: {e}");
@@ -40,7 +38,7 @@ pub async fn cmd_feed_list(opts: FeedListOptions<'_>) -> Result<(), String> {
     }
 
     let feed: FeedResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse feed response: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to parse feed response: {e}")))?;
 
     print_feed_list_header(&feed, opts.author_filter, opts.keyword_filter);
 

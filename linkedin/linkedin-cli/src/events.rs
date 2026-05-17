@@ -1,19 +1,16 @@
 use linkedin_api::client::LinkedInClient;
 use serde_json::Value;
 
+use crate::error::CliResult;
 use crate::session::load_session_client;
 
-pub async fn cmd_event_view(event_id: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_event_view(event_id: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let event = client
-        .get_event(event_id)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let event = client.get_event(event_id).await?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&event).map_err(|e| format!("JSON format error: {e}"))?;
+        let pretty = serde_json::to_string_pretty(&event)?;
         println!("{}", pretty);
         return Ok(());
     }
@@ -86,13 +83,10 @@ pub async fn cmd_event_attendees(
     start: u32,
     count: u32,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let resp = client
-        .get_event_attendees(event_id, start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let resp = client.get_event_attendees(event_id, start, count).await?;
 
     if raw_json {
         return print_json(&resp);
@@ -109,9 +103,8 @@ pub async fn cmd_event_attendees(
     Ok(())
 }
 
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }

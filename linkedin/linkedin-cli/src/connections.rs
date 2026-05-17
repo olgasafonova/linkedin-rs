@@ -3,6 +3,7 @@ use serde_json::Value;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{ConnectionsResponse, Paging};
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::print_paging_header;
 
@@ -21,24 +22,21 @@ pub struct ConnectionsListOptions<'a> {
 ///
 /// Loads the session, calls GET /voyager/api/relationships/connections with
 /// pagination params sorted by RECENTLY_ADDED, and prints the results.
-pub async fn cmd_connections_list(opts: ConnectionsListOptions<'_>) -> Result<(), String> {
+pub async fn cmd_connections_list(opts: ConnectionsListOptions<'_>) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     if opts.fetch_all {
         return cmd_connections_list_all(&client, opts.keyword_filter, opts.raw_json).await;
     }
 
-    let value = client
-        .get_connections(opts.start, opts.count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_connections(opts.start, opts.count).await?;
 
     if opts.raw_json {
         return print_json(&value);
     }
 
     let resp: ConnectionsResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse connections response: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to parse connections response: {e}")))?;
 
     if let Some(ref paging) = resp.paging {
         print_paging_header("Connections", paging);
@@ -111,7 +109,7 @@ pub async fn cmd_connections_list_all(
     client: &LinkedInClient,
     keyword_filter: Option<&str>,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let page_size = 40u32;
     let mut offset = 0u32;
     let mut total_shown = 0usize;
@@ -149,12 +147,10 @@ async fn fetch_connections_page(
     client: &LinkedInClient,
     offset: u32,
     page_size: u32,
-) -> Result<ConnectionsResponse, String> {
-    let value = client
-        .get_connections(offset, page_size)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
-    serde_json::from_value(value).map_err(|e| format!("failed to parse connections response: {e}"))
+) -> CliResult<ConnectionsResponse> {
+    let value = client.get_connections(offset, page_size).await?;
+    serde_json::from_value(value)
+        .map_err(|e| CliError::Other(format!("failed to parse connections response: {e}")))
 }
 
 fn print_fetch_all_header(resp: &ConnectionsResponse, keyword_filter: Option<&str>) {
@@ -185,7 +181,7 @@ fn finalize_fetch_all(
     raw_json: bool,
     total_shown: usize,
     all_elements: Vec<Value>,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if raw_json {
         let combined = serde_json::json!({
             "elements": all_elements,
@@ -208,14 +204,13 @@ pub async fn cmd_connections_invite(
     public_id_or_urn: &str,
     message: Option<&str>,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
     let profile_urn = resolve_invite_target(&client, public_id_or_urn).await?;
 
     let value = client
         .send_connection_request(&profile_urn, message)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+        .await?;
 
     if raw_json {
         print_json(&value)?;
@@ -236,7 +231,7 @@ pub async fn cmd_connections_invite(
 async fn resolve_invite_target(
     client: &LinkedInClient,
     public_id_or_urn: &str,
-) -> Result<String, String> {
+) -> CliResult<String> {
     if public_id_or_urn.starts_with("urn:li:") {
         return Ok(public_id_or_urn.to_string());
     }
@@ -244,7 +239,7 @@ async fn resolve_invite_target(
     client
         .resolve_profile_urn(public_id_or_urn)
         .await
-        .map_err(|e| format!("failed to resolve profile: {e}"))
+        .map_err(|e| CliError::Other(format!("failed to resolve profile: {e}")))
 }
 
 /// Parse a batch input list (one slug/URN per line).
@@ -262,15 +257,15 @@ fn parse_batch_targets(raw: &str) -> Vec<String> {
 }
 
 /// Read a batch source: either a path on disk, or `-` for stdin.
-fn read_batch_input(from_file: &str) -> Result<String, String> {
+fn read_batch_input(from_file: &str) -> CliResult<String> {
     if from_file == "-" {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-            .map_err(|e| format!("failed to read stdin: {e}"))?;
+            .map_err(|e| CliError::Other(format!("failed to read stdin: {e}")))?;
         Ok(buf)
     } else {
         std::fs::read_to_string(from_file)
-            .map_err(|e| format!("failed to read {}: {}", from_file, e))
+            .map_err(|e| CliError::Other(format!("failed to read {}: {}", from_file, e)))
     }
 }
 
@@ -329,11 +324,13 @@ pub async fn cmd_connections_invite_batch(
     message: Option<&str>,
     pacing_ms: u64,
     stop_on_error: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let raw = read_batch_input(from_file)?;
     let targets = parse_batch_targets(&raw);
     if targets.is_empty() {
-        return Err("no targets in input (every line was blank or a comment)".to_string());
+        return Err(CliError::Other(
+            "no targets in input (every line was blank or a comment)".to_string(),
+        ));
     }
 
     let (client, _path) = load_session_client()?;
@@ -347,7 +344,12 @@ pub async fn cmd_connections_invite_batch(
         match invite_one(&client, target, message).await {
             BatchRowResult::Ok => ok_count += 1,
             BatchRowResult::Fail(reason) if stop_on_error => {
-                return Err(format!("stopped at #{} ({}): {}", i + 1, target, reason));
+                return Err(CliError::Other(format!(
+                    "stopped at #{} ({}): {}",
+                    i + 1,
+                    target,
+                    reason
+                )));
             }
             BatchRowResult::Fail(_) => fail_count += 1,
         }
@@ -372,17 +374,10 @@ async fn pace_between_rows(i: usize, pacing_ms: u64) {
 ///
 /// Lists pending (received) connection invitations using the Dash GraphQL
 /// `voyagerRelationshipsDashInvitationViews` endpoint.
-pub async fn cmd_connections_invitations(
-    start: u32,
-    count: u32,
-    raw_json: bool,
-) -> Result<(), String> {
+pub async fn cmd_connections_invitations(start: u32, count: u32, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_invitations(start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_invitations(start, count).await?;
 
     if raw_json {
         return print_json(&value);
@@ -444,7 +439,7 @@ async fn invitation_op(
     shared_secret: &str,
     raw_json: bool,
     op: InvitationOp,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
     let invitation_urn = build_invitation_urn(invitation_id);
 
@@ -459,8 +454,7 @@ async fn invitation_op(
                 .withdraw_invitation(&invitation_urn, shared_secret)
                 .await
         }
-    }
-    .map_err(|e| format!("API call failed: {e}"))?;
+    }?;
 
     if raw_json {
         print_json(&value)?;
@@ -475,7 +469,7 @@ pub async fn cmd_connections_accept(
     invitation_id: &str,
     shared_secret: &str,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     invitation_op(invitation_id, shared_secret, raw_json, InvitationOp::Accept).await
 }
 
@@ -483,7 +477,7 @@ pub async fn cmd_connections_withdraw(
     invitation_id: &str,
     shared_secret: &str,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     invitation_op(
         invitation_id,
         shared_secret,
@@ -494,9 +488,8 @@ pub async fn cmd_connections_withdraw(
 }
 
 /// Pretty-print a JSON value to stdout.
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }

@@ -1,24 +1,28 @@
 use linkedin_api::auth::Session;
 use linkedin_api::client::LinkedInClient;
 
+use crate::error::{CliError, CliResult};
+
 /// Load the stored session or return a descriptive error.
 ///
 /// Checks for session validity and prints a warning to stderr if the
 /// session is old enough to be potentially expired.
-pub fn load_session() -> Result<(Session, std::path::PathBuf), String> {
-    let path = Session::default_path().map_err(|e| format!("{e}"))?;
+pub fn load_session() -> CliResult<(Session, std::path::PathBuf)> {
+    let path = Session::default_path().map_err(|e| CliError::Session(format!("{e}")))?;
 
     if !path.exists() {
-        return Err(format!(
+        return Err(CliError::Session(format!(
             "no session found at {} -- run `auth login` first",
             path.display()
-        ));
+        )));
     }
 
-    let session = Session::load(&path).map_err(|e| format!("{e}"))?;
+    let session = Session::load(&path).map_err(|e| CliError::Session(format!("{e}")))?;
 
     if !session.is_valid() {
-        return Err("session is invalid (empty li_at cookie)".to_string());
+        return Err(CliError::Session(
+            "session is invalid (empty li_at cookie)".to_string(),
+        ));
     }
 
     // Warn about potentially expired sessions.
@@ -39,28 +43,27 @@ pub fn load_session() -> Result<(Session, std::path::PathBuf), String> {
 /// Never resolves relative to the current working directory. Running `li`
 /// from a directory that happens to contain `secrets/browser_cookies.json`
 /// must not silently swap in those cookies.
-fn browser_cookies_path() -> Result<std::path::PathBuf, String> {
+fn browser_cookies_path() -> CliResult<std::path::PathBuf> {
     if let Some(override_path) = std::env::var_os("LINKEDIN_COOKIES_FILE") {
         return Ok(std::path::PathBuf::from(override_path));
     }
-    let session_path = Session::default_path().map_err(|e| format!("{e}"))?;
+    let session_path = Session::default_path().map_err(|e| CliError::Session(format!("{e}")))?;
     let session_dir = session_path
         .parent()
-        .ok_or_else(|| "session path has no parent directory".to_string())?;
+        .ok_or_else(|| CliError::Session("session path has no parent directory".to_string()))?;
     Ok(session_dir.join("browser_cookies.json"))
 }
 
 /// Load the stored session and create an authenticated client.
-pub fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), String> {
+pub fn load_session_client() -> CliResult<(LinkedInClient, std::path::PathBuf)> {
     // Check for browser cookies file first (enables write operations).
     let cookies_path = browser_cookies_path()?;
     if cookies_path.exists() {
         let data = std::fs::read_to_string(&cookies_path)
-            .map_err(|e| format!("failed to read browser cookies: {e}"))?;
+            .map_err(|e| CliError::Session(format!("failed to read browser cookies: {e}")))?;
         let cookies: std::collections::HashMap<String, String> = serde_json::from_str(&data)
-            .map_err(|e| format!("failed to parse browser cookies: {e}"))?;
-        let client = LinkedInClient::with_browser_cookies(&cookies)
-            .map_err(|e| format!("client error: {e}"))?;
+            .map_err(|e| CliError::Session(format!("failed to parse browser cookies: {e}")))?;
+        let client = LinkedInClient::with_browser_cookies(&cookies)?;
         let (_, path) = load_session()?;
         let display = std::fs::canonicalize(&cookies_path).unwrap_or(cookies_path);
         eprintln!("Using browser cookies from {}", display.display());
@@ -68,8 +71,7 @@ pub fn load_session_client() -> Result<(LinkedInClient, std::path::PathBuf), Str
     }
 
     let (session, path) = load_session()?;
-    let client =
-        LinkedInClient::with_session(&session).map_err(|e| format!("client error: {e}"))?;
+    let client = LinkedInClient::with_session(&session)?;
     Ok((client, path))
 }
 

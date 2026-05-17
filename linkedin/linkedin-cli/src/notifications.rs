@@ -1,6 +1,7 @@
 use linkedin_api::models::NotificationCardsResponse;
 use linkedin_api::urn::{extract_activity_urn_from_url, find_fsd_profile_urn};
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
 
@@ -9,25 +10,21 @@ use crate::util::{print_paging_header, truncate_with_ellipsis};
 /// Loads the session, calls the Voyager GraphQL notifications endpoint
 /// (`identityDashNotificationCardsByFilterVanityName`) with pagination
 /// params, and prints the results.
-pub async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_notifications(start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_notifications(start, count).await?;
 
     save_notifications_cache(&value)?;
 
     if raw_json {
-        let pretty =
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON format error: {e}"))?;
+        let pretty = serde_json::to_string_pretty(&value)?;
         println!("{}", pretty);
         return Ok(());
     }
 
     let resp: NotificationCardsResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse notifications response: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to parse notifications response: {e}")))?;
 
     if let Some(ref paging) = resp.paging {
         print_paging_header("Notifications", paging);
@@ -59,9 +56,9 @@ pub async fn cmd_notifications_list(start: u32, count: u32, raw_json: bool) -> R
 /// mentioned member's URN. The exact discriminator key is unverified
 /// against a captured response, so the handler walks all entries
 /// permissively and surfaces any URN it finds.
-pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> CliResult<()> {
     if index == 0 {
-        return Err("index must be >= 1".to_string());
+        return Err(CliError::Other("index must be >= 1".to_string()));
     }
 
     let cache = load_notifications_cache()?;
@@ -72,7 +69,7 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<
     let post = client
         .get_post(&activity_urn)
         .await
-        .map_err(|e| format!("failed to fetch post {}: {e}", activity_urn))?;
+        .map_err(|e| CliError::Other(format!("failed to fetch post {}: {e}", activity_urn)))?;
     let mentions = collect_post_mentions(&post);
 
     if raw_json {
@@ -85,41 +82,42 @@ pub async fn cmd_notifications_mentions(index: usize, raw_json: bool) -> Result<
 fn cached_notification_at(
     cache: &serde_json::Value,
     index: usize,
-) -> Result<&serde_json::Value, String> {
+) -> CliResult<&serde_json::Value> {
     let elements = cache
         .get("elements")
         .and_then(|e| e.as_array())
-        .ok_or_else(|| "cached notifications response has no elements array".to_string())?;
+        .ok_or_else(|| {
+            CliError::Other("cached notifications response has no elements array".to_string())
+        })?;
     elements.get(index - 1).ok_or_else(|| {
-        format!(
+        CliError::Input(format!(
             "index {} out of range (cached notifications has {} items)",
             index,
             elements.len()
-        )
+        ))
     })
 }
 
-fn activity_urn_for_card(card: &serde_json::Value, index: usize) -> Result<String, String> {
+fn activity_urn_for_card(card: &serde_json::Value, index: usize) -> CliResult<String> {
     let action_target = card
         .get("cardAction")
         .and_then(|a| a.get("actionTarget"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
     extract_activity_urn_from_url(action_target).ok_or_else(|| {
-        format!(
+        CliError::Other(format!(
             "notification {} has no activity URN in cardAction.actionTarget ({})",
             index, action_target
-        )
+        ))
     })
 }
 
-fn print_mentions_json(activity_urn: &str, mentions: &[serde_json::Value]) -> Result<(), String> {
+fn print_mentions_json(activity_urn: &str, mentions: &[serde_json::Value]) -> CliResult<()> {
     let payload = serde_json::json!({
         "activityUrn": activity_urn,
         "mentions": mentions,
     });
-    let pretty =
-        serde_json::to_string_pretty(&payload).map_err(|e| format!("JSON format error: {e}"))?;
+    let pretty = serde_json::to_string_pretty(&payload)?;
     println!("{}", pretty);
     Ok(())
 }
@@ -297,28 +295,31 @@ fn card_post_link(card: &serde_json::Value) -> Option<String> {
     ))
 }
 
-fn notifications_cache_path() -> Result<std::path::PathBuf, String> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| "could not determine data directory".to_string())?;
+fn notifications_cache_path() -> CliResult<std::path::PathBuf> {
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| CliError::Other("could not determine data directory".to_string()))?;
     Ok(data_dir.join("linkedin").join("last_notifications.json"))
 }
 
-fn save_notifications_cache(value: &serde_json::Value) -> Result<(), String> {
+fn save_notifications_cache(value: &serde_json::Value) -> CliResult<()> {
     let path = notifications_cache_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Other(format!("failed to create cache dir: {e}")))?;
     }
     let json = serde_json::to_string(value)
-        .map_err(|e| format!("failed to serialize notifications cache: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write notifications cache: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to serialize notifications cache: {e}")))?;
+    std::fs::write(&path, json)
+        .map_err(|e| CliError::Other(format!("failed to write notifications cache: {e}")))?;
     Ok(())
 }
 
-fn load_notifications_cache() -> Result<serde_json::Value, String> {
+fn load_notifications_cache() -> CliResult<serde_json::Value> {
     let path = notifications_cache_path()?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| "no cached notifications. Run `notifications list` first.".to_string())?;
-    serde_json::from_str(&data).map_err(|e| format!("failed to parse notifications cache: {e}"))
+    serde_json::from_str(&data)
+        .map_err(|e| CliError::Other(format!("failed to parse notifications cache: {e}")))
 }
 
 #[cfg(test)]

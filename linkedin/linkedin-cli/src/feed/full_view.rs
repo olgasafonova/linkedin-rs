@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use linkedin_api::models::FeedResponse;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
@@ -17,13 +18,13 @@ use linkedin_api::feed_extract::{
 
 use super::urn::extract_activity_urn;
 
-pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
+pub fn cmd_feed_read(index: usize, raw_json: bool) -> CliResult<()> {
     if index == 0 {
-        return Err("index must be >= 1".to_string());
+        return Err(CliError::Other("index must be >= 1".to_string()));
     }
     let cache = load_feed_cache()?;
     let feed: FeedResponse = serde_json::from_value(cache.clone())
-        .map_err(|e| format!("failed to parse cached feed: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to parse cached feed: {e}")))?;
     let element = feed.elements.get(index - 1).ok_or_else(|| {
         format!(
             "index {} out of range (feed has {} items)",
@@ -38,12 +39,9 @@ pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn cmd_feed_view(activity_urn: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_feed_view(activity_urn: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
-    let post = client
-        .get_post(activity_urn)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let post = client.get_post(activity_urn).await?;
     if raw_json {
         return print_json(&post);
     }

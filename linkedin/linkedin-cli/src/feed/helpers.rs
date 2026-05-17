@@ -1,11 +1,11 @@
 //! Shared helpers used across feed submodules.
 
+use crate::error::CliResult;
 use serde_json::Value;
 
 /// Pretty-print a JSON value to stdout.
-pub(super) fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+pub(super) fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }

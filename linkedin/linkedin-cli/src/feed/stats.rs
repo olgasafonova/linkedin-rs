@@ -2,19 +2,17 @@
 
 use serde_json::Value;
 
+use crate::error::CliResult;
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
 use super::helpers::{commentary_text, print_json, social_count, unwrap_update_v2};
 
-pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
+pub async fn cmd_feed_stats(raw_json: bool) -> CliResult<()> {
     const POST_COUNT: u32 = 20;
 
     let (client, _path) = load_session_client()?;
-    let value = client
-        .get_my_posts(0, POST_COUNT)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_my_posts(0, POST_COUNT).await?;
 
     let elements = value
         .get("elements")
@@ -36,7 +34,7 @@ pub async fn cmd_feed_stats(raw_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn print_stats_json(posts: &[PostStat], totals: &PostStat, n: u64) -> Result<(), String> {
+fn print_stats_json(posts: &[PostStat], totals: &PostStat, n: u64) -> CliResult<()> {
     let averages = match (
         totals.views.checked_div(n),
         totals.likes.checked_div(n),

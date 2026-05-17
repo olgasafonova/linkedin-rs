@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use linkedin_api::models::FeedResponse;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
 
@@ -14,13 +15,10 @@ use super::helpers::{
 };
 use super::urn::extract_activity_urn;
 
-pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_my_posts(start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_my_posts(start, count).await?;
 
     if let Err(e) = save_feed_cache(&value) {
         eprintln!("warning: failed to cache feed: {}", e);
@@ -31,7 +29,7 @@ pub async fn cmd_feed_my_posts(start: u32, count: u32, raw_json: bool) -> Result
     }
 
     let feed: FeedResponse = serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse response: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to parse response: {e}")))?;
 
     if let Some(ref paging) = feed.paging {
         print_paging_header("My posts", paging);

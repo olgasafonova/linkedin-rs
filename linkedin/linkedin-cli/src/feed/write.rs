@@ -1,5 +1,6 @@
 //! Mutating feed commands: react, unreact, comment, post.
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
@@ -11,13 +12,13 @@ pub async fn cmd_feed_react(
     reaction_type: &str,
     confirmed: bool,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if !confirmed {
-        return Err(format!(
+        return Err(CliError::Other(format!(
             "this will place a REAL {} reaction visible to the post's author. \
              Pass --yes to confirm.",
             reaction_type.to_uppercase()
-        ));
+        )));
     }
 
     let resolved_urn = resolve_post_urn(post_urn)?;
@@ -25,10 +26,7 @@ pub async fn cmd_feed_react(
     let (client, _path) = load_session_client()?;
 
     eprintln!("Reacting to {} with {}...", resolved_urn, rt_upper);
-    let result = client
-        .react_to_post(&resolved_urn, &rt_upper)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let result = client.react_to_post(&resolved_urn, &rt_upper).await?;
 
     if raw_json {
         print_json(&result)?;
@@ -42,16 +40,13 @@ pub async fn cmd_feed_unreact(
     post_urn: &str,
     reaction_type: &str,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let resolved_urn = resolve_post_urn(post_urn)?;
     let rt_upper = reaction_type.to_uppercase();
     let (client, _path) = load_session_client()?;
 
     eprintln!("Removing {} reaction from {}...", resolved_urn, rt_upper);
-    let result = client
-        .unreact_from_post(&resolved_urn, &rt_upper)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let result = client.unreact_from_post(&resolved_urn, &rt_upper).await?;
 
     if raw_json {
         print_json(&result)?;
@@ -66,21 +61,20 @@ pub async fn cmd_feed_comment(
     text: &str,
     confirmed: bool,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if !confirmed {
-        return Err("this will create a REAL COMMENT on a LinkedIn post. \
+        return Err(CliError::Input(
+            "this will create a REAL COMMENT on a LinkedIn post. \
              Pass --yes to confirm."
-            .to_string());
+                .to_string(),
+        ));
     }
 
     let resolved_urn = resolve_post_urn(post_urn)?;
     let (client, _path) = load_session_client()?;
 
     eprintln!("Commenting on {}...", resolved_urn);
-    let result = client
-        .comment_on_post(&resolved_urn, text)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let result = client.comment_on_post(&resolved_urn, text).await?;
 
     if raw_json {
         print_json(&result)?;
@@ -95,13 +89,13 @@ pub async fn cmd_feed_post(
     visibility: &str,
     confirmed: bool,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let vis_upper = visibility.to_uppercase();
     if vis_upper != "ANYONE" && vis_upper != "CONNECTIONS_ONLY" {
-        return Err(format!(
+        return Err(CliError::Other(format!(
             "invalid visibility '{}'. Must be ANYONE or CONNECTIONS_ONLY",
             visibility
-        ));
+        )));
     }
 
     if !confirmed {
@@ -111,15 +105,14 @@ pub async fn cmd_feed_post(
         eprintln!("  Text: {}", truncate_with_ellipsis(text, 200));
         eprintln!();
         eprintln!("Use --yes to confirm and publish this post.");
-        return Err("post not confirmed (use --yes to publish)".to_string());
+        return Err(CliError::Other(
+            "post not confirmed (use --yes to publish)".to_string(),
+        ));
     }
 
     let (client, _path) = load_session_client()?;
     eprintln!("Creating post (visibility: {})...", vis_upper);
-    let result = client
-        .create_post(text, &vis_upper)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let result = client.create_post(text, &vis_upper).await?;
 
     if raw_json {
         print_json(&result)?;

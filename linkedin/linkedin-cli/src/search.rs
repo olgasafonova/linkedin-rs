@@ -4,6 +4,7 @@ use linkedin_api::models::SearchResponse;
 use linkedin_api::urn::extract_activity_urn;
 
 use crate::connections::cmd_connections_invite;
+use crate::error::{CliError, CliResult};
 use crate::profile::cmd_profile_view;
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
@@ -17,13 +18,10 @@ pub async fn cmd_search_people(
     start: u32,
     count: u32,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .search_people(keywords, start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.search_people(keywords, start, count).await?;
 
     if let Err(e) = save_search_cache("people", &value) {
         eprintln!("warning: failed to cache search results: {e}");
@@ -88,13 +86,10 @@ pub async fn cmd_search_jobs(
     start: u32,
     count: u32,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .search_jobs(keywords, start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.search_jobs(keywords, start, count).await?;
 
     if raw_json {
         return print_json(&value);
@@ -149,44 +144,46 @@ fn print_job_card(index: usize, card: &Value) {
     }
 }
 
-fn search_cache_path(kind: &str) -> Result<std::path::PathBuf, String> {
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| "could not determine data directory".to_string())?;
+fn search_cache_path(kind: &str) -> CliResult<std::path::PathBuf> {
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| CliError::Other("could not determine data directory".to_string()))?;
     Ok(data_dir
         .join("linkedin")
         .join(format!("last_search_{}.json", kind)))
 }
 
-fn save_search_cache(kind: &str, value: &Value) -> Result<(), String> {
+fn save_search_cache(kind: &str, value: &Value) -> CliResult<()> {
     let path = search_cache_path(kind)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create cache dir: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Other(format!("failed to create cache dir: {e}")))?;
     }
     let json = serde_json::to_string(value)
-        .map_err(|e| format!("failed to serialize search cache: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write search cache: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to serialize search cache: {e}")))?;
+    std::fs::write(&path, json)
+        .map_err(|e| CliError::Other(format!("failed to write search cache: {e}")))?;
     Ok(())
 }
 
-fn load_search_cache(kind: &str) -> Result<Value, String> {
+fn load_search_cache(kind: &str) -> CliResult<Value> {
     let path = search_cache_path(kind)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| format!("no cached {} search. Run `search {}` first.", kind, kind))?;
-    serde_json::from_str(&data).map_err(|e| format!("failed to parse search cache: {e}"))
+    serde_json::from_str(&data)
+        .map_err(|e| CliError::Other(format!("failed to parse search cache: {e}")))
 }
 
 /// Pretty-print a JSON value to stdout.
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }
 
 /// Decode a raw search payload into the typed envelope.
-fn parse_search_response(value: &Value) -> Result<SearchResponse, String> {
+fn parse_search_response(value: &Value) -> CliResult<SearchResponse> {
     serde_json::from_value(value.clone())
-        .map_err(|e| format!("failed to parse search response: {e}"))
+        .map_err(|e| CliError::Other(format!("failed to parse search response: {e}")))
 }
 
 /// Print the standard "label … --- " header used by every search command.
@@ -218,26 +215,26 @@ fn iter_cluster_items<'a>(
 }
 
 /// Find the Nth (1-based) item of `kind` from a cached search payload.
-fn nth_cached_item(cache_kind: &str, item_kind: &str, index: usize) -> Result<Value, String> {
+fn nth_cached_item(cache_kind: &str, item_kind: &str, index: usize) -> CliResult<Value> {
     let cache = load_search_cache(cache_kind)?;
     let resp = parse_search_response(&cache)?;
     let items: Vec<Value> = iter_cluster_items(&resp, item_kind).cloned().collect();
     if index == 0 || index > items.len() {
-        return Err(format!(
+        return Err(CliError::Other(format!(
             "index {} out of range (search has {} results)",
             index,
             items.len()
-        ));
+        )));
     }
     Ok(items[index - 1].clone())
 }
 
 /// Extract the Nth post's activity URN from cached search results.
-fn resolve_search_post_urn(index: usize) -> Result<String, String> {
+fn resolve_search_post_urn(index: usize) -> CliResult<String> {
     let sfu = nth_cached_item("posts", "searchFeedUpdate", index)?;
     let update = sfu.get("update").unwrap_or(&sfu);
     activity_urn_from_update(update)
-        .ok_or_else(|| format!("search result {} has no activity URN", index))
+        .ok_or_else(|| CliError::Other(format!("search result {} has no activity URN", index)))
 }
 
 /// Extract an activity URN (`urn:li:activity:N`) from an update value.
@@ -271,14 +268,14 @@ fn coerce_activity_urn(s: &str) -> Option<String> {
 }
 
 /// Extract the Nth person's profile slug from cached people search results.
-fn resolve_search_person_slug(index: usize) -> Result<String, String> {
+fn resolve_search_person_slug(index: usize) -> CliResult<String> {
     let entity = nth_cached_item("people", "entityResult", index)?;
     entity
         .get("navigationUrl")
         .and_then(|v| v.as_str())
         .and_then(profile_slug_from_url)
         .map(str::to_string)
-        .ok_or_else(|| format!("search result {} has no profile URL", index))
+        .ok_or_else(|| CliError::Other(format!("search result {} has no profile URL", index)))
 }
 
 /// Strip the "/in/" prefix and trailing query string from a navigation URL.
@@ -302,13 +299,10 @@ pub async fn cmd_search_posts(
     start: u32,
     count: u32,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .search_content(keywords, start, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.search_content(keywords, start, count).await?;
 
     if let Err(e) = save_search_cache("posts", &value) {
         eprintln!("warning: failed to cache search results: {e}");
@@ -335,13 +329,9 @@ pub async fn cmd_search_posts(
 }
 
 /// Handle `search react <index> [--type LIKE] [--json]`.
-pub async fn cmd_search_react(
-    index: usize,
-    reaction_type: &str,
-    raw_json: bool,
-) -> Result<(), String> {
+pub async fn cmd_search_react(index: usize, reaction_type: &str, raw_json: bool) -> CliResult<()> {
     if index == 0 {
-        return Err("index must be >= 1".to_string());
+        return Err(CliError::Other("index must be >= 1".to_string()));
     }
 
     let activity_urn = resolve_search_post_urn(index)?;
@@ -349,10 +339,7 @@ pub async fn cmd_search_react(
     let (client, _path) = load_session_client()?;
 
     eprintln!("Reacting to {} with {}...", activity_urn, rt_upper);
-    let result = client
-        .react_to_post(&activity_urn, &rt_upper)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let result = client.react_to_post(&activity_urn, &rt_upper).await?;
 
     if raw_json {
         print_json(&result)?;
@@ -363,9 +350,9 @@ pub async fn cmd_search_react(
 }
 
 /// Handle `search view <index> [--json]`.
-pub async fn cmd_search_view(index: usize, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_search_view(index: usize, raw_json: bool) -> CliResult<()> {
     if index == 0 {
-        return Err("index must be >= 1".to_string());
+        return Err(CliError::Other("index must be >= 1".to_string()));
     }
 
     let slug = resolve_search_person_slug(index)?;
@@ -385,9 +372,9 @@ pub async fn cmd_search_invite(
     index: usize,
     message: Option<&str>,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if index == 0 {
-        return Err("index must be >= 1".to_string());
+        return Err(CliError::Other("index must be >= 1".to_string()));
     }
 
     let target = resolve_search_person_target(index)?;
@@ -424,7 +411,7 @@ impl SearchPersonTarget {
     }
 }
 
-fn resolve_search_person_target(index: usize) -> Result<SearchPersonTarget, String> {
+fn resolve_search_person_target(index: usize) -> CliResult<SearchPersonTarget> {
     let entity = nth_cached_item("people", "entityResult", index)?;
     let urn = profile_urn_from_entity(&entity);
     let slug = entity
@@ -435,10 +422,10 @@ fn resolve_search_person_target(index: usize) -> Result<SearchPersonTarget, Stri
     let name = text_field(&entity, "title").map(str::to_string);
 
     if urn.is_none() && slug.is_none() {
-        return Err(format!(
+        return Err(CliError::Other(format!(
             "search result {} has neither entityUrn nor navigationUrl",
             index
-        ));
+        )));
     }
 
     Ok(SearchPersonTarget { urn, slug, name })

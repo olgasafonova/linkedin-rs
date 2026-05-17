@@ -3,6 +3,7 @@ use serde_json::Value;
 use linkedin_api::client::LinkedInClient;
 use linkedin_api::models::{ConnectionsResponse, Paging};
 
+use crate::error::{CliError, CliResult};
 use crate::graphql_print::{print_graphql_conversation, print_graphql_message};
 use crate::session::load_session_client;
 use crate::spam::{is_spam_conversation, is_spam_invitation};
@@ -16,9 +17,8 @@ const PROFILE_URN_PREFIXES: &[&str] = &[
 ];
 
 /// Pretty-print a JSON value to stdout.
-fn print_json(value: &Value) -> Result<(), String> {
-    let pretty =
-        serde_json::to_string_pretty(value).map_err(|e| format!("JSON format error: {e}"))?;
+fn print_json(value: &Value) -> CliResult<()> {
+    let pretty = serde_json::to_string_pretty(value)?;
     println!("{}", pretty);
     Ok(())
 }
@@ -71,7 +71,7 @@ fn elements_slice(value: &Value) -> &[Value] {
 /// Shows a daily summary: unread messages, pending invitations, and
 /// recent unread notifications in one view. Filters likely recruiter
 /// spam by default; use `--all` to see everything.
-pub async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
+pub async fn cmd_inbox(raw_json: bool, show_all: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     // Fetch all three concurrently. The client's request throttle still
@@ -83,10 +83,12 @@ pub async fn cmd_inbox(raw_json: bool, show_all: bool) -> Result<(), String> {
         client.get_invitations(0, 10),
         client.get_notifications(0, 10),
     );
-    let conversations = conversations_res.map_err(|e| format!("failed to fetch messages: {e}"))?;
-    let invitations = invitations_res.map_err(|e| format!("failed to fetch invitations: {e}"))?;
-    let notifications =
-        notifications_res.map_err(|e| format!("failed to fetch notifications: {e}"))?;
+    let conversations =
+        conversations_res.map_err(|e| CliError::Other(format!("failed to fetch messages: {e}")))?;
+    let invitations = invitations_res
+        .map_err(|e| CliError::Other(format!("failed to fetch invitations: {e}")))?;
+    let notifications = notifications_res
+        .map_err(|e| CliError::Other(format!("failed to fetch notifications: {e}")))?;
 
     if raw_json {
         let combined = serde_json::json!({
@@ -300,14 +302,14 @@ fn print_unread_notifications_section(notifications: &Value) {
 /// Shows your network overlap with a company: connections who work there,
 /// profile viewers from there, recent messages with people there, and
 /// key people at the company.
-pub async fn cmd_who(company_slug: &str, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_who(company_slug: &str, raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     eprintln!("Looking up {}...", company_slug);
     let company_data = client
         .get_company(company_slug)
         .await
-        .map_err(|e| format!("company lookup failed: {e}"))?;
+        .map_err(|e| CliError::Other(format!("company lookup failed: {e}")))?;
     let company = summarize_company(&company_data, company_slug);
     let name_lower = company.name.to_lowercase();
     let slug_lower = company_slug.to_lowercase();
@@ -432,7 +434,7 @@ async fn scan_connections_at(
     client: &LinkedInClient,
     name_lower: &str,
     slug_lower: &str,
-) -> Result<Vec<ConnectionMatch>, String> {
+) -> CliResult<Vec<ConnectionMatch>> {
     let mut matches = Vec::new();
     let page_size = 40u32;
     let mut offset = 0u32;
@@ -440,9 +442,9 @@ async fn scan_connections_at(
         let value = client
             .get_connections(offset, page_size)
             .await
-            .map_err(|e| format!("connections fetch failed: {e}"))?;
-        let resp: ConnectionsResponse =
-            serde_json::from_value(value).map_err(|e| format!("parse error: {e}"))?;
+            .map_err(|e| CliError::Other(format!("connections fetch failed: {e}")))?;
+        let resp: ConnectionsResponse = serde_json::from_value(value)
+            .map_err(|e| CliError::Other(format!("parse error: {e}")))?;
 
         matches.extend(
             resp.elements
@@ -649,7 +651,7 @@ fn match_search_person(
     })
 }
 
-fn print_who_json(f: &WhoFindings) -> Result<(), String> {
+fn print_who_json(f: &WhoFindings) -> CliResult<()> {
     let output = serde_json::json!({
         "company": {
             "name": f.company.name,
@@ -785,13 +787,10 @@ pub async fn cmd_messages_list(
     count: u32,
     created_before: Option<u64>,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
-    let value = client
-        .get_conversations(count, created_before)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_conversations(count, created_before).await?;
 
     if raw_json {
         return print_json(&value);
@@ -830,13 +829,12 @@ pub async fn cmd_messages_read(
     conversation_id: &str,
     created_before: Option<u64>,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     let value = client
         .get_conversation_events(conversation_id, created_before)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+        .await?;
 
     if raw_json {
         return print_json(&value);
@@ -875,9 +873,9 @@ pub async fn cmd_messages_send(
     message: &str,
     confirmed: bool,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if !confirmed {
-        return Err(send_confirmation_error(recipient, message));
+        return Err(CliError::Input(send_confirmation_error(recipient, message)));
     }
 
     let (client, _path) = load_session_client()?;
@@ -888,7 +886,7 @@ pub async fn cmd_messages_send(
     let value = client
         .send_message(&profile_urn, message)
         .await
-        .map_err(|e| format!("failed to send message: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to send message: {e}")))?;
 
     if raw_json {
         print_json(&value)?;
@@ -914,10 +912,7 @@ fn send_confirmation_error(recipient: &str, message: &str) -> String {
 
 /// Resolve a `messages send` recipient. Accepts a URN, a vanity slug, or
 /// a "First Last" name (fuzzy-matched against connections).
-async fn resolve_send_recipient(
-    client: &LinkedInClient,
-    recipient: &str,
-) -> Result<String, String> {
+async fn resolve_send_recipient(client: &LinkedInClient, recipient: &str) -> CliResult<String> {
     if PROFILE_URN_PREFIXES
         .iter()
         .any(|p| recipient.starts_with(p))
@@ -933,7 +928,7 @@ async fn resolve_send_recipient(
     client
         .resolve_profile_urn(recipient)
         .await
-        .map_err(|e| format!("failed to resolve profile URN: {e}"))
+        .map_err(|e| CliError::Other(format!("failed to resolve profile URN: {e}")))
 }
 
 /// One row of the name-fuzzy-match resolver. At least one of `slug` /
@@ -950,7 +945,7 @@ struct NameMatch {
 /// given name (case-insensitive substring match on first+last). If
 /// multiple matches are found, lists them and asks the user to be more
 /// specific.
-async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> Result<String, String> {
+async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> CliResult<String> {
     let matches = scan_connections_for_name(client, &name.to_lowercase()).await?;
     pick_unique_match(client, name, matches).await
 }
@@ -960,7 +955,7 @@ async fn resolve_recipient_by_name(client: &LinkedInClient, name: &str) -> Resul
 async fn scan_connections_for_name(
     client: &LinkedInClient,
     name_lower: &str,
-) -> Result<Vec<NameMatch>, String> {
+) -> CliResult<Vec<NameMatch>> {
     let page_size = 40u32;
     let max_scan = 200u32;
     let mut offset = 0u32;
@@ -970,7 +965,7 @@ async fn scan_connections_for_name(
         let value = client
             .get_connections(offset, page_size)
             .await
-            .map_err(|e| format!("failed to fetch connections: {e}"))?;
+            .map_err(|e| CliError::Other(format!("failed to fetch connections: {e}")))?;
         let elements = elements_slice(&value);
 
         for conn in elements {
@@ -1020,18 +1015,18 @@ async fn pick_unique_match(
     client: &LinkedInClient,
     name: &str,
     matches: Vec<NameMatch>,
-) -> Result<String, String> {
+) -> CliResult<String> {
     match matches.len() {
-        0 => Err(format!(
+        0 => Err(CliError::Other(format!(
             "no connection found matching '{}'. Try a vanity slug instead.",
             name
-        )),
+        ))),
         1 => urn_for_match(client, &matches[0]).await,
-        _ => Err(format_ambiguous_error(name, &matches)),
+        _ => Err(CliError::Input(format_ambiguous_error(name, &matches))),
     }
 }
 
-async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> Result<String, String> {
+async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> CliResult<String> {
     eprintln!("Matched: {} ({})", m.name, m.slug);
     if !m.urn.is_empty() {
         return Ok(m.urn.replace("fs_miniProfile", "fsd_profile"));
@@ -1040,9 +1035,11 @@ async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> Result<String,
         return client
             .resolve_profile_urn(&m.slug)
             .await
-            .map_err(|e| format!("failed to resolve profile: {e}"));
+            .map_err(|e| CliError::Other(format!("failed to resolve profile: {e}")));
     }
-    Err("matched connection has no URN or slug".to_string())
+    Err(CliError::Other(
+        "matched connection has no URN or slug".to_string(),
+    ))
 }
 
 fn format_ambiguous_error(name: &str, matches: &[NameMatch]) -> String {
@@ -1065,7 +1062,7 @@ pub async fn cmd_messages_reply(
     message: &str,
     confirmed: bool,
     raw_json: bool,
-) -> Result<(), String> {
+) -> CliResult<()> {
     if !confirmed {
         return preview_thread_then_abort(conversation_id, message).await;
     }
@@ -1075,7 +1072,7 @@ pub async fn cmd_messages_reply(
     let value = client
         .reply_to_conversation(conversation_id, message)
         .await
-        .map_err(|e| format!("failed to send reply: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to send reply: {e}")))?;
 
     if raw_json {
         print_json(&value)?;
@@ -1085,12 +1082,12 @@ pub async fn cmd_messages_reply(
     Ok(())
 }
 
-async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> Result<(), String> {
+async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
     let events = client
         .get_conversation_events(conversation_id, None)
         .await
-        .map_err(|e| format!("failed to load conversation: {e}"))?;
+        .map_err(|e| CliError::Other(format!("failed to load conversation: {e}")))?;
     let elements = elements_slice(&events);
     let show = elements
         .get(elements.len().saturating_sub(3)..)
@@ -1105,10 +1102,10 @@ async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> Resu
     eprintln!("---");
     eprintln!("Your reply: {}", message);
     eprintln!();
-    Err(
+    Err(CliError::Input(
         "this will send a REAL MESSAGE in this LinkedIn conversation. Pass --yes to confirm."
             .to_string(),
-    )
+    ))
 }
 
 /// Best-effort sender label. Prefers the structured member name; falls

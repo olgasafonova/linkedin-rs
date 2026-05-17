@@ -2,20 +2,18 @@
 
 use serde_json::Value;
 
+use crate::error::{CliError, CliResult};
 use crate::session::load_session_client;
 
 use super::cache::cached_feed_element;
 use super::helpers::{print_json, unwrap_update_v2};
 
-pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Result<(), String> {
+pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> CliResult<()> {
     let element = cached_feed_element(index)?;
     let social_detail_urn = social_detail_urn(&element)?;
 
     let (client, _path) = load_session_client()?;
-    let value = client
-        .get_comments(&social_detail_urn, 0, count)
-        .await
-        .map_err(|e| format!("API call failed: {e}"))?;
+    let value = client.get_comments(&social_detail_urn, 0, count).await?;
 
     if raw_json {
         return print_json(&value);
@@ -39,14 +37,14 @@ pub async fn cmd_feed_comments(index: usize, count: u32, raw_json: bool) -> Resu
     Ok(())
 }
 
-fn social_detail_urn(element: &Value) -> Result<String, String> {
+fn social_detail_urn(element: &Value) -> CliResult<String> {
     let update = unwrap_update_v2(element);
     update
         .get("socialDetail")
         .and_then(|sd| sd.get("dashEntityUrn").or_else(|| sd.get("entityUrn")))
         .and_then(|u| u.as_str())
         .map(str::to_string)
-        .ok_or_else(|| "feed item has no socialDetail URN".to_string())
+        .ok_or_else(|| CliError::Other("feed item has no socialDetail URN".to_string()))
 }
 
 fn print_comment(index: usize, comment: &Value) {
