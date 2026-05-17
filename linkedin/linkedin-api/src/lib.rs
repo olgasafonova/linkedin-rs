@@ -14,5 +14,7 @@
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod feed_extract;
 pub mod models;
 pub mod restli;
+pub mod urn;

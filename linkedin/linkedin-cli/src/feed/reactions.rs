@@ -1,12 +1,13 @@
 //! `feed reactions` command.
 
+use linkedin_api::urn::extract_reactions_urn;
 use serde_json::Value;
 
 use crate::session::load_session_client;
 use crate::util::truncate_with_ellipsis;
 
 use super::cache::cached_feed_element;
-use super::helpers::{print_json, reaction_emoji, text_field, unwrap_update_v2};
+use super::helpers::{print_json, reaction_emoji, text_field};
 use super::urn::normalize_reactions_urn;
 
 /// Options for `feed reactions`. Bundles the five-argument call into a struct.
@@ -100,23 +101,6 @@ fn print_reactions_empty_hint(urn: &str, from_list: Option<usize>) {
     );
 }
 
-/// Extract the right thread URN for the reactions endpoint from a cached feed
-/// element. ugcPost-backed posts require the ugcPost URN, share-backed posts
-/// require the activity URN.
-fn extract_reactions_urn(element: &Value) -> Option<String> {
-    let update = unwrap_update_v2(element);
-    let metadata = update.get("updateMetadata")?;
-    let activity_urn = metadata.get("urn").and_then(|u| u.as_str());
-    let share_urn = metadata.get("shareUrn").and_then(|u| u.as_str());
-
-    match (share_urn, activity_urn) {
-        (Some(s), _) if s.starts_with("urn:li:ugcPost:") => Some(s.to_string()),
-        (_, Some(a)) => Some(a.to_string()),
-        (Some(s), None) => Some(s.to_string()),
-        (None, None) => None,
-    }
-}
-
 fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
     let element = cached_feed_element(index)?;
     extract_reactions_urn(&element).ok_or_else(|| {
@@ -125,67 +109,4 @@ fn reactions_urn_from_cache(index: usize) -> Result<String, String> {
             index
         )
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn wrapped_metadata_element(activity_urn: &str, share_urn: &str) -> Value {
-        json!({
-            "value": {
-                "com.linkedin.voyager.feed.render.UpdateV2": {
-                    "updateMetadata": {
-                        "urn": activity_urn,
-                        "shareUrn": share_urn,
-                    }
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn extract_reactions_urn_picks_correct_urn_per_post_backing() {
-        let cases = [
-            (
-                "urn:li:activity:7450891298279972864",
-                "urn:li:ugcPost:7450888187100639232",
-                "urn:li:ugcPost:7450888187100639232",
-            ),
-            (
-                "urn:li:activity:7450895500045598720",
-                "urn:li:share:7450895499496202240",
-                "urn:li:activity:7450895500045598720",
-            ),
-        ];
-        for (activity, share, expected) in cases {
-            let element = wrapped_metadata_element(activity, share);
-            assert_eq!(
-                extract_reactions_urn(&element),
-                Some(expected.to_string()),
-                "activity={activity} share={share}"
-            );
-        }
-    }
-
-    #[test]
-    fn extract_reactions_urn_handles_unwrapped_update_element() {
-        let element = json!({
-            "updateMetadata": {
-                "urn": "urn:li:activity:7450808005048094720",
-                "shareUrn": "urn:li:ugcPost:7450808001881534464"
-            }
-        });
-        assert_eq!(
-            extract_reactions_urn(&element),
-            Some("urn:li:ugcPost:7450808001881534464".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_reactions_urn_returns_none_when_metadata_missing() {
-        let element = json!({"foo": "bar"});
-        assert_eq!(extract_reactions_urn(&element), None);
-    }
 }

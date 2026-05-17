@@ -11,7 +11,7 @@ use super::cache::save_feed_cache;
 use super::helpers::{
     actor_name, commentary_text, field_str, print_json, social_count, unwrap_update_v2,
 };
-use super::render::extract_media_type_label;
+use linkedin_api::feed_extract::extract_media_type_label;
 
 /// Options for `feed list`. Bundles the five-argument call into a struct.
 pub struct FeedListOptions<'a> {

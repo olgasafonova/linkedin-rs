@@ -11,7 +11,10 @@ use super::cache::load_feed_cache;
 use super::helpers::{
     actor_name, commentary_text, field_str, nested_text, print_json, social_count, unwrap_update_v2,
 };
-use super::render::{extract_article_info, extract_media_type_label, extract_media_urls};
+use linkedin_api::feed_extract::{
+    extract_article_info, extract_media_type_label, extract_media_urls,
+};
+
 use super::urn::extract_activity_urn;
 
 pub fn cmd_feed_read(index: usize, raw_json: bool) -> Result<(), String> {

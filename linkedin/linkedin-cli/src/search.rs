@@ -1,9 +1,9 @@
 use serde_json::Value;
 
 use linkedin_api::models::SearchResponse;
+use linkedin_api::urn::extract_activity_urn;
 
 use crate::connections::cmd_connections_invite;
-use crate::feed::extract_activity_urn;
 use crate::profile::cmd_profile_view;
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};

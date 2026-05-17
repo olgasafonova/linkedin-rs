@@ -1,15 +1,23 @@
-//! Article + media-type extraction shared by `feed list` and `feed read`.
+//! Extractors for Voyager feed `content` payloads.
+//!
+//! Feed responses carry articles, images, videos, documents, polls, and
+//! carousels under a `content` object whose shape varies by post type. This
+//! module hides the per-component walking behind a small set of pure
+//! extractors so callers don't reach into the JSON themselves.
 
 use serde_json::Value;
 
-use super::helpers::field_str;
-
-pub(super) struct ArticleInfo {
+/// Article fields surfaced from a feed item that links to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleInfo {
     pub title: String,
     pub url: String,
 }
 
-pub(super) fn extract_article_info(update: &Value) -> Option<ArticleInfo> {
+/// Extract article title + URL from a feed update's content. Returns `None`
+/// when the item isn't an article (no articleComponent and no navigation
+/// context).
+pub fn extract_article_info(update: &Value) -> Option<ArticleInfo> {
     let content = update.get("content")?;
     extract_article_from_component(content).or_else(|| extract_article_from_nav(content))
 }
@@ -48,6 +56,10 @@ fn extract_article_from_nav(content: &Value) -> Option<ArticleInfo> {
     }
     let title = field_str(nav, "accessibilityText").to_string();
     Some(ArticleInfo { title, url })
+}
+
+fn field_str<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
 /// Component union keys that map directly to a media-type label.
@@ -93,7 +105,9 @@ const MEDIA_TYPE_TOKENS: &[(&str, &str)] = &[
     ("Article", "article"),
 ];
 
-pub(super) fn extract_media_type_label(update: &Value) -> String {
+/// Classify a feed update's media type. Empty string when no component or
+/// `$type` token matches.
+pub fn extract_media_type_label(update: &Value) -> String {
     let Some(content) = update.get("content") else {
         return String::new();
     };
@@ -117,8 +131,9 @@ fn label_from_type_token(content: &Value) -> Option<String> {
         .map(|(_, label)| (*label).to_string())
 }
 
-/// Extract media URLs (images, videos, documents) from a feed item's content.
-pub(super) fn extract_media_urls(update: &Value) -> Vec<String> {
+/// Extract media URLs (images, videos, documents, carousels) from a feed
+/// item's content.
+pub fn extract_media_urls(update: &Value) -> Vec<String> {
     let mut urls = Vec::new();
     let Some(content) = update.get("content") else {
         return urls;
@@ -256,4 +271,119 @@ fn image_attribute_url(attr: &Value) -> Option<String> {
         })
         .unwrap_or("");
     Some(format!("{}{}", root, segment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_article_info_reads_article_component() {
+        let update = json!({
+            "content": {
+                "articleComponent": {
+                    "title": {"text": "Headline"},
+                    "navigationContext": {"actionTarget": "https://example.com/post"}
+                }
+            }
+        });
+        assert_eq!(
+            extract_article_info(&update),
+            Some(ArticleInfo {
+                title: "Headline".to_string(),
+                url: "https://example.com/post".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn extract_article_info_falls_back_to_nav_context() {
+        let update = json!({
+            "content": {
+                "navigationContext": {
+                    "actionTarget": "https://example.com/link",
+                    "accessibilityText": "Open link"
+                }
+            }
+        });
+        assert_eq!(
+            extract_article_info(&update),
+            Some(ArticleInfo {
+                title: "Open link".to_string(),
+                url: "https://example.com/link".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn extract_article_info_none_when_neither() {
+        let update = json!({"content": {"imageComponent": {}}});
+        assert!(extract_article_info(&update).is_none());
+    }
+
+    #[test]
+    fn extract_media_type_label_recognises_short_names() {
+        let cases = [
+            ("imageComponent", "image"),
+            ("videoComponent", "video"),
+            ("documentComponent", "document"),
+            ("pollComponent", "poll"),
+            ("articleComponent", "article"),
+            ("carouselComponent", "carousel"),
+            ("celebrationComponent", "celebration"),
+        ];
+        for (key, expected) in cases {
+            let update = json!({"content": {key: {}}});
+            assert_eq!(extract_media_type_label(&update), expected, "key={key}");
+        }
+    }
+
+    #[test]
+    fn extract_media_type_label_recognises_voyager_typenames() {
+        let update = json!({
+            "content": {
+                "com.linkedin.voyager.feed.render.ImageComponent": {}
+            }
+        });
+        assert_eq!(extract_media_type_label(&update), "image");
+    }
+
+    #[test]
+    fn extract_media_type_label_falls_back_to_type_token() {
+        let update = json!({
+            "content": {
+                "$type": "com.linkedin.voyager.feed.render.VideoSomething"
+            }
+        });
+        assert_eq!(extract_media_type_label(&update), "video");
+    }
+
+    #[test]
+    fn extract_media_type_label_empty_when_no_content() {
+        let update = json!({});
+        assert_eq!(extract_media_type_label(&update), "");
+    }
+
+    #[test]
+    fn extract_media_urls_pulls_image_url() {
+        let update = json!({
+            "content": {
+                "imageComponent": {
+                    "images": [{
+                        "attributes": [{"imageUrl": "https://media.example/i1.jpg"}]
+                    }]
+                }
+            }
+        });
+        assert_eq!(
+            extract_media_urls(&update),
+            vec!["https://media.example/i1.jpg"]
+        );
+    }
+
+    #[test]
+    fn extract_media_urls_returns_empty_when_no_content() {
+        assert_eq!(extract_media_urls(&json!({})), Vec::<String>::new());
+    }
 }

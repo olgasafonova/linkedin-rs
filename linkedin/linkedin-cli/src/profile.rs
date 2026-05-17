@@ -890,16 +890,9 @@ fn print_me_response_keys(me: &Value) {
     }
 }
 
-/// Recursively search a JSON value for a string that starts with
-/// `urn:li:fsd_profile:`. Returns the first match.
-pub fn find_fsd_profile_urn(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(s) if s.starts_with("urn:li:fsd_profile:") => Some(s.clone()),
-        serde_json::Value::Object(map) => map.values().find_map(find_fsd_profile_urn),
-        serde_json::Value::Array(arr) => arr.iter().find_map(find_fsd_profile_urn),
-        _ => None,
-    }
-}
+// `find_fsd_profile_urn` moved to `linkedin_api::urn`. Callers that used to
+// import it via `crate::profile::find_fsd_profile_urn` now import directly
+// from `linkedin_api::urn::find_fsd_profile_urn`.
 
 #[cfg(test)]
 mod tests {

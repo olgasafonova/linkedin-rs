@@ -1,7 +1,6 @@
 use linkedin_api::models::NotificationCardsResponse;
+use linkedin_api::urn::{extract_activity_urn_from_url, find_fsd_profile_urn};
 
-use crate::feed::extract_activity_urn_from_url;
-use crate::profile::find_fsd_profile_urn;
 use crate::session::load_session_client;
 use crate::util::{print_paging_header, truncate_with_ellipsis};
 
