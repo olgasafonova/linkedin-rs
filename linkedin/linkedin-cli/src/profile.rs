@@ -566,6 +566,14 @@ fn render_private_viewer(index: usize, private_card: &Value) {
     println!("[{}] (private) {}", index, headline);
 }
 
+/// Render a `WvmpGenericCard`: an aggregated/generic viewer entry.
+fn render_generic(index: usize, generic_card: &Value) {
+    let text = nested_text(generic_card, &["headline", "text"])
+        .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("Anonymous viewer(s)");
+    println!("[{}] (aggregated) {}", index, text);
+}
+
 /// Render a single viewer card. Returns true if the entry was countable
 /// (a real viewer), false for upsell/skipped cards.
 fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
@@ -578,10 +586,7 @@ fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
         return true;
     }
     if let Some(generic_card) = card_value.get(WVMP_GENERIC_CARD) {
-        let text = nested_text(generic_card, &["headline", "text"])
-            .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
-            .unwrap_or("Anonymous viewer(s)");
-        println!("[{}] (aggregated) {}", index, text);
+        render_generic(index, generic_card);
         return true;
     }
     if let Some(anon_card) = card_value.get(WVMP_ANON_CARD) {
