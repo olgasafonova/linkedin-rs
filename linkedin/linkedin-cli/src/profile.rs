@@ -548,54 +548,86 @@ fn print_view_change_header(summary: &Value) {
     println!("---");
 }
 
-/// Render a single viewer card. Returns true if the entry was countable
-/// (a real viewer), false for upsell/skipped cards.
-fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
-    if let Some(profile_card) = card_value.get(WVMP_PROFILE_VIEW) {
-        let (name, occupation) = extract_viewer_profile(profile_card);
-        println!("[{}] {}", index, name);
-        if !occupation.is_empty() {
-            println!("    {}", occupation);
-        }
-        return true;
+/// Render a `WvmpProfileViewCard`: a real named viewer entry.
+fn render_profile_view(index: usize, profile_card: &Value) {
+    let (name, occupation) = extract_viewer_profile(profile_card);
+    println!("[{}] {}", index, name);
+    if !occupation.is_empty() {
+        println!("    {}", occupation);
     }
-    if let Some(private_card) = card_value.get(WVMP_PRIVATE_VIEWER) {
-        let headline = private_card
-            .get("headline")
-            .and_then(|h| h.as_str())
-            .unwrap_or("Private viewer");
-        println!("[{}] (private) {}", index, headline);
-        return true;
-    }
-    if let Some(generic_card) = card_value.get(WVMP_GENERIC_CARD) {
-        let text = nested_text(generic_card, &["headline", "text"])
-            .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
-            .unwrap_or("Anonymous viewer(s)");
-        println!("[{}] (aggregated) {}", index, text);
-        return true;
-    }
-    if let Some(anon_card) = card_value.get(WVMP_ANON_CARD) {
-        let num = anon_card
-            .get("numViewers")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(1);
-        let label = if num == 1 {
-            "1 anonymous viewer".to_string()
-        } else {
-            format!("{} anonymous viewers", num)
-        };
-        println!("[{}] (anonymous) {}", index, label);
-        return true;
-    }
-    if card_value.get(WVMP_PREMIUM_UPSELL).is_some() {
-        return false;
-    }
+}
+
+/// Render a `WvmpPrivateViewerCard`: a private viewer with only a headline.
+fn render_private_viewer(index: usize, private_card: &Value) {
+    let headline = private_card
+        .get("headline")
+        .and_then(|h| h.as_str())
+        .unwrap_or("Private viewer");
+    println!("[{}] (private) {}", index, headline);
+}
+
+/// Render a `WvmpGenericCard`: an aggregated/generic viewer entry.
+fn render_generic(index: usize, generic_card: &Value) {
+    let text = nested_text(generic_card, &["headline", "text"])
+        .or_else(|| generic_card.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("Anonymous viewer(s)");
+    println!("[{}] (aggregated) {}", index, text);
+}
+
+/// Render a `WvmpAnonCard`: a count of anonymous viewers.
+fn render_anon(index: usize, anon_card: &Value) {
+    let num = anon_card
+        .get("numViewers")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1);
+    let label = if num == 1 {
+        "1 anonymous viewer".to_string()
+    } else {
+        format!("{} anonymous viewers", num)
+    };
+    println!("[{}] (anonymous) {}", index, label);
+}
+
+/// Render a card whose union key isn't one of the recognised WVMP variants.
+/// Logs the first key when the value is a JSON object, or a generic label
+/// otherwise. Used as the dispatch fallback.
+fn render_unknown(index: usize, card_value: &Value) {
     if let Some(obj) = card_value.as_object() {
         let key = obj.keys().next().cloned().unwrap_or_default();
         println!("[{}] (unknown: {})", index, key);
     } else {
         println!("[{}] (unknown card)", index);
     }
+}
+
+/// Render a single viewer card. Returns true if the entry was countable
+/// (a real viewer), false for upsell/skipped cards.
+///
+/// Dispatches to one of `render_profile_view`, `render_private_viewer`,
+/// `render_generic`, `render_anon`, or `render_unknown` based on which
+/// Rest.li union key the card carries. `WVMP_PREMIUM_UPSELL` is the only
+/// recognised but non-countable variant.
+fn print_wvmp_viewer_card(index: usize, card_value: &Value) -> bool {
+    if let Some(profile_card) = card_value.get(WVMP_PROFILE_VIEW) {
+        render_profile_view(index, profile_card);
+        return true;
+    }
+    if let Some(private_card) = card_value.get(WVMP_PRIVATE_VIEWER) {
+        render_private_viewer(index, private_card);
+        return true;
+    }
+    if let Some(generic_card) = card_value.get(WVMP_GENERIC_CARD) {
+        render_generic(index, generic_card);
+        return true;
+    }
+    if let Some(anon_card) = card_value.get(WVMP_ANON_CARD) {
+        render_anon(index, anon_card);
+        return true;
+    }
+    if card_value.get(WVMP_PREMIUM_UPSELL).is_some() {
+        return false;
+    }
+    render_unknown(index, card_value);
     true
 }
 
