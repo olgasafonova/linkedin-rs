@@ -296,54 +296,87 @@ fn check_summary(profile: &serde_json::Value) -> Option<serde_json::Value> {
 
 fn check_positions(profile: &serde_json::Value, current_year: u64) -> Vec<serde_json::Value> {
     let positions: Vec<&serde_json::Value> = iter_positions(profile).collect();
-
     if positions.is_empty() {
-        return vec![serde_json::json!({
-            "field": "positions",
-            "severity": "high",
-            "message": "No positions listed. Add your work experience."
-        })];
+        return vec![no_positions_finding()];
     }
 
-    let mut findings = Vec::new();
-    let mut has_current_role = false;
-    let mut newest_end_year: Option<u64> = None;
+    let summary = summarize_positions(&positions, current_year);
+    let mut findings = summary.findings;
+    if !summary.has_current_role {
+        findings.push(no_current_role_finding(summary.newest_end_year));
+    }
+    findings
+}
 
+struct PositionsSummary {
+    findings: Vec<serde_json::Value>,
+    has_current_role: bool,
+    newest_end_year: Option<u64>,
+}
+
+fn summarize_positions(
+    positions: &[&serde_json::Value],
+    current_year: u64,
+) -> PositionsSummary {
+    let mut summary = PositionsSummary {
+        findings: Vec::new(),
+        has_current_role: false,
+        newest_end_year: None,
+    };
     for pos in positions {
-        let date_range = pos.get("dateRange");
-        let end_year = date_range
-            .and_then(|dr| dr.get("end"))
-            .and_then(|d| d.get("year"))
-            .and_then(|y| y.as_u64());
-        let start_year = date_range
-            .and_then(|dr| dr.get("start"))
-            .and_then(|d| d.get("year"))
-            .and_then(|y| y.as_u64());
+        ingest_position(&mut summary, pos, current_year);
+    }
+    summary
+}
 
-        if end_year.is_none() {
-            has_current_role = true;
+fn ingest_position(
+    summary: &mut PositionsSummary,
+    pos: &serde_json::Value,
+    current_year: u64,
+) {
+    let date_range = pos.get("dateRange");
+    let end_year = position_year(date_range, "end");
+    let start_year = position_year(date_range, "start");
+
+    match end_year {
+        None => {
+            summary.has_current_role = true;
             if let Some(f) = stale_current_role_finding(pos, start_year, current_year) {
-                findings.push(f);
+                summary.findings.push(f);
             }
         }
-        if let Some(ey) = end_year {
-            newest_end_year = Some(newest_end_year.map_or(ey, |prev: u64| prev.max(ey)));
+        Some(ey) => {
+            summary.newest_end_year =
+                Some(summary.newest_end_year.map_or(ey, |prev: u64| prev.max(ey)));
         }
     }
+}
 
-    if !has_current_role {
-        let msg = match newest_end_year {
-            Some(ey) => format!("No current position. Most recent role ended in {}.", ey),
-            None => "No current position. Your profile may look inactive.".to_string(),
-        };
-        findings.push(serde_json::json!({
-            "field": "positions",
-            "severity": "high",
-            "message": msg
-        }));
-    }
+fn position_year(date_range: Option<&serde_json::Value>, side: &str) -> Option<u64> {
+    date_range
+        .and_then(|dr| dr.get(side))
+        .and_then(|d| d.get("year"))
+        .and_then(|y| y.as_u64())
+}
 
-    findings
+fn no_positions_finding() -> serde_json::Value {
+    serde_json::json!({
+        "field": "positions",
+        "severity": "high",
+        "message": "No positions listed. Add your work experience."
+    })
+}
+
+fn no_current_role_finding(newest_end_year: Option<u64>) -> serde_json::Value {
+    let msg = match newest_end_year {
+        Some(ey) => format!("No current position. Most recent role ended in {}.", ey),
+        None => "No current position. Your profile may look inactive.".to_string(),
+    };
+    serde_json::json!({
+        "field": "positions",
+        "severity": "high",
+        "message": msg
+    })
 }
 
 /// Flatten the two-level `profilePositionGroups[].profilePositionInPositionGroup[]`
