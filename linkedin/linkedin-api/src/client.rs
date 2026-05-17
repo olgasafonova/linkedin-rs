@@ -135,6 +135,13 @@ impl LinkedInClient {
             if name == "JSESSIONID" || name == "li_at" {
                 continue;
             }
+            if !is_valid_cookie_name(name) {
+                // Reject names with control chars, whitespace, or cookie-attribute
+                // separators (`;`, `=`, `,`, etc.). A malformed name in an
+                // untrusted cookies file could otherwise inject extra
+                // attributes into the Set-Cookie string.
+                continue;
+            }
             let cookie_str = if value.contains(';') || value.contains(',') || value.contains(' ') {
                 format!(
                     "{}=\"{}\"; Domain=.linkedin.com; Path=/; Secure",
@@ -472,6 +479,20 @@ fn graphql_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(MAX_BACKOFF_MS))
 }
 
+/// Validate a cookie name against a conservative whitelist.
+///
+/// Accepts only `[A-Za-z0-9_-]+`. Real LinkedIn cookies use this character
+/// set; the stricter rule than RFC 6265 keeps us from accepting names with
+/// punctuation that could change meaning if the cookies file is ever sourced
+/// from a less trusted location (semicolons split attributes, equals signs
+/// split name/value, control characters could inject CRLF).
+fn is_valid_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 fn generate_jsessionid() -> String {
     use rand::RngExt;
     let mut rng = rand::rng();
@@ -737,5 +758,47 @@ mod tests {
         .expect("client creation must succeed");
         assert_eq!(client.device_id(), "my-device-id");
         assert_eq!(client.jsessionid(), "ajax:0000000000000000001");
+    }
+
+    #[test]
+    fn cookie_name_accepts_real_linkedin_names() {
+        for name in [
+            "bcookie",
+            "bscookie",
+            "lidc",
+            "li_gc",
+            "li_mc",
+            "li_sugr",
+            "JSESSIONID",
+            "UserMatchHistory",
+            "li-x-li-token-12",
+        ] {
+            assert!(is_valid_cookie_name(name), "must accept: {name}");
+        }
+    }
+
+    #[test]
+    fn cookie_name_rejects_injection_attempts() {
+        let rejected = [
+            "",
+            "bad name",
+            "bad;Path=/",
+            "bad=value",
+            "bad,more",
+            "bad\nname",
+            "bad\rname",
+            "bad\tname",
+            "li_at\0",
+            "name.with.dots",
+            "name/slash",
+            "name\"quote",
+        ];
+        for name in rejected {
+            assert!(
+                !is_valid_cookie_name(name),
+                "must reject: {:?}",
+                name.escape_debug().to_string()
+            );
+        }
     }
 }
