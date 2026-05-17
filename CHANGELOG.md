@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Build** — added a tuned `[profile.release]` block (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`). Release `li` binary measures 6.2MB after the change (down from ~12MB at v0.1.0). Pruned `linkedin-cli`'s tokio feature set from `["full"]` to `["macros", "rt-multi-thread", "time"]` — the only features actually used by the CLI (`#[tokio::main]`, `tokio::join!`, `tokio::time::sleep`).
+
 ### Security
 
 - **Auth** — browser cookies are now resolved from the session directory (`<data_dir>/linkedin/browser_cookies.json`), not the current working directory. Set `LINKEDIN_COOKIES_FILE` to override. Running `li` from a directory that happens to contain `secrets/browser_cookies.json` no longer silently swaps in those cookies. The "Using browser cookies from ..." log message now prints the absolute path so the active identity is verifiable.

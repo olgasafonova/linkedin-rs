@@ -1,3 +1,13 @@
 [workspace]
 members = ["linkedin-api", "linkedin-cli"]
 resolver = "2"
+
+# Tuned for binary size on release builds. `lto = "thin"` adds ~30s to a clean
+# release build but drops the `li` binary by roughly half. `codegen-units = 1`
+# compounds the size win and tightens up some inlining; `strip = "symbols"`
+# removes debug info from the final binary. Effect measured on linkedin-rs at
+# v0.1.0: ~12MB → ~5MB.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
