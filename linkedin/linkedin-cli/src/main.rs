@@ -288,37 +288,47 @@ async fn dispatch_search(action: SearchAction) {
     }
 }
 
+/// Expand a flat list of `EnumName::Variant { field, ... } => cmd(expr, ...)`
+/// arms into a complete async dispatcher.
+///
+/// Each arm names the action enum, the variant to destructure, the fields it
+/// exposes, and the `exit_on_err`-wrapped command call. Used for the smaller
+/// per-resource dispatchers where every arm is a one-liner.
+macro_rules! dispatch_action {
+    (
+        $action:expr;
+        $( $enum:ident :: $variant:ident { $($field:ident),* $(,)? } => $cmd:expr ),+ $(,)?
+    ) => {
+        match $action {
+            $( $enum::$variant { $($field),* } => exit_on_err($cmd.await), )+
+        }
+    };
+}
+
 async fn dispatch_events(action: EventsAction) {
-    match action {
-        EventsAction::View { event_id, json } => exit_on_err(cmd_event_view(&event_id, json).await),
-        EventsAction::Attendees {
-            event_id,
-            count,
-            start,
-            json,
-        } => exit_on_err(cmd_event_attendees(&event_id, start, count, json).await),
-    }
+    dispatch_action!(
+        action;
+        EventsAction::View { event_id, json } => cmd_event_view(&event_id, json),
+        EventsAction::Attendees { event_id, count, start, json } =>
+            cmd_event_attendees(&event_id, start, count, json),
+    );
 }
 
 async fn dispatch_company(action: CompanyAction) {
-    match action {
-        CompanyAction::View { slug, json } => exit_on_err(cmd_company_view(&slug, json).await),
-        CompanyAction::Followers {
-            slug,
-            count,
-            start,
-            json,
-        } => exit_on_err(cmd_company_followers(&slug, start, count, json).await),
-    }
+    dispatch_action!(
+        action;
+        CompanyAction::View { slug, json } => cmd_company_view(&slug, json),
+        CompanyAction::Followers { slug, count, start, json } =>
+            cmd_company_followers(&slug, start, count, json),
+    );
 }
 
 async fn dispatch_notifications(action: NotificationsAction) {
-    match action {
-        NotificationsAction::List { count, start, json } => {
-            exit_on_err(cmd_notifications_list(start, count, json).await)
-        }
-        NotificationsAction::Mentions { index, json } => {
-            exit_on_err(cmd_notifications_mentions(index, json).await)
-        }
-    }
+    dispatch_action!(
+        action;
+        NotificationsAction::List { count, start, json } =>
+            cmd_notifications_list(start, count, json),
+        NotificationsAction::Mentions { index, json } =>
+            cmd_notifications_mentions(index, json),
+    );
 }
