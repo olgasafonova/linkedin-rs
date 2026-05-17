@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- **Auth** — browser cookies are now resolved from the session directory (`<data_dir>/linkedin/browser_cookies.json`), not the current working directory. Set `LINKEDIN_COOKIES_FILE` to override. Running `li` from a directory that happens to contain `secrets/browser_cookies.json` no longer silently swaps in those cookies. The "Using browser cookies from ..." log message now prints the absolute path so the active identity is verifiable.
+
 ## [v0.1.0] - 2026-04-29
 
 First public release. The CLI exposes 44 subcommands across 11 domains and the `linkedin-api` crate can be used as a standalone library.
