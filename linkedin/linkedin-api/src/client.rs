@@ -27,6 +27,7 @@ mod search;
 
 use internal::{check_graphql_errors, check_response};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,51 @@ const CLIENT_VERSION: &str = "4.2.1058";
 /// Numeric build/version code corresponding to CLIENT_VERSION.
 const CLIENT_MINOR_VERSION: i64 = 562100;
 
+/// Optional runtime configuration for the HTTP client.
+///
+/// Used to pass environment-derived settings (proxy URL) into client
+/// construction without requiring the caller to build the full client
+/// manually.
+///
+/// # Example
+///
+/// ```ignore
+/// use linkedin_api::client::ClientOptions;
+/// let opts = ClientOptions::from_env();
+/// let client = LinkedInClient::with_options(opts)?;
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientOptions {
+    /// Optional HTTP(S)/SOCKS proxy URL, e.g. `http://127.0.0.1:8888`.
+    ///
+    /// When set, both the main API client and the CDN upload client route
+    /// requests through this proxy.
+    pub proxy_url: Option<String>,
+}
+
+impl ClientOptions {
+    /// Build options from the process environment.
+    ///
+    /// Reads `LINKEDIN_PROXY_URL` first, falling back to `HTTPS_PROXY` then
+    /// `HTTP_PROXY`. Empty strings are treated as unset.
+    pub fn from_env() -> Self {
+        Self::from_env_map(&std::env::vars().collect::<HashMap<_, _>>())
+    }
+
+    /// Build options from an explicit environment map (testable without
+    /// mutating the real process environment).
+    pub fn from_env_map(env: &HashMap<String, String>) -> Self {
+        let proxy_url = env
+            .get("LINKEDIN_PROXY_URL")
+            .or_else(|| env.get("HTTPS_PROXY"))
+            .or_else(|| env.get("HTTP_PROXY"))
+            .filter(|value| !value.trim().is_empty())
+            .cloned();
+
+        Self { proxy_url }
+    }
+}
+
 /// HTTP client configured to impersonate the LinkedIn Android app.
 ///
 /// Holds a `reqwest::Client` with cookie jar, persistent device identity,
@@ -71,6 +117,9 @@ const CLIENT_MINOR_VERSION: i64 = 562100;
 ///
 /// `LinkedInClient` is `Send + Sync` and can be shared across threads via `Arc`.
 pub struct LinkedInClient {
+    /// Runtime options (proxy URL, etc.) used to build this client.
+    options: ClientOptions,
+
     /// The underlying reqwest HTTP client with cookie jar enabled.
     http: reqwest::Client,
 
@@ -99,22 +148,37 @@ pub struct LinkedInClient {
 
 impl LinkedInClient {
     /// Create a new `LinkedInClient` with auto-generated device identity and
-    /// CSRF token.
+    /// CSRF token, reading proxy configuration from the process environment.
     pub fn new() -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
         let jsessionid = generate_jsessionid();
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
+    }
+
+    /// Create a client with explicit runtime options.
+    ///
+    /// This is the preferred entry point when the caller wants to control
+    /// proxy settings explicitly rather than reading from the environment.
+    pub fn with_options(options: ClientOptions) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let jsessionid = generate_jsessionid();
+        Self::build(&device_id, &jsessionid, None, options)
     }
 
     /// Create a client with a specific device ID and JSESSIONID.
     pub fn with_identity(device_id: String, jsessionid: String) -> Result<Self, Error> {
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
     }
 
     /// Create a client from a persisted [`Session`].
     pub fn with_session(session: &Session) -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
-        Self::build(&device_id, &session.jsessionid, Some(&session.li_at))
+        Self::build(
+            &device_id,
+            &session.jsessionid,
+            Some(&session.li_at),
+            ClientOptions::from_env(),
+        )
     }
 
     /// Create a client using full browser cookies (from a cookies JSON file).
@@ -128,7 +192,7 @@ impl LinkedInClient {
             .unwrap_or_else(generate_jsessionid);
 
         let li_at = cookies.get("li_at").map(|s| s.as_str());
-        let client = Self::build(&device_id, &jsessionid, li_at)?;
+        let client = Self::build(&device_id, &jsessionid, li_at, ClientOptions::from_env())?;
 
         let base_url: url::Url = BASE_URL.parse().unwrap();
         for (name, value) in cookies {
@@ -156,7 +220,12 @@ impl LinkedInClient {
     }
 
     /// Shared client construction logic.
-    fn build(device_id: &str, jsessionid: &str, li_at: Option<&str>) -> Result<Self, Error> {
+    fn build(
+        device_id: &str,
+        jsessionid: &str,
+        li_at: Option<&str>,
+        options: ClientOptions,
+    ) -> Result<Self, Error> {
         let x_li_track = build_x_li_track(device_id);
         let default_headers = build_default_headers(device_id, &x_li_track)?;
 
@@ -182,12 +251,20 @@ impl LinkedInClient {
             );
         }
 
-        let http = reqwest::Client::builder()
+        let mut http_builder = reqwest::Client::builder()
             .cookie_provider(jar.clone())
-            .default_headers(default_headers)
-            .build()?;
+            .default_headers(default_headers);
+
+        if let Some(ref proxy_url) = options.proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| Error::Auth(format!("invalid proxy URL: {e}")))?;
+            http_builder = http_builder.proxy(proxy);
+        }
+
+        let http = http_builder.build()?;
 
         Ok(Self {
+            options,
             cookie_jar: jar,
             http,
             jsessionid: jsessionid.to_string(),
@@ -366,6 +443,43 @@ impl LinkedInClient {
 
     pub fn base_url(&self) -> &str {
         BASE_URL
+    }
+
+    /// Returns the runtime options this client was built with.
+    pub fn options(&self) -> &ClientOptions {
+        &self.options
+    }
+
+    /// Build a separate `reqwest::Client` for CDN uploads.
+    ///
+    /// CDN pre-signed upload URLs (e.g., `dms-uploads`) go to different
+    /// hosts than the main LinkedIn API. Depending on network topology,
+    /// callers may want CDN uploads to bypass the proxy entirely.
+    ///
+    /// This client respects the same proxy configuration as the main client
+    /// by default. To bypass the proxy for CDN uploads, set the
+    /// `LINKEDIN_CDN_NO_PROXY` environment variable to any non-empty value.
+    pub(super) fn cdn_upload_client(&self) -> Result<reqwest::Client, Error> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30));
+
+        // Check for explicit CDN proxy bypass.
+        let cdn_no_proxy = std::env::var("LINKEDIN_CDN_NO_PROXY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+
+        if !cdn_no_proxy {
+            if let Some(ref proxy_url) = self.options.proxy_url {
+                let proxy = reqwest::Proxy::all(proxy_url)
+                    .map_err(|e| Error::Auth(format!("invalid proxy URL for CDN upload: {e}")))?;
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        builder
+            .build()
+            .map_err(|e| Error::Auth(format!("failed to build CDN client: {e}")))
     }
 }
 
@@ -818,5 +932,73 @@ mod tests {
                 name.escape_debug().to_string()
             );
         }
+    }
+
+    // ---- ClientOptions ----
+
+    #[test]
+    fn client_options_from_env_map_reads_linkedin_proxy() {
+        let mut env = HashMap::new();
+        env.insert(
+            "LINKEDIN_PROXY_URL".to_string(),
+            "http://127.0.0.1:8888".to_string(),
+        );
+        let opts = ClientOptions::from_env_map(&env);
+        assert_eq!(opts.proxy_url.as_deref(), Some("http://127.0.0.1:8888"));
+    }
+
+    #[test]
+    fn client_options_falls_back_to_https_proxy() {
+        let mut env = HashMap::new();
+        env.insert(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example.com:3128".to_string(),
+        );
+        let opts = ClientOptions::from_env_map(&env);
+        assert_eq!(
+            opts.proxy_url.as_deref(),
+            Some("http://proxy.example.com:3128")
+        );
+    }
+
+    #[test]
+    fn client_options_falls_back_to_http_proxy() {
+        let mut env = HashMap::new();
+        env.insert(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example.com:8080".to_string(),
+        );
+        let opts = ClientOptions::from_env_map(&env);
+        assert_eq!(
+            opts.proxy_url.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
+    }
+
+    #[test]
+    fn client_options_linkedin_proxy_takes_precedence() {
+        let mut env = HashMap::new();
+        env.insert(
+            "LINKEDIN_PROXY_URL".to_string(),
+            "http://first:8888".to_string(),
+        );
+        env.insert("HTTPS_PROXY".to_string(), "http://second:3128".to_string());
+        let opts = ClientOptions::from_env_map(&env);
+        assert_eq!(opts.proxy_url.as_deref(), Some("http://first:8888"));
+    }
+
+    #[test]
+    fn client_options_ignores_empty_proxy() {
+        let mut env = HashMap::new();
+        env.insert("LINKEDIN_PROXY_URL".to_string(), "   ".to_string());
+        let opts = ClientOptions::from_env_map(&env);
+        assert!(opts.proxy_url.is_none());
+    }
+
+    #[test]
+    fn client_options_default_is_no_proxy() {
+        let env = HashMap::new();
+        let opts = ClientOptions::from_env_map(&env);
+        assert!(opts.proxy_url.is_none());
     }
 }

@@ -124,6 +124,44 @@ li auth status
 
 The session is stored locally at `~/.config/linkedin-cli/session.json`.
 
+### Proxy Configuration
+
+The client supports routing all API requests through an HTTP/HTTPS proxy. This is useful when accessing LinkedIn from regions where direct connections are unreliable or when you need a static egress IP.
+
+**Environment variables (checked in order):**
+
+| Variable | Priority |
+|----------|----------|
+| `LINKEDIN_PROXY_URL` | Highest — use this for LinkedIn-specific proxy |
+| `HTTPS_PROXY` | Fallback |
+| `HTTP_PROXY` | Fallback |
+
+```bash
+# Route all LinkedIn API calls through a local proxy
+export LINKEDIN_PROXY_URL=http://127.0.0.1:8888
+
+# CDN uploads (media attachment uploads) use the same proxy by default.
+# To bypass the proxy for CDN uploads only:
+export LINKEDIN_CDN_NO_PROXY=1
+```
+
+You can also construct a client programmatically with explicit options:
+
+```rust
+use linkedin_api::client::{LinkedInClient, ClientOptions};
+use std::collections::HashMap;
+
+// From environment variables (LINKEDIN_PROXY_URL, HTTPS_PROXY, HTTP_PROXY)
+let options = ClientOptions::from_env();
+
+// Or from an explicit map (useful for testing or config files)
+let mut env = HashMap::new();
+env.insert("LINKEDIN_PROXY_URL".to_string(), "http://proxy:3128".to_string());
+let options = ClientOptions::from_env_map(&env);
+
+let client = LinkedInClient::with_options(options)?;
+```
+
 ## Usage
 
 ### Profile

@@ -119,9 +119,64 @@ pub(super) async fn check_response(resp: reqwest::Response) -> Result<Value, Err
     })
 }
 
+/// Normalize a LinkedIn social thread URN to a canonical format.
+///
+/// LinkedIn uses two different URN formats for comment threads:
+///
+/// - `urn:li:fsd_comment:(<comment_id>,urn:li:activity:<activity_id>)` —
+///   the "social detail" format returned by some endpoints.
+/// - `urn:li:comment:(activity:<activity_id>,<comment_id>)` — the canonical
+///   comment URN format used by most API endpoints.
+///
+/// This function converts the former to the latter. If the input doesn't
+/// match the `fsd_comment` pattern, it passes through unchanged (or wraps
+/// bare IDs as `urn:li:activity:<id>`).
+pub(super) fn normalize_social_thread_urn(thread_urn: &str) -> String {
+    if let Some(rest) = thread_urn.strip_prefix("urn:li:fsd_comment:(") {
+        if let Some(inner) = rest.strip_suffix(')') {
+            if let Some((comment_id, activity_urn)) = inner.split_once(',') {
+                if let Some(activity_id) = activity_urn.strip_prefix("urn:li:activity:") {
+                    return format!("urn:li:comment:(activity:{activity_id},{comment_id})");
+                }
+            }
+        }
+    }
+
+    if thread_urn.starts_with("urn:li:") {
+        thread_urn.to_string()
+    } else {
+        format!("urn:li:activity:{thread_urn}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- normalize_social_thread_urn ----
+
+    #[test]
+    fn normalize_fsd_comment_urn_to_comment_urn() {
+        let input = "urn:li:fsd_comment:(abc123,urn:li:activity:789012)";
+        let out = normalize_social_thread_urn(input);
+        assert_eq!(out, "urn:li:comment:(activity:789012,abc123)");
+    }
+
+    #[test]
+    fn normalize_urn_passthrough() {
+        let urn = "urn:li:activity:12345";
+        assert_eq!(normalize_social_thread_urn(urn), urn);
+    }
+
+    #[test]
+    fn normalize_bare_id_wraps_as_activity() {
+        assert_eq!(
+            normalize_social_thread_urn("12345"),
+            "urn:li:activity:12345"
+        );
+    }
+
+    // ---- restli encoding ----
 
     #[test]
     fn restli_encode_empty_string() {
