@@ -9,7 +9,8 @@ use crate::error::Error;
 use crate::urn::{ActivityUrn, SocialDetailUrn};
 
 use super::internal::{
-    check_graphql_errors, check_response, graphql_params, restli_encode_string, unwrap_graphql,
+    check_graphql_errors, check_response, graphql_params, normalize_social_thread_urn,
+    restli_encode_string, unwrap_graphql,
 };
 use super::{LinkedInClient, API_PREFIX, BASE_URL};
 
@@ -118,6 +119,53 @@ impl LinkedInClient {
         );
         let raw = self.graphql_get(&params).await?;
         unwrap_graphql(&raw, "socialDashCommentsBySocialDetail")
+    }
+
+    /// Fetch replies for a parent comment URN.
+    ///
+    /// LinkedIn's `ByRepliesByCursor` finder requires a non-null cursor.
+    /// Extract the parent comment's reply cursor from `get_comments --json`.
+    pub async fn get_comment_replies(
+        &self,
+        comment_urn: &str,
+        count: u32,
+        cursor: &str,
+    ) -> Result<Value, Error> {
+        let cursor = if cursor.is_empty() {
+            return Err(Error::InvalidInput(
+                "get_comment_replies requires a non-empty cursor from the parent comment".into(),
+            ));
+        } else {
+            cursor
+        };
+        let encoded_urn = restli_encode_string(comment_urn);
+        let encoded_cursor = restli_encode_string(cursor);
+        let variables = format!("(commentUrn:{encoded_urn},count:{count},cursor:{encoded_cursor})");
+        let params = graphql_params(
+            &variables,
+            "voyagerSocialDashComments.8ada653d14b465e4f86d3ed7dcbe6695",
+            "SocialDashCommentsByRepliesByCursor",
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashCommentsByRepliesByCursor")
+    }
+
+    /// Fetch a single comment by comment URN and update/thread URN.
+    pub async fn get_single_comment(
+        &self,
+        comment_urn: &str,
+        update_thread_urn: &str,
+    ) -> Result<Value, Error> {
+        let encoded_comment = restli_encode_string(comment_urn);
+        let encoded_thread = restli_encode_string(update_thread_urn);
+        let variables = format!("(commentUrn:{encoded_comment},updateThreadUrn:{encoded_thread})");
+        let params = graphql_params(
+            &variables,
+            "voyagerSocialDashComments.a84e91d6baaa2d2018fdc49f21541de5",
+            "SocialDashCommentsBySingleComment",
+        );
+        let raw = self.graphql_get(&params).await?;
+        unwrap_graphql(&raw, "socialDashCommentsBySingleComment")
     }
 
     /// Fetch the authenticated user's own posts with engagement metrics.
@@ -261,6 +309,28 @@ impl LinkedInClient {
         text: &str,
     ) -> Result<Value, Error> {
         let thread = post_urn.as_str();
+        let variables = serde_json::json!({
+            "entity": {
+                "commentary": { "text": text },
+                "threadUrn": thread,
+                "origin": "FEED"
+            }
+        });
+        self.graphql_post(
+            &variables,
+            "voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e",
+            "CreateSocialDashNormComments",
+        )
+        .await
+    }
+
+    /// Reply to a feed comment by creating a nested comment under the parent.
+    ///
+    /// Uses the same `CreateSocialDashNormComments` mutation as top-level
+    /// comments but sets `threadUrn` to the parent comment URN (after
+    /// normalizing from Dash `fsd_comment` to backend `comment` format).
+    pub async fn reply_to_comment(&self, comment_urn: &str, text: &str) -> Result<Value, Error> {
+        let thread = normalize_social_thread_urn(comment_urn);
         let variables = serde_json::json!({
             "entity": {
                 "commentary": { "text": text },

@@ -42,12 +42,7 @@ impl FromStr for ConversationCategory {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value
-            .trim()
-            .to_ascii_uppercase()
-            .replace('-', "_")
-            .as_str()
-        {
+        match value.trim().to_ascii_uppercase().replace('-', "_").as_str() {
             "PRIMARY" | "PRIMARY_INBOX" | "INBOX" => Ok(Self::PrimaryInbox),
             "SPAM" => Ok(Self::Spam),
             other => Err(format!(

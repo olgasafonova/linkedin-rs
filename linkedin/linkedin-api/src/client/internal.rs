@@ -71,9 +71,19 @@ pub(super) fn unwrap_graphql(raw: &Value, data_key: &str) -> Result<Value, Error
         })
 }
 
-/// Check a GraphQL JSON response for a top-level `errors` array.
+/// Check a GraphQL JSON response for an `errors` array.
+///
+/// GraphQL can return HTTP 200 with logical errors in the response body.
+/// Mutations may wrap errors under `value.errors` instead of the top-level
+/// `errors` key, so both paths are checked.
 pub(super) fn check_graphql_errors(json: &Value) -> Result<(), Error> {
-    let Some(errors) = json.get("errors").and_then(|e| e.as_array()) else {
+    let errors = json.get("errors").and_then(|e| e.as_array()).or_else(|| {
+        json.get("value")
+            .and_then(|v| v.get("errors"))
+            .and_then(|e| e.as_array())
+    });
+
+    let Some(errors) = errors else {
         return Ok(());
     };
     if errors.is_empty() {

@@ -792,9 +792,8 @@ pub async fn cmd_messages_list(
     raw_json: bool,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
-    let category: ConversationCategory = category
-        .parse()
-        .map_err(|e: String| CliError::Other(e))?;
+    let category: ConversationCategory =
+        category.parse().map_err(|e: String| CliError::Other(e))?;
 
     if _created_before.is_some() {
         eprintln!("warning: --before is deprecated; use --cursor from metadata.nextCursor");
