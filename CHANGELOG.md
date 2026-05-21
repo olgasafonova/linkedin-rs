@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Feed** — `feed reply <urn> <text>`: reply to a feed comment (requires `--yes`).
+- **Feed** — `feed schedule`: schedule a post with optional media upload (image/GIF/MP4/PDF). Supports `--text`, `--caption-file`, `--media`, `--schedule "YYYY-MM-DD HH:MM"`, `--timezone`, `--visibility`, `--media-ready-timeout`. Requires `--yes`.
+- **Feed** — `feed schedule-get <urn>`: fetch a scheduled or published share by URN.
+- **Feed** — `feed schedule-delete <urn>`: delete/cancel a scheduled share (requires `--yes`).
+- **Analytics** — `analytics content [--count N] [--days N]`: show recent post engagement metrics (reactions, comments, reposts).
+- **Analytics** — `analytics post [--urn <URN>] [--days N]`: show analytics for a single post (defaults to latest).
+- **Analytics** — `analytics profile-viewers [--days N] [--interesting]`: show profile viewer cards.
+- **Analytics** — `analytics search-appearances`: show search appearance data (total appearances, top companies).
+- **API** — `ClientOptions` struct for proxy configuration (`LINKEDIN_PROXY_URL`, `LINKEDIN_CDN_NO_PROXY` env vars).
+- **API** — `ConversationCategory` enum and cursor-based pagination for conversations/events.
+- **API** — `get_comment_replies`, `get_single_comment`, `reply_to_comment` for read/write comment access.
+- **API** — `schedule_post`, `schedule_post_with_media`, `upload_media`, `wait_media_ready` for scheduled content with CDN upload pipeline.
+- **API** — `get_profile_viewers_for_period`, `get_search_appearances` for profile analytics.
+- **API** — `get_share`, `delete_share`, `create_post` refactored into shared `build_share_body` + `execute_share_mutation`.
+- **API** — `check_graphql_errors` extended to handle mutation `value.errors` shape.
+- **Dependencies** — added `chrono-tz` for timezone-aware scheduling.
+
 ### Changed
 
 - **Build** — added a tuned `[profile.release]` block (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`). Release `li` binary measures 6.2MB after the change (down from ~12MB at v0.1.0). Pruned `linkedin-cli`'s tokio feature set from `["full"]` to `["macros", "rt-multi-thread", "time"]` — the only features actually used by the CLI (`#[tokio::main]`, `tokio::join!`, `tokio::time::sleep`).

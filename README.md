@@ -6,7 +6,7 @@ This project is for personal and educational use only.
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
+The CLI (`linkedin-cli`) exposes 52 subcommands across 12 domains:
 
 | Command | Description |
 |---------|-------------|
@@ -32,6 +32,10 @@ The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
 | `feed reactions <urn>` | Show who reacted to a post (names, headlines, reaction types) |
 | `feed stats` | Aggregate engagement stats across your recent posts |
 | `feed post <text>` | Create a new text post (public or connections-only) |
+| `feed reply <urn> <text>` | Reply to a feed comment (requires `--yes`) |
+| `feed schedule` | Schedule a post with optional media upload (requires `--yes`) |
+| `feed schedule-get <urn>` | Fetch a scheduled/published share by URN |
+| `feed schedule-delete <urn>` | Delete/cancel a scheduled share (requires `--yes`) |
 | **Messages** | |
 | `messages list` | List conversations (cursor-based pagination) |
 | `messages read <id>` | Read messages in a conversation (cursor-paginated via `--before`; no `--count`) |
@@ -60,6 +64,11 @@ The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
 | **Notifications** | |
 | `notifications list` | List notification cards (paginated) |
 | `notifications mentions <n>` | Show everyone @-mentioned in the post behind notification N |
+| **Analytics** | |
+| `analytics content` | Recent post engagement metrics (reactions, comments, reposts) |
+| `analytics post [--urn <URN>]` | Single post analytics (defaults to latest post) |
+| `analytics profile-viewers` | Show who viewed your profile in a time period |
+| `analytics search-appearances` | Show how often you appear in search results |
 | **Composite** | |
 | `inbox` | Daily inbox: unread messages, pending invitations, recent notifications |
 | `who <company>` | Who do you know at a company? Network overlap in one command |
