@@ -8,6 +8,7 @@ mod helpers;
 mod list;
 mod my_posts;
 mod reactions;
+mod schedule;
 mod stats;
 mod urn;
 mod write;
@@ -17,5 +18,8 @@ pub use full_view::{cmd_feed_read, cmd_feed_view};
 pub use list::{cmd_feed_list, FeedListOptions};
 pub use my_posts::cmd_feed_my_posts;
 pub use reactions::{cmd_feed_reactions, FeedReactionsOptions};
+pub use schedule::{cmd_feed_schedule, cmd_feed_schedule_delete, cmd_feed_schedule_get};
 pub use stats::cmd_feed_stats;
-pub use write::{cmd_feed_comment, cmd_feed_post, cmd_feed_react, cmd_feed_unreact};
+pub use write::{
+    cmd_feed_comment, cmd_feed_post, cmd_feed_react, cmd_feed_reply, cmd_feed_unreact,
+};

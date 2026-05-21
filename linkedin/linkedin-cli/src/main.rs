@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser};
 
+mod analytics;
 mod auth;
 mod cli;
 mod company;
@@ -17,11 +18,15 @@ mod spam;
 mod util;
 
 use cli::{
-    AuthAction, Cli, Commands, CompanyAction, ConnectionsAction, EventsAction, FeedAction,
-    MessagesAction, NotificationsAction, ProfileAction, SearchAction,
+    AnalyticsAction, AuthAction, Cli, Commands, CompanyAction, ConnectionsAction, EventsAction,
+    FeedAction, MessagesAction, NotificationsAction, ProfileAction, SearchAction,
 };
 use util::exit_on_err;
 
+use analytics::{
+    cmd_analytics_content, cmd_analytics_post, cmd_analytics_profile_viewers,
+    cmd_analytics_search_appearances,
+};
 use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use company::{cmd_company_followers, cmd_company_view};
 use connections::{
@@ -32,7 +37,8 @@ use connections::{
 use events::{cmd_event_attendees, cmd_event_view};
 use feed::{
     cmd_feed_comment, cmd_feed_comments, cmd_feed_list, cmd_feed_my_posts, cmd_feed_post,
-    cmd_feed_react, cmd_feed_reactions, cmd_feed_read, cmd_feed_stats, cmd_feed_unreact,
+    cmd_feed_react, cmd_feed_reactions, cmd_feed_read, cmd_feed_reply, cmd_feed_schedule,
+    cmd_feed_schedule_delete, cmd_feed_schedule_get, cmd_feed_stats, cmd_feed_unreact,
     cmd_feed_view, FeedListOptions, FeedReactionsOptions,
 };
 use messages::{
@@ -68,6 +74,7 @@ async fn dispatch_misc(cmd: Commands) {
         Commands::Notifications { action } => dispatch_notifications(action).await,
         Commands::Inbox { json, all } => exit_on_err(cmd_inbox(json, all).await),
         Commands::Who { company, json } => exit_on_err(cmd_who(&company, json).await),
+        Commands::Analytics { action } => dispatch_analytics(action).await,
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "li", &mut std::io::stdout());
         }
@@ -209,7 +216,45 @@ async fn dispatch_feed_write(action: FeedAction) {
             yes,
             json,
         } => exit_on_err(cmd_feed_post(&text, &visibility, yes, json).await),
-        _ => unreachable!("dispatch_feed_write only handles React/Unreact/Comment/Post"),
+        FeedAction::Reply {
+            comment_urn,
+            text,
+            yes,
+            json,
+        } => exit_on_err(cmd_feed_reply(&comment_urn, &text, yes, json).await),
+        FeedAction::Schedule {
+            text,
+            caption_file,
+            media,
+            title,
+            schedule,
+            timezone,
+            visibility,
+            media_ready_timeout,
+            yes,
+            json,
+        } => exit_on_err(
+            cmd_feed_schedule(
+                text.as_deref(),
+                caption_file.as_ref().map(|v| v.as_path()),
+                media.as_ref().map(|v| v.as_path()),
+                title.as_deref(),
+                &schedule,
+                &timezone,
+                &visibility,
+                media_ready_timeout,
+                yes,
+                json,
+            )
+            .await,
+        ),
+        FeedAction::ScheduleGet { share_urn, json } => {
+            exit_on_err(cmd_feed_schedule_get(&share_urn, json).await)
+        }
+        FeedAction::ScheduleDelete { share_urn, yes } => {
+            exit_on_err(cmd_feed_schedule_delete(&share_urn, yes).await)
+        }
+        _ => unreachable!("dispatch_feed_write covers all write actions"),
     }
 }
 
@@ -338,4 +383,25 @@ async fn dispatch_notifications(action: NotificationsAction) {
         NotificationsAction::Mentions { index, json } =>
             cmd_notifications_mentions(index, json),
     );
+}
+
+async fn dispatch_analytics(action: AnalyticsAction) {
+    match action {
+        AnalyticsAction::Content { count, days, json } => {
+            exit_on_err(cmd_analytics_content(count, days, json).await)
+        }
+        AnalyticsAction::Post {
+            post_urn,
+            days,
+            json,
+        } => exit_on_err(cmd_analytics_post(post_urn.as_deref(), days, json).await),
+        AnalyticsAction::ProfileViewers {
+            days,
+            interesting_viewers,
+            json,
+        } => exit_on_err(cmd_analytics_profile_viewers(days, interesting_viewers, json).await),
+        AnalyticsAction::SearchAppearances { json } => {
+            exit_on_err(cmd_analytics_search_appearances(json).await)
+        }
+    }
 }

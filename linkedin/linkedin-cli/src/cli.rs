@@ -74,11 +74,69 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Analytics for posts, content, audience, and profile impact
+    Analytics {
+        #[command(subcommand)]
+        action: AnalyticsAction,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AnalyticsAction {
+    /// Show your recent post analytics with engagement metrics
+    Content {
+        /// Number of posts to fetch (default: 10)
+        #[arg(long, default_value = "10")]
+        count: u32,
+
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show analytics for a single post
+    Post {
+        /// Post/share/activity URN
+        post_urn: Option<String>,
+
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show profile viewers and viewer cards
+    #[command(name = "profile-viewers")]
+    ProfileViewers {
+        /// Lookback window in days: 7, 14, 28, 30, 60, 90, or 365
+        #[arg(long, default_value = "7")]
+        days: u32,
+
+        /// Include interesting/profile-viewer cards when available
+        #[arg(long = "interesting-viewers")]
+        interesting_viewers: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show search appearance analytics
+    #[command(name = "search-appearances")]
+    SearchAppearances {
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -291,6 +349,89 @@ pub enum FeedAction {
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
+    },
+    /// Reply to a feed comment
+    ///
+    /// WARNING: This creates a REAL COMMENT REPLY on LinkedIn.
+    /// Use --yes to skip the confirmation prompt.
+    Reply {
+        /// Parent comment URN (e.g. urn:li:fsd_comment:(...,urn:li:activity:...))
+        comment_urn: String,
+
+        /// The reply text
+        text: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Schedule a LinkedIn post, optionally with image/GIF/MP4/PDF media
+    ///
+    /// WARNING: This creates a REAL scheduled post. Use --yes to confirm.
+    Schedule {
+        /// Inline text content. Use --caption-file for longer posts.
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Read post text from a file
+        #[arg(long = "caption-file")]
+        caption_file: Option<std::path::PathBuf>,
+
+        /// Optional media file: png/jpg/webp/gif/mp4/mov/pdf
+        #[arg(long)]
+        media: Option<std::path::PathBuf>,
+
+        /// Document title for PDF/native document posts
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Schedule time in 'YYYY-MM-DD HH:MM' (24h format)
+        #[arg(long)]
+        schedule: String,
+
+        /// Timezone for --schedule (e.g. "Asia/Singapore", "UTC")
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+
+        /// Post visibility: ANYONE (public) or CONNECTIONS_ONLY
+        #[arg(long, default_value = "ANYONE")]
+        visibility: String,
+
+        /// Seconds to poll LinkedIn media READY after upload
+        #[arg(long = "media-ready-timeout", default_value = "240")]
+        media_ready_timeout: u64,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a scheduled/published share by URN
+    #[command(name = "schedule-get")]
+    ScheduleGet {
+        /// Share URN (e.g. urn:li:fsd_share:...)
+        share_urn: String,
+
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete/cancel a scheduled/published share by URN
+    #[command(name = "schedule-delete")]
+    ScheduleDelete {
+        /// Share URN (e.g. urn:li:fsd_share:...)
+        share_urn: String,
+
+        /// Skip confirmation prompt (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
     },
 }
 

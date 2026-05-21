@@ -131,3 +131,27 @@ pub async fn cmd_feed_post(
     }
     Ok(())
 }
+
+pub async fn cmd_feed_reply(
+    comment_urn: &str,
+    text: &str,
+    confirmed: bool,
+    raw_json: bool,
+) -> CliResult<()> {
+    if !confirmed {
+        return Err(CliError::Input(
+            "this will create a REAL COMMENT REPLY on LinkedIn. Pass --yes to confirm.".to_string(),
+        ));
+    }
+
+    let (client, _path) = load_session_client()?;
+    eprintln!("Replying to comment {}...", comment_urn);
+    let result = client.reply_to_comment(comment_urn, text).await?;
+
+    if raw_json {
+        print_json(&result)?;
+    } else {
+        println!("Replied to comment {}", comment_urn);
+    }
+    Ok(())
+}
