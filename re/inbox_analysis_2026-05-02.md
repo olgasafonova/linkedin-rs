@@ -6,7 +6,7 @@ Analyze `linkedin-rs` messaging/inbox support against the current live LinkedIn 
 
 ## Current Rust implementation
 
-Repo: `/home/ubuntu/linkedin-rs`
+Repo: `<repo-root>`
 
 Messaging CLI surface:
 
@@ -73,7 +73,7 @@ Rust test suite passes:
 The stored `linkedin-rs` session file exists at:
 
 ```text
-/home/ubuntu/.local/share/linkedin/session.json
+<session-dir>/session.json
 ```
 
 but live session validation currently fails:
@@ -86,16 +86,16 @@ Interpretation: the local `linkedin-rs` `li_at` session is stale or insufficient
 
 Control data from the active LinkedIn automation stack still works for inbox listing via AutoCLI fallback. It returned these visible inbox threads:
 
-- Himani Panwar — May 2 — latest sales/hackathon bump
-- Kayden Tan Kang Rui — Apr 30 — “How come can’t contact you”
-- Jordan Goldman — Apr 28 — unread — “Hope all ok!”
-- Joanna Yeo — sponsored AI Engineering item
-- Misha Narula — PMP/PDU pitch
-- Balu Babu — Apr 10 — “Seeing this only now”
-- Sana Alvi — Apr 2 — “That's great info! Thank you :)”
-- Guillaume SAUVAGE — Mar 30 — InMail opportunity
-- Adrian NG — Mar 23 — “Very helpful, many thanks bro!”
-- Joel Haowen Tong — Mar 17 — unread — “Let me know which sections interest you.”
+- Contact A — May 2 — latest sales/hackathon bump
+- Contact B — Apr 30 — “How come can’t contact you”
+- Contact C — Apr 28 — unread — “Hope all ok!”
+- Contact D — sponsored AI Engineering item
+- Contact E — PMP/PDU pitch
+- Contact F — Apr 10 — “Seeing this only now”
+- Contact G — Apr 2 — “That's great info! Thank you :)”
+- Contact H — Mar 30 — InMail opportunity
+- Contact I — Mar 23 — “Very helpful, many thanks bro!”
+- Contact J — Mar 17 — unread — “Let me know which sections interest you.”
 
 Live browser/API probe confirmed a useful implementation detail:
 
@@ -166,8 +166,8 @@ These may be separate GraphQL finder variables, not category enums. They need on
 ## Risk notes
 
 - Do not assume LinkedIn UI labels map 1:1 to GraphQL `category`. “Focused” likely maps to `PRIMARY_INBOX`, but “Jobs”, “Unread”, “Connections”, “InMail”, and “Starred” may be filters rather than categories.
-- `messages read <conversation_id>` may require the exact thread ID from the conversation object's `backendUrn`; names like “Jordan Goldman” are not valid for this Rust command.
-- The README says session path is `~/.config/linkedin-cli/session.json`, but the code uses `dirs::data_dir()/linkedin/session.json`, observed as `/home/ubuntu/.local/share/linkedin/session.json`. README is stale.
+- `messages read <conversation_id>` may require the exact thread ID from the conversation object's `backendUrn`; names like “Contact C” are not valid for this Rust command.
+- The README says session path is `<session-dir>/session.json`, but the code uses `dirs::data_dir()/linkedin/session.json`, observed as `<session-dir>/session.json`. README is stale.
 - The local `backlog` CLI is unavailable in this shell, so I could not add a project backlog task through the required backlog interface.
 
 ## Implemented in `feat/linkedin-proxy-inbox-categories`
@@ -181,7 +181,7 @@ These may be separate GraphQL finder variables, not category enums. They need on
 LINKEDIN_PROXY_URL=http://127.0.0.1:3128 linkedin-cli messages list --category spam --count 20 --json
 ```
 
-5. Corrected README session path to `/home/ubuntu/.local/share/linkedin/session.json` and documented browser cookie map usage.
+5. Corrected README session path to `<session-dir>/session.json` and documented browser cookie map usage.
 6. Updated `auth status` so the live API check uses the same browser-cookie fallback as profile/feed/messaging commands.
 
 Verified:
