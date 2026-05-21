@@ -641,9 +641,17 @@ pub enum MessagesAction {
         #[arg(long, default_value = "10")]
         count: u32,
 
-        /// Cursor for pagination: epoch-millis timestamp to fetch conversations created before
+        /// Opaque nextCursor token from response metadata (preferred pagination)
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// [deprecated] Ignored by LinkedIn's current GraphQL inbox endpoint; use --cursor
         #[arg(long)]
         before: Option<u64>,
+
+        /// Inbox category: primary or spam
+        #[arg(long, default_value = "primary")]
+        category: String,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
@@ -654,7 +662,11 @@ pub enum MessagesAction {
         /// Conversation ID (thread ID portion of URN, e.g. 2-abc123)
         conversation_id: String,
 
-        /// Cursor for pagination: epoch-millis timestamp to fetch messages created before
+        /// Opaque nextCursor token from response metadata (preferred pagination)
+        #[arg(long)]
+        cursor: Option<String>,
+
+        /// [deprecated] Ignored by LinkedIn's current GraphQL message endpoint; use --cursor
         #[arg(long)]
         before: Option<u64>,
 

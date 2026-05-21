@@ -25,6 +25,9 @@ mod notifications;
 mod profile;
 mod search;
 
+// Re-export types that CLI consumers need from submodules.
+pub use messaging::ConversationCategory;
+
 use internal::{check_graphql_errors, check_response};
 
 use std::collections::HashMap;

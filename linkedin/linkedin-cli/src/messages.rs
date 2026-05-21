@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use linkedin_api::client::LinkedInClient;
+use linkedin_api::client::{ConversationCategory, LinkedInClient};
 use linkedin_api::models::{ConnectionsResponse, Paging};
 use linkedin_api::urn::{ConversationUrn, ProfileUrn};
 
@@ -786,12 +786,23 @@ pub fn extract_conversation_names(conv: &Value) -> Vec<String> {
 /// pagination params, and prints the results.
 pub async fn cmd_messages_list(
     count: u32,
-    created_before: Option<u64>,
+    cursor: Option<&str>,
+    _created_before: Option<u64>,
+    category: &str,
     raw_json: bool,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
+    let category: ConversationCategory = category
+        .parse()
+        .map_err(|e: String| CliError::Other(e))?;
 
-    let value = client.get_conversations(count, created_before).await?;
+    if _created_before.is_some() {
+        eprintln!("warning: --before is deprecated; use --cursor from metadata.nextCursor");
+    }
+
+    let value = client
+        .get_conversations_by_category_with_cursor(count, cursor, category)
+        .await?;
 
     if raw_json {
         return print_json(&value);
@@ -828,14 +839,19 @@ pub async fn cmd_messages_list(
 /// with cursor-based pagination, and prints the messages.
 pub async fn cmd_messages_read(
     conversation_id: &str,
-    created_before: Option<u64>,
+    cursor: Option<&str>,
+    _created_before: Option<u64>,
     raw_json: bool,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
     let conv_urn = ConversationUrn::from(conversation_id);
 
+    if _created_before.is_some() {
+        eprintln!("warning: --before is deprecated; use --cursor from metadata.nextCursor");
+    }
+
     let value = client
-        .get_conversation_events(&conv_urn, created_before)
+        .get_conversation_events_with_cursor(&conv_urn, cursor)
         .await?;
 
     if raw_json {

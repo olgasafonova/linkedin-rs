@@ -105,14 +105,21 @@ async fn dispatch_messages(action: MessagesAction) {
     match action {
         MessagesAction::List {
             count,
+            cursor,
             before,
+            category,
             json,
-        } => exit_on_err(cmd_messages_list(count, before, json).await),
+        } => exit_on_err(
+            cmd_messages_list(count, cursor.as_deref(), before, &category, json).await,
+        ),
         MessagesAction::Read {
             conversation_id,
+            cursor,
             before,
             json,
-        } => exit_on_err(cmd_messages_read(&conversation_id, before, json).await),
+        } => exit_on_err(
+            cmd_messages_read(&conversation_id, cursor.as_deref(), before, json).await,
+        ),
         MessagesAction::Send {
             recipient,
             message,
