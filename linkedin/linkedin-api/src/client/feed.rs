@@ -352,21 +352,63 @@ impl LinkedInClient {
     /// in the POST body, not just URL params. The server uses both, but the
     /// body shape is required for the modern endpoint.
     pub async fn create_post(&self, text: &str, visibility: &str) -> Result<Value, Error> {
-        let vis = visibility.to_uppercase();
-        let body = serde_json::json!({
-            "variables": {
-                "post": {
-                    "allowedCommentersScope": "ALL",
-                    "intendedShareLifeCycleState": "PUBLISHED",
-                    "origin": "FEED",
-                    "visibilityDataUnion": { "visibilityType": vis },
-                    "commentary": { "text": text, "attributesV2": [] }
-                }
-            },
-            "queryId": "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
-            "includeWebMetadata": true
-        });
+        let body = build_share_body(text, visibility, "PUBLISHED", None, None)?;
+        self.execute_share_mutation(&body).await
+    }
 
+    /// Schedule a text-only post for future publication.
+    ///
+    /// `scheduled_at_ms` is a Unix epoch in milliseconds. The LinkedIn API
+    /// requires `lifecycleState = SCHEDULED` and a non-null `scheduledAt`.
+    pub async fn schedule_post(
+        &self,
+        text: &str,
+        visibility: &str,
+        scheduled_at_ms: i64,
+    ) -> Result<Value, Error> {
+        let body = build_share_body(text, visibility, "SCHEDULED", Some(scheduled_at_ms), None)?;
+        self.execute_share_mutation(&body).await
+    }
+
+    /// Schedule a post with media attachment.
+    ///
+    /// Uploads the file via [`upload_media`], waits for processing to complete
+    /// (polling up to `ready_timeout_secs`), then schedules the post.
+    pub async fn schedule_post_with_media(
+        &self,
+        text: &str,
+        visibility: &str,
+        scheduled_at_ms: i64,
+        media_path: &std::path::Path,
+        title: Option<&str>,
+        ready_timeout_secs: u64,
+    ) -> Result<Value, Error> {
+        let media = self.upload_media(media_path).await?;
+        let ready = self
+            .wait_media_ready(
+                &media,
+                std::time::Duration::from_secs(ready_timeout_secs.max(1)),
+            )
+            .await?;
+        if !ready.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(Error::Api {
+                status: 408,
+                body: format!("media did not become READY: {ready}"),
+                correlation_id: None,
+            });
+        }
+        let body = build_share_body(
+            text,
+            visibility,
+            "SCHEDULED",
+            Some(scheduled_at_ms),
+            Some((&media, title)),
+        )?;
+        self.execute_share_mutation(&body).await
+    }
+
+    /// Shared mutation executor for share creation.
+    async fn execute_share_mutation(&self, body: &Value) -> Result<Value, Error> {
         let url = format!(
             "{}{}graphql?action=execute&queryId=voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
             BASE_URL, API_PREFIX
@@ -376,12 +418,253 @@ impl LinkedInClient {
             .post(&url)
             .header("Csrf-Token", self.jsessionid())
             .header("x-li-graphql-pegasus-client", "true")
-            .json(&body)
+            .json(body)
             .send()
             .await?;
         let json = check_response(resp).await?;
         check_graphql_errors(&json)?;
         Ok(json)
+    }
+
+    /// Upload an image/GIF/video/PDF to LinkedIn media storage.
+    ///
+    /// Handles single-part and multi-part uploads via the pre-signed CDN flow.
+    /// Returns metadata including `urn`, `media_upload_type`, and `content_type`.
+    pub async fn upload_media(&self, media_path: &std::path::Path) -> Result<Value, Error> {
+        if !media_path.is_file() {
+            return Err(Error::InvalidInput(format!(
+                "media file does not exist: {}",
+                media_path.display()
+            )));
+        }
+        let filename = media_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::InvalidInput("media path has no valid filename".to_string()))?;
+        let (upload_type, content_type) = media_upload_type(filename)?;
+        let bytes = std::fs::read(media_path)
+            .map_err(|e| Error::InvalidInput(format!("failed to read media file: {e}")))?;
+
+        let body = serde_json::json!({
+            "mediaUploadType": upload_type,
+            "fileSize": bytes.len(),
+            "hasOverlayImage": false,
+            "uploadMetadataType": "SINGLE",
+            "filename": filename,
+        });
+        let meta = self
+            .post("voyagerMediaUploadMetadata?action=upload", &body)
+            .await?;
+        let value = meta.get("value").cloned().ok_or_else(|| Error::Api {
+            status: 200,
+            body: format!("missing upload metadata value: {meta}"),
+            correlation_id: None,
+        })?;
+
+        let cdn = self.cdn_upload_client()?;
+
+        // Multi-part flow if LinkedIn returned part upload requests.
+        if let Some(parts) = value.get("partUploadRequests").and_then(|v| v.as_array()) {
+            if !parts.is_empty() {
+                return self
+                    .upload_multipart(&cdn, &value, &bytes, content_type, upload_type, parts)
+                    .await;
+            }
+        }
+
+        // Single-part upload.
+        let upload_url = value
+            .get("singleUploadUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Api {
+                status: 200,
+                body: format!("missing singleUploadUrl: {value}"),
+                correlation_id: None,
+            })?;
+
+        let mut req = cdn
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
+            for (name, val) in headers {
+                if let Some(val) = val.as_str() {
+                    req = req.header(name.as_str(), val);
+                }
+            }
+        }
+        let put = req.body(bytes.clone()).send().await?;
+        let put_status = put.status().as_u16();
+        if !put.status().is_success() {
+            let err_body = put.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                status: put_status,
+                body: format!(
+                    "CDN single-upload failed ({} bytes, status {put_status}): {err_body}",
+                    bytes.len()
+                ),
+                correlation_id: None,
+            });
+        }
+        let mut out = value;
+        out["media_upload_type"] = serde_json::json!(upload_type);
+        out["content_type"] = serde_json::json!(content_type);
+        out["singleUploadStatus"] = serde_json::json!(put_status);
+        Ok(out)
+    }
+
+    /// Upload file parts to LinkedIn's CDN using pre-signed URLs.
+    async fn upload_multipart(
+        &self,
+        cdn: &reqwest::Client,
+        value: &Value,
+        bytes: &[u8],
+        content_type: &str,
+        upload_type: &str,
+        parts: &[Value],
+    ) -> Result<Value, Error> {
+        for (i, part) in parts.iter().enumerate() {
+            let url = part
+                .get("partUploadUrl")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Api {
+                    status: 200,
+                    body: format!("part {i} missing partUploadUrl: {part}"),
+                    correlation_id: None,
+                })?;
+            let (start, end) = parse_byte_range(
+                part.get("byteRange").and_then(|v| v.as_str()).unwrap_or(""),
+                bytes.len(),
+            )?;
+            let slice = bytes[start..=end].to_vec();
+            let mut req = cdn
+                .put(url)
+                .header(reqwest::header::CONTENT_TYPE, content_type);
+            if let Some(headers) = part.get("partUploadHeaders").and_then(|v| v.as_object()) {
+                for (name, val) in headers {
+                    if let Some(val) = val.as_str() {
+                        req = req.header(name.as_str(), val);
+                    }
+                }
+            }
+            let resp = req.body(slice).send().await?;
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                let err_body = resp.text().await.unwrap_or_default();
+                return Err(Error::Api {
+                    status,
+                    body: format!("CDN part {i} upload failed: {err_body}"),
+                    correlation_id: None,
+                });
+            }
+        }
+        let mut out = value.clone();
+        out["media_upload_type"] = serde_json::json!(upload_type);
+        out["content_type"] = serde_json::json!(content_type);
+        Ok(out)
+    }
+
+    /// Poll LinkedIn's media-processing status until the asset is READY.
+    ///
+    /// Polls every 2 seconds up to `timeout`. Returns `{ ok: bool, last: <status> }`.
+    pub async fn wait_media_ready(
+        &self,
+        media: &Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, Error> {
+        let urn = media
+            .get("urn")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::InvalidInput("media metadata missing urn".to_string()))?;
+        let upload_type = media
+            .get("media_upload_type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::InvalidInput("media metadata missing media_upload_type".to_string())
+            })?;
+        let status_type = media_status_type(upload_type);
+        let encoded_urn = restli_encode_string(urn);
+        let path =
+            format!("voyagerVideoDashMediaAssetStatus/{encoded_urn}?mediaStatusType={status_type}");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_status = serde_json::Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            match self.get(&path).await {
+                Ok(json) => {
+                    last_status = json.clone();
+                    if json.get("processingStatus").and_then(|v| v.as_str()) == Some("READY")
+                        || json.get("documentProcessingResult").is_some()
+                    {
+                        return Ok(serde_json::json!({
+                            "ok": true,
+                            "mediaStatusType": status_type,
+                            "last": json,
+                        }));
+                    }
+                    if matches!(
+                        json.get("processingStatus").and_then(|v| v.as_str()),
+                        Some("FAILED") | Some("PROCESSING_FAILED")
+                    ) {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "mediaStatusType": status_type,
+                            "last": json,
+                        }));
+                    }
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Ok(serde_json::json!({
+            "ok": false,
+            "mediaStatusType": status_type,
+            "timeout_secs": timeout.as_secs(),
+            "last": last_status,
+        }))
+    }
+
+    /// Fetch a scheduled/published share by URN.
+    pub async fn get_share(&self, share_urn: &str) -> Result<Value, Error> {
+        let urn = share_urn
+            .strip_prefix("urn:li:fsd_share:")
+            .unwrap_or(share_urn);
+        let enc = restli_encode_string(urn);
+        let q = format!(
+            "variables=(shareUrns:List({enc}))&queryId=voyagerContentcreationDashShares.b6c8295dc377a63224101ecce6d3c1ca"
+        );
+        let raw = self.graphql_get(&q).await?;
+        Ok(raw)
+    }
+
+    /// Delete a scheduled/published share by URN.
+    pub async fn delete_share(&self, share_urn: &str) -> Result<Value, Error> {
+        let urn = share_urn
+            .strip_prefix("urn:li:fsd_share:")
+            .unwrap_or(share_urn);
+        let encoded = restli_encode_string(urn);
+        let url = format!(
+            "{}{}contentcreation/normShares/{encoded}",
+            BASE_URL, API_PREFIX
+        );
+        let resp = self
+            .http()
+            .delete(&url)
+            .header("Csrf-Token", self.jsessionid())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Api {
+                status: status.as_u16(),
+                body,
+                correlation_id: None,
+            });
+        }
+        Ok(serde_json::json!({
+            "status_code": status.as_u16(),
+            "share_urn": urn,
+        }))
     }
 }
 
@@ -431,6 +714,156 @@ fn metadata_contains_id(metadata: &Value, id: &str) -> bool {
         .and_then(Value::as_str)
         .is_some_and(|s| s.contains(id));
     urn_match || share_match
+}
+
+/// Build the JSON body for a share-creation mutation (publish or schedule).
+///
+/// Centralises validation so `create_post`, `schedule_post`, and
+/// `schedule_post_with_media` all go through one code path.
+fn build_share_body(
+    text: &str,
+    visibility: &str,
+    lifecycle_state: &str,
+    scheduled_at_ms: Option<i64>,
+    media: Option<(&Value, Option<&str>)>,
+) -> Result<Value, Error> {
+    let vis = visibility.to_uppercase();
+    if vis != "ANYONE" && vis != "CONNECTIONS_ONLY" {
+        return Err(Error::InvalidInput(format!(
+            "invalid visibility '{visibility}'. Must be ANYONE or CONNECTIONS_ONLY"
+        )));
+    }
+    let lifecycle = lifecycle_state.to_uppercase();
+    if lifecycle != "PUBLISHED" && lifecycle != "SCHEDULED" {
+        return Err(Error::InvalidInput(format!(
+            "invalid lifecycle_state '{lifecycle_state}'. Must be PUBLISHED or SCHEDULED"
+        )));
+    }
+    let mut post = serde_json::json!({
+        "allowedCommentersScope": "ALL",
+        "intendedShareLifeCycleState": lifecycle,
+        "origin": "FEED",
+        "visibilityDataUnion": { "visibilityType": vis },
+        "commentary": { "text": text, "attributesV2": [] }
+    });
+    if lifecycle == "SCHEDULED" {
+        let ts = scheduled_at_ms.ok_or_else(|| {
+            Error::InvalidInput("scheduled_at_ms is required for SCHEDULED shares".to_string())
+        })?;
+        post["scheduledAt"] = serde_json::json!(ts);
+    }
+    if let Some((media_val, title)) = media {
+        post["media"] = media_payload_from_upload(media_val, title)?;
+    }
+    Ok(serde_json::json!({
+        "variables": { "post": post },
+        "queryId": "voyagerContentcreationDashShares.279996efa5064c01775d5aff003d9377",
+        "includeWebMetadata": true
+    }))
+}
+
+/// Convert upload metadata into the `media` field expected by the share mutation.
+fn media_payload_from_upload(media: &Value, title: Option<&str>) -> Result<Value, Error> {
+    let upload_type = media
+        .get("media_upload_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::InvalidInput("media metadata missing media_upload_type".to_string())
+        })?;
+    let urn = media
+        .get("urn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidInput("media metadata missing urn".to_string()))?;
+    let recipes = media.get("recipes").cloned();
+    match upload_type {
+        "VIDEO_SHARING" => Ok(serde_json::json!({
+            "category": "VIDEO",
+            "mediaUrn": urn,
+            "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                "urn:li:digitalmediaRecipe:feedshare-video-captions-thumbnails-ambry",
+                "urn:li:digitalmediaRecipe:feedshare-video-auto-caption-public"
+            ])),
+            "nativeMediaSource": "PRE_RECORDED"
+        })),
+        "DOCUMENT_SHARING" => {
+            let mut payload = serde_json::json!({
+                "category": "NATIVE_DOCUMENT",
+                "mediaUrn": urn,
+                "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                    "urn:li:digitalmediaRecipe:feedshare-document-preview",
+                    "urn:li:digitalmediaRecipe:feedshare-document"
+                ]))
+            });
+            if let Some(title) = title {
+                payload["title"] = serde_json::json!(title);
+            }
+            Ok(payload)
+        }
+        "IMAGE_SHARING" => Ok(serde_json::json!({
+            "category": "IMAGE",
+            "mediaUrn": urn,
+            "recipes": recipes.unwrap_or_else(|| serde_json::json!([
+                "urn:li:digitalmediaRecipe:feedshare-image"
+            ]))
+        })),
+        other => Err(Error::InvalidInput(format!(
+            "unsupported media_upload_type '{other}'"
+        ))),
+    }
+}
+
+/// Map a filename extension to LinkedIn's `(uploadType, contentType)` pair.
+fn media_upload_type(filename: &str) -> Result<(&'static str, &'static str), Error> {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Ok(("IMAGE_SHARING", "image/png")),
+        "jpg" | "jpeg" => Ok(("IMAGE_SHARING", "image/jpeg")),
+        "gif" => Ok(("IMAGE_SHARING", "image/gif")),
+        "webp" => Ok(("IMAGE_SHARING", "image/webp")),
+        "mp4" => Ok(("VIDEO_SHARING", "video/mp4")),
+        "mov" => Ok(("VIDEO_SHARING", "video/quicktime")),
+        "m4v" => Ok(("VIDEO_SHARING", "video/x-m4v")),
+        "webm" => Ok(("VIDEO_SHARING", "video/webm")),
+        "pdf" => Ok(("DOCUMENT_SHARING", "application/pdf")),
+        _ => Err(Error::InvalidInput(format!(
+            "unsupported LinkedIn media type for '{filename}'"
+        ))),
+    }
+}
+
+/// Map upload type to the status-type query parameter for media polling.
+fn media_status_type(upload_type: &str) -> &'static str {
+    match upload_type {
+        "DOCUMENT_SHARING" => "DOCUMENT_PREVIEW",
+        "VIDEO_SHARING" => "VIDEO",
+        _ => "IMAGE",
+    }
+}
+
+/// Parse a LinkedIn byte-range string like `"bytes 0-4194303"` into `(start, end)`
+/// inclusive indices. Falls back to `(0, total - 1)` if the range is empty.
+fn parse_byte_range(range: &str, total: usize) -> Result<(usize, usize), Error> {
+    if range.is_empty() {
+        return Ok((0, total.saturating_sub(1)));
+    }
+    let stripped = range.strip_prefix("bytes ").unwrap_or(range);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    if parts.len() != 2 {
+        return Err(Error::InvalidInput(format!(
+            "invalid byte range '{range}', expected 'start-end'"
+        )));
+    }
+    let start: usize = parts[0]
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid byte range start '{}'", parts[0])))?;
+    let end: usize = parts[1]
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid byte range end '{}'", parts[1])))?;
+    Ok((start, end.min(total.saturating_sub(1))))
 }
 
 #[cfg(test)]
@@ -485,5 +918,63 @@ mod tests {
             &element,
             "7312345678901234567"
         ));
+    }
+
+    #[test]
+    fn media_upload_type_maps_supported_extensions() {
+        assert_eq!(
+            media_upload_type("photo.png").unwrap(),
+            ("IMAGE_SHARING", "image/png")
+        );
+        assert_eq!(
+            media_upload_type("photo.jpg").unwrap(),
+            ("IMAGE_SHARING", "image/jpeg")
+        );
+        assert_eq!(
+            media_upload_type("anim.gif").unwrap(),
+            ("IMAGE_SHARING", "image/gif")
+        );
+        assert_eq!(
+            media_upload_type("clip.mp4").unwrap(),
+            ("VIDEO_SHARING", "video/mp4")
+        );
+        assert_eq!(
+            media_upload_type("doc.pdf").unwrap(),
+            ("DOCUMENT_SHARING", "application/pdf")
+        );
+        assert!(media_upload_type("data.csv").is_err());
+    }
+
+    #[test]
+    fn parse_byte_range_parses_valid_ranges() {
+        assert_eq!(
+            parse_byte_range("bytes 0-4194303", 8_000_000).unwrap(),
+            (0, 4194303)
+        );
+        assert_eq!(parse_byte_range("0-99", 100).unwrap(), (0, 99));
+        assert_eq!(parse_byte_range("", 100).unwrap(), (0, 99));
+        // End clamped to total - 1
+        assert_eq!(parse_byte_range("0-200", 100).unwrap(), (0, 99));
+    }
+
+    #[test]
+    fn build_share_body_requires_scheduled_at_for_scheduled() {
+        let err = build_share_body("text", "ANYONE", "SCHEDULED", None, None).unwrap_err();
+        assert!(err.to_string().contains("scheduled_at_ms"));
+    }
+
+    #[test]
+    fn build_share_body_rejects_bad_visibility() {
+        let err = build_share_body("text", "PRIVATE", "PUBLISHED", None, None).unwrap_err();
+        assert!(err.to_string().contains("visibility"));
+    }
+
+    #[test]
+    fn build_share_body_builds_scheduled_payload() {
+        let body =
+            build_share_body("hello", "ANYONE", "SCHEDULED", Some(1700000000000i64), None).unwrap();
+        let post = &body["variables"]["post"];
+        assert_eq!(post["intendedShareLifeCycleState"], "SCHEDULED");
+        assert_eq!(post["scheduledAt"], 1700000000000i64);
     }
 }

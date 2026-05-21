@@ -90,6 +90,31 @@ impl LinkedInClient {
         self.get("identity/wvmpCards").await
     }
 
+    /// Fetch profile viewers for a given period.
+    ///
+    /// LinkedIn's `identity/wvmpCards` endpoint currently chooses the
+    /// available viewer window server-side, so the `days` and
+    /// `interesting_viewers` parameters are accepted but ignored. They are
+    /// kept in the signature so callers can be explicit about intent and
+    /// the method can be upgraded when LinkedIn exposes server-side filters.
+    pub async fn get_profile_viewers_for_period(
+        &self,
+        _days: u32,
+        _interesting_viewers: bool,
+    ) -> Result<Value, Error> {
+        self.get_profile_viewers().await
+    }
+
+    /// Fetch search-appearance analytics when LinkedIn exposes it.
+    pub async fn get_search_appearances(&self) -> Result<Value, Error> {
+        self.get("identity/searchAppearances").await
+    }
+
+    /// Fetch profile dashboard analytics (view counts, search appearances).
+    pub async fn get_profile_dashboard(&self) -> Result<Value, Error> {
+        self.get("identity/profile/dashboard").await
+    }
+
     /// Resolve a public identifier (vanity URL slug) to an `fsd_profile` URN.
     /// Tries the REST miniprofile endpoint, the REST profile endpoint, the
     /// GraphQL profile endpoint, and finally the preload-page scraper.
