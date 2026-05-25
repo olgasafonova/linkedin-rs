@@ -146,12 +146,12 @@ li profile viewers
 li profile audit
 
 # Recent posts by a member (curator-watch use case)
-li profile posts eric-vyacheslav-156273169 --count 20
+li profile posts john-doe-123 --count 20
 
-# Include first-comment URLs. Useful when a curator drops the article link
+# Include first-comment URLs. Useful when an author drops the article link
 # in their post's first comment (a common workaround for LinkedIn's downrank
 # on posts with external links in the body).
-li profile posts eric-vyacheslav-156273169 --count 20 --with-first-comment --json
+li profile posts john-doe-123 --count 20 --with-first-comment --json
 ```
 
 ### Feed
