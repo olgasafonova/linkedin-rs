@@ -6,7 +6,7 @@ This project is for personal and educational use only.
 
 ## Features
 
-The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
+The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 
 | Command | Description |
 |---------|-------------|
@@ -20,6 +20,7 @@ The CLI (`linkedin-cli`) exposes 44 subcommands across 11 domains:
 | `profile visit <id>` | Visit a profile (registers in "who viewed my profile") |
 | `profile viewers` | Show who viewed your profile |
 | `profile audit` | Audit your profile for staleness and missing sections |
+| `profile posts <id>` | List recent posts by a member (most-recent first); `--with-first-comment` also surfaces URLs from the post author's own first comment (LinkedIn's link-in-first-comment pattern) |
 | **Feed** | |
 | `feed list` | List feed updates (paginated) |
 | `feed read <n>` | Show full post details for item N from the last `feed list` |
@@ -143,6 +144,14 @@ li profile viewers
 
 # Audit your profile for staleness
 li profile audit
+
+# Recent posts by a member (curator-watch use case)
+li profile posts john-doe-123 --count 20
+
+# Include first-comment URLs. Useful when an author drops the article link
+# in their post's first comment (a common workaround for LinkedIn's downrank
+# on posts with external links in the body).
+li profile posts john-doe-123 --count 20 --with-first-comment --json
 ```
 
 ### Feed

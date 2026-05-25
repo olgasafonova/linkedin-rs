@@ -338,6 +338,29 @@ pub enum ProfileAction {
         #[arg(long)]
         json: bool,
     },
+    /// List recent posts by a member (vanity slug). Drops most-recent-first.
+    ///
+    /// Time-window filtering is NOT done here; the CLI returns up to `--count`
+    /// posts and exposes a relative-time label (e.g., "2d") plus the activity
+    /// URN. Date arithmetic is the caller's job.
+    Posts {
+        /// LinkedIn public identifier (vanity URL slug, e.g. eric-vyacheslav-156273169)
+        public_id: String,
+
+        /// Number of posts to fetch (default: 20; LinkedIn caps the page size).
+        #[arg(long, default_value = "20")]
+        count: u32,
+
+        /// Also fetch comments per post and surface URLs from the author's own
+        /// first comment under `firstCommentByAuthor`. Doubles the API calls,
+        /// so opt-in.
+        #[arg(long)]
+        with_first_comment: bool,
+
+        /// Output raw JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

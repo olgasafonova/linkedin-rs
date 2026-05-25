@@ -40,7 +40,8 @@ use messages::{
 };
 use notifications::{cmd_notifications_list, cmd_notifications_mentions};
 use profile::{
-    cmd_profile_audit, cmd_profile_me, cmd_profile_view, cmd_profile_viewers, cmd_profile_visit,
+    cmd_profile_audit, cmd_profile_me, cmd_profile_posts, cmd_profile_view, cmd_profile_viewers,
+    cmd_profile_visit,
 };
 use search::{
     cmd_search_invite, cmd_search_jobs, cmd_search_people, cmd_search_posts, cmd_search_react,
@@ -98,6 +99,12 @@ async fn dispatch_profile(action: ProfileAction) {
         }
         ProfileAction::Viewers { json } => exit_on_err(cmd_profile_viewers(json).await),
         ProfileAction::Audit { json } => exit_on_err(cmd_profile_audit(json).await),
+        ProfileAction::Posts {
+            public_id,
+            count,
+            with_first_comment,
+            json,
+        } => exit_on_err(cmd_profile_posts(&public_id, count, with_first_comment, json).await),
     }
 }
 
