@@ -344,7 +344,7 @@ pub enum ProfileAction {
     /// posts and exposes a relative-time label (e.g., "2d") plus the activity
     /// URN. Date arithmetic is the caller's job.
     Posts {
-        /// LinkedIn public identifier (vanity URL slug, e.g. eric-vyacheslav-156273169)
+        /// LinkedIn public identifier (vanity URL slug, e.g. john-doe-123)
         public_id: String,
 
         /// Number of posts to fetch (default: 20; LinkedIn caps the page size).
