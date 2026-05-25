@@ -104,9 +104,7 @@ async fn dispatch_profile(action: ProfileAction) {
             count,
             with_first_comment,
             json,
-        } => exit_on_err(
-            cmd_profile_posts(&public_id, count, with_first_comment, json).await,
-        ),
+        } => exit_on_err(cmd_profile_posts(&public_id, count, with_first_comment, json).await),
     }
 }
 
