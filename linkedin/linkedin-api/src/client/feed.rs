@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::urn::{ActivityUrn, SocialDetailUrn};
+use crate::urn::{ActivityUrn, ProfileUrn, SocialDetailUrn};
 
 use super::internal::{
     check_graphql_errors, check_response, graphql_params, restli_encode_string, unwrap_graphql,
@@ -121,14 +121,31 @@ impl LinkedInClient {
     }
 
     /// Fetch the authenticated user's own posts with engagement metrics.
+    /// Thin convenience wrapper around `get_member_posts` that self-resolves
+    /// the caller's `fsd_profile` URN.
     pub async fn get_my_posts(&self, start: u32, count: u32) -> Result<Value, Error> {
         let profile_urn = self.my_profile_urn().await?;
-        let encoded_urn = restli_encode_string(profile_urn);
-        let path = format!(
-            "identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
-            encoded_urn, start, count
-        );
-        self.get(&path).await
+        let urn = ProfileUrn::new(profile_urn);
+        self.get_member_posts(&urn, start, count).await
+    }
+
+    /// Fetch posts and reshares by a specific member.
+    ///
+    /// Hits the `memberShareFeed` finder on `identity/profileUpdatesV2` for any
+    /// `fsd_profile` URN. See `re/my_posts.md` for the full endpoint contract.
+    ///
+    /// Reshared posts surface with the *original* author in the `actor` field,
+    /// not the queried member. Callers that want to separate originals from
+    /// reshares should compare `actor.entityUrn` against the URN they queried
+    /// for.
+    pub async fn get_member_posts(
+        &self,
+        profile_urn: &ProfileUrn,
+        start: u32,
+        count: u32,
+    ) -> Result<Value, Error> {
+        self.get(&member_posts_path(profile_urn.as_str(), start, count))
+            .await
     }
 
     /// Fetch the list of reactors for a specific post. Auto-paginates in
@@ -315,6 +332,19 @@ impl LinkedInClient {
     }
 }
 
+/// Build the `identity/profileUpdatesV2` path for the `memberShareFeed`
+/// finder. The profile URN is Rest.li-encoded (colons → `%3A`); the path
+/// fragment then lives inside a URL query string where those `%` already
+/// represent literal percent characters, so no further encoding is needed
+/// here. See `re/my_posts.md` for the double-encoding discussion.
+fn member_posts_path(profile_urn: &str, start: u32, count: u32) -> String {
+    let encoded_urn = restli_encode_string(profile_urn);
+    format!(
+        "identity/profileUpdatesV2?q=memberShareFeed&profileUrn={}&moduleKey=member-shares%3Aphone&start={}&count={}",
+        encoded_urn, start, count
+    )
+}
+
 /// Returns the uppercased reaction type on success, or an `InvalidInput`
 /// error if the value is not recognized.
 fn validate_reaction_type(reaction_type: &str) -> Result<String, Error> {
@@ -415,5 +445,26 @@ mod tests {
             &element,
             "7312345678901234567"
         ));
+    }
+
+    #[test]
+    fn member_posts_path_encodes_colons_and_carries_pagination() {
+        let path = member_posts_path("urn:li:fsd_profile:ACoAAA111", 0, 10);
+        // The fsd_profile URN's colons must be Rest.li-encoded as %3A so the
+        // server's URL parser hands the full URN to the q=memberShareFeed
+        // finder rather than splitting on the first colon.
+        assert!(path.contains("profileUrn=urn%3Ali%3Afsd_profile%3AACoAAA111"));
+        assert!(path.contains("q=memberShareFeed"));
+        assert!(path.contains("moduleKey=member-shares%3Aphone"));
+        assert!(path.contains("start=0"));
+        assert!(path.contains("count=10"));
+        assert!(path.starts_with("identity/profileUpdatesV2?"));
+    }
+
+    #[test]
+    fn member_posts_path_round_trips_arbitrary_pagination() {
+        let path = member_posts_path("urn:li:fsd_profile:ACoAAA222", 25, 50);
+        assert!(path.contains("start=25"));
+        assert!(path.contains("count=50"));
     }
 }
