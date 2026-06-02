@@ -456,23 +456,29 @@ impl LinkedInClient {
     /// Build a separate `reqwest::Client` for CDN uploads.
     ///
     /// CDN pre-signed upload URLs (e.g., `dms-uploads`) go to different
-    /// hosts than the main LinkedIn API. Depending on network topology,
-    /// callers may want CDN uploads to bypass the proxy entirely.
+    /// hosts than the main LinkedIn API (e.g., `*.linkedin.com`). The
+    /// proxy is needed only for the LinkedIn API calls themselves; CDN
+    /// pre-signed PUTs go to direct S3/CDN endpoints and are faster
+    /// without proxying.
     ///
-    /// This client respects the same proxy configuration as the main client
-    /// by default. To bypass the proxy for CDN uploads, set the
-    /// `LINKEDIN_CDN_NO_PROXY` environment variable to any non-empty value.
+    /// By default, CDN uploads **bypass** the proxy. To force CDN uploads
+    /// through the proxy, set the `LINKEDIN_CDN_USE_PROXY` environment
+    /// variable to any non-empty value.
     pub(super) fn cdn_upload_client(&self) -> Result<reqwest::Client, Error> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(30));
 
-        // Check for explicit CDN proxy bypass.
-        let cdn_no_proxy = std::env::var("LINKEDIN_CDN_NO_PROXY")
+        // CDN uploads bypass the proxy by default. The LinkedIn API proxy
+        // (used for GraphQL/REST calls) is typically a VPN like ProtonVPN
+        // that adds latency and can timeout for large file uploads.
+        // Pre-signed CDN PUTs don't need geographic routing — they go
+        // directly to the CDN/S3 origin.
+        let cdn_use_proxy = std::env::var("LINKEDIN_CDN_USE_PROXY")
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false);
 
-        if !cdn_no_proxy {
+        if cdn_use_proxy {
             if let Some(ref proxy_url) = self.options.proxy_url {
                 let proxy = reqwest::Proxy::all(proxy_url)
                     .map_err(|e| Error::Auth(format!("invalid proxy URL for CDN upload: {e}")))?;
