@@ -426,10 +426,46 @@ impl LinkedInClient {
         Ok(json)
     }
 
+    /// Threshold in bytes above which GIF uploads will be **optionally**
+    /// converted to MP4 and uploaded via the video pipeline.
+    ///
+    /// LinkedIn's image CDN sync endpoint (`/dms-uploads/sp/sync/v2/`) has a
+    /// hard ~1.15 MB single-part upload cap for `IMAGE_SHARING`. Files larger
+    /// than that get a 400 error. The image CDN never returns
+    /// `partUploadRequests` for `IMAGE_SHARING`, so the multipart flow is not
+    /// available for images. The video endpoint (`/dms-uploads/sp/v2/`, no
+    /// `sync/`) has no such limit and accepts arbitrary sizes.
+    ///
+    /// Conversion is **opt-in** — by default we attempt the original GIF
+    /// upload and let it fail if the file is too large, so callers always get
+    /// a real GIF when the server accepts it. To enable the conversion
+    /// fallback, set `LINKEDIN_GIF_TO_VIDEO=1` (or any non-empty value) in
+    /// the environment. The threshold is `LINKEDIN_GIF_TO_VIDEO_THRESHOLD`
+    /// (default 1 MB).
+    pub(crate) fn gif_to_video_enabled() -> bool {
+        std::env::var("LINKEDIN_GIF_TO_VIDEO")
+            .map(|v| !v.trim().is_empty() && v.trim() != "0" && v.trim().to_ascii_lowercase() != "false")
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn gif_to_video_threshold() -> usize {
+        std::env::var("LINKEDIN_GIF_TO_VIDEO_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1_000_000)
+    }
+
     /// Upload an image/GIF/video/PDF to LinkedIn media storage.
     ///
     /// Handles single-part and multi-part uploads via the pre-signed CDN flow.
     /// Returns metadata including `urn`, `media_upload_type`, and `content_type`.
+    ///
+    /// **Optional GIF-to-video fallback:** when `LINKEDIN_GIF_TO_VIDEO=1` and
+    /// the GIF exceeds `LINKEDIN_GIF_TO_VIDEO_THRESHOLD` (default 1 MB), the
+    /// file is re-encoded as H.264 + silent AAC MP4 via `ffmpeg` and uploaded
+    /// through LinkedIn's video pipeline. This works around the image CDN's
+    /// ~1.15 MB cap. The conversion is opt-in so that callers always get a
+    /// true GIF when the server accepts it natively.
     pub async fn upload_media(&self, media_path: &std::path::Path) -> Result<Value, Error> {
         if !media_path.is_file() {
             return Err(Error::InvalidInput(format!(
@@ -444,6 +480,17 @@ impl LinkedInClient {
         let (upload_type, content_type) = media_upload_type(filename)?;
         let bytes = std::fs::read(media_path)
             .map_err(|e| Error::InvalidInput(format!("failed to read media file: {e}")))?;
+
+        // Optional GIF→MP4 fallback. Off by default — only triggers when the
+        // caller explicitly sets LINKEDIN_GIF_TO_VIDEO=1. Without it, large
+        // GIFs will hit the server's ~1.15 MB cap and return a clear error.
+        if upload_type == "IMAGE_SHARING"
+            && content_type == "image/gif"
+            && Self::gif_to_video_enabled()
+            && bytes.len() > Self::gif_to_video_threshold()
+        {
+            return self.upload_gif_as_video(media_path).await;
+        }
 
         let body = serde_json::json!({
             "mediaUploadType": upload_type,
@@ -509,6 +556,83 @@ impl LinkedInClient {
         out["media_upload_type"] = serde_json::json!(upload_type);
         out["content_type"] = serde_json::json!(content_type);
         out["singleUploadStatus"] = serde_json::json!(put_status);
+        Ok(out)
+    }
+
+    /// Convert a large GIF to MP4 and upload via LinkedIn's video pipeline.
+    ///
+    /// This is the implementation of the optional `LINKEDIN_GIF_TO_VIDEO=1`
+    /// fallback (see [`gif_to_video_enabled`]). It re-encodes the GIF as a
+    /// LinkedIn-compatible H.264 + silent AAC MP4 and uploads it through the
+    /// `VIDEO_SHARING` flow. The video endpoint has no size cap.
+    async fn upload_gif_as_video(&self, gif_path: &std::path::Path) -> Result<Value, Error> {
+        let mp4_path = convert_gif_to_mp4(gif_path)?;
+        let mp4_filename = mp4_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video.mp4")
+            .to_string();
+        let mp4_bytes = std::fs::read(&mp4_path)
+            .map_err(|e| Error::InvalidInput(format!("failed to read converted MP4: {e}")))?;
+
+        // Clean up the temp MP4 regardless of upload outcome.
+        let _ = std::fs::remove_file(&mp4_path);
+
+        let body = serde_json::json!({
+            "mediaUploadType": "VIDEO_SHARING",
+            "fileSize": mp4_bytes.len(),
+            "hasOverlayImage": false,
+            "uploadMetadataType": "SINGLE",
+            "filename": mp4_filename,
+        });
+        let meta = self
+            .post("voyagerMediaUploadMetadata?action=upload", &body)
+            .await?;
+        let value = meta.get("value").cloned().ok_or_else(|| Error::Api {
+            status: 200,
+            body: format!("missing upload metadata value: {meta}"),
+            correlation_id: None,
+        })?;
+
+        let upload_url = value
+            .get("singleUploadUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Api {
+                status: 200,
+                body: format!("missing singleUploadUrl: {value}"),
+                correlation_id: None,
+            })?;
+
+        let cdn = self.cdn_upload_client()?;
+        let mut req = cdn
+            .put(upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "video/mp4");
+        if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
+            for (name, val) in headers {
+                if let Some(val) = val.as_str() {
+                    req = req.header(name.as_str(), val);
+                }
+            }
+        }
+        let put = req.body(mp4_bytes.clone()).send().await?;
+        let put_status = put.status().as_u16();
+        if !put.status().is_success() {
+            let err_body = put.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                status: put_status,
+                body: format!(
+                    "CDN video-upload failed ({} bytes from GIF→MP4, status {put_status}): {err_body}",
+                    mp4_bytes.len()
+                ),
+                correlation_id: None,
+            });
+        }
+        let mut out = value;
+        out["media_upload_type"] = serde_json::json!("VIDEO_SHARING");
+        out["content_type"] = serde_json::json!("video/mp4");
+        out["singleUploadStatus"] = serde_json::json!(put_status);
+        out["media_path"] = serde_json::json!(gif_path.display().to_string());
+        out["converted_from_gif"] = serde_json::json!(true);
         Ok(out)
     }
 
@@ -864,6 +988,82 @@ fn parse_byte_range(range: &str, total: usize) -> Result<(usize, usize), Error> 
         .parse()
         .map_err(|_| Error::InvalidInput(format!("invalid byte range end '{}'", parts[1])))?;
     Ok((start, end.min(total.saturating_sub(1))))
+}
+
+/// Convert a GIF file to an MP4 (H.264 + silent AAC) using `ffmpeg`.
+///
+/// Returns the path to a temporary MP4 file in the same directory as the
+/// input GIF (to avoid cross-filesystem moves). The caller is responsible
+/// for cleaning up the temp file after the upload completes.
+fn convert_gif_to_mp4(gif_path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
+    use std::process::Command;
+
+    // Build a temp filename in the same directory: `name.tmp-<n>.mp4`.
+    let parent = gif_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = gif_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload");
+    let mut tmp_path = parent.join(format!("{stem}.tmp-{}.mp4", std::process::id()));
+    // If pid-based name collides (rare in tests), add a counter.
+    let mut counter = 0u32;
+    while tmp_path.exists() {
+        counter += 1;
+        tmp_path = parent.join(format!("{stem}.tmp-{}-{counter}.mp4", std::process::id()));
+    }
+
+    // LinkedIn-compatible encode: H.264 main profile, yuv420p, plus a silent
+    // AAC audio track (LinkedIn's video pipeline requires an audio stream).
+    // `+faststart` moves the moov atom to the front so playback starts
+    // before the file is fully downloaded.
+    let output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(gif_path)
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("anullsrc=channel_layout=stereo:sample_rate=44100")
+        .arg("-t")
+        .arg("30") // 30 second cap
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-profile:v")
+        .arg("main")
+        .arg("-crf")
+        .arg("23")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-shortest")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&tmp_path)
+        .output()
+        .map_err(|e| {
+            Error::InvalidInput(format!(
+                "failed to spawn ffmpeg for GIF→MP4 conversion (is ffmpeg installed?): {e}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::InvalidInput(format!(
+            "ffmpeg failed to convert {} to MP4: {stderr}",
+            gif_path.display()
+        )));
+    }
+    if !tmp_path.exists() {
+        return Err(Error::InvalidInput(format!(
+            "ffmpeg exited successfully but {} was not created",
+            tmp_path.display()
+        )));
+    }
+    Ok(tmp_path)
 }
 
 #[cfg(test)]
