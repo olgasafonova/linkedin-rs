@@ -426,46 +426,23 @@ impl LinkedInClient {
         Ok(json)
     }
 
-    /// Threshold in bytes above which GIF uploads will be **optionally**
-    /// converted to MP4 and uploaded via the video pipeline.
-    ///
-    /// LinkedIn's image CDN sync endpoint (`/dms-uploads/sp/sync/v2/`) has a
-    /// hard ~1.15 MB single-part upload cap for `IMAGE_SHARING`. Files larger
-    /// than that get a 400 error. The image CDN never returns
-    /// `partUploadRequests` for `IMAGE_SHARING`, so the multipart flow is not
-    /// available for images. The video endpoint (`/dms-uploads/sp/v2/`, no
-    /// `sync/`) has no such limit and accepts arbitrary sizes.
-    ///
-    /// Conversion is **opt-in** — by default we attempt the original GIF
-    /// upload and let it fail if the file is too large, so callers always get
-    /// a real GIF when the server accepts it. To enable the conversion
-    /// fallback, set `LINKEDIN_GIF_TO_VIDEO=1` (or any non-empty value) in
-    /// the environment. The threshold is `LINKEDIN_GIF_TO_VIDEO_THRESHOLD`
-    /// (default 1 MB).
-    pub(crate) fn gif_to_video_enabled() -> bool {
-        std::env::var("LINKEDIN_GIF_TO_VIDEO")
-            .map(|v| !v.trim().is_empty() && v.trim() != "0" && v.trim().to_ascii_lowercase() != "false")
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn gif_to_video_threshold() -> usize {
-        std::env::var("LINKEDIN_GIF_TO_VIDEO_THRESHOLD")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(1_000_000)
-    }
+    /// Size threshold (bytes) above which IMAGE_SHARING uploads request
+    /// MULTIPART instead of SINGLE upload metadata. LinkedIn's CDN may
+    /// return `partUploadRequests` for files above this threshold, which
+    /// the multipart flow handles. Even when the server returns SINGLE,
+    /// the upload succeeds because CDN PUTs now bypass the VPN proxy
+    /// (the real root cause of previous failures).
+    /// The GIF stays a native GIF — no conversion or compression.
+    const MULTIPART_THRESHOLD: usize = 1_000_000; // 1 MB
 
     /// Upload an image/GIF/video/PDF to LinkedIn media storage.
     ///
     /// Handles single-part and multi-part uploads via the pre-signed CDN flow.
     /// Returns metadata including `urn`, `media_upload_type`, and `content_type`.
     ///
-    /// **Optional GIF-to-video fallback:** when `LINKEDIN_GIF_TO_VIDEO=1` and
-    /// the GIF exceeds `LINKEDIN_GIF_TO_VIDEO_THRESHOLD` (default 1 MB), the
-    /// file is re-encoded as H.264 + silent AAC MP4 via `ffmpeg` and uploaded
-    /// through LinkedIn's video pipeline. This works around the image CDN's
-    /// ~1.15 MB cap. The conversion is opt-in so that callers always get a
-    /// true GIF when the server accepts it natively.
+    /// **CDN proxy bypass:** CDN pre-signed PUTs bypass the API proxy by default
+    /// (see `cdn_upload_client()`). This was the root cause of large-GIF upload
+    /// failures — the SG VPN proxy timed out, not a size cap.
     pub async fn upload_media(&self, media_path: &std::path::Path) -> Result<Value, Error> {
         if !media_path.is_file() {
             return Err(Error::InvalidInput(format!(
@@ -481,43 +458,66 @@ impl LinkedInClient {
         let bytes = std::fs::read(media_path)
             .map_err(|e| Error::InvalidInput(format!("failed to read media file: {e}")))?;
 
-        // Optional GIF→MP4 fallback. Off by default — only triggers when the
-        // caller explicitly sets LINKEDIN_GIF_TO_VIDEO=1. Without it, large
-        // GIFs will hit the server's ~1.15 MB cap and return a clear error.
-        if upload_type == "IMAGE_SHARING"
-            && content_type == "image/gif"
-            && Self::gif_to_video_enabled()
-            && bytes.len() > Self::gif_to_video_threshold()
-        {
-            return self.upload_gif_as_video(media_path).await;
-        }
+        // Use MULTIPART for large IMAGE_SHARING uploads (animated GIFs etc).
+        // This requests chunk-based upload metadata from the server, which
+        // bypasses the single-part ~1.15 MB cap on the image CDN endpoint.
+        let use_multipart = upload_type == "IMAGE_SHARING" && bytes.len() > Self::MULTIPART_THRESHOLD;
+        let metadata_type = if use_multipart { "MULTIPART" } else { "SINGLE" };
+
+        eprintln!(
+            "upload_media: {} bytes, type={}, content={}, metadata={}",
+            bytes.len(), upload_type, content_type, metadata_type
+        );
 
         let body = serde_json::json!({
             "mediaUploadType": upload_type,
             "fileSize": bytes.len(),
             "hasOverlayImage": false,
-            "uploadMetadataType": "SINGLE",
+            "uploadMetadataType": metadata_type,
             "filename": filename,
         });
         let meta = self
             .post("voyagerMediaUploadMetadata?action=upload", &body)
             .await?;
+        eprintln!("upload_media: server raw response keys: {:?}", meta.as_object().map(|o| o.keys().collect::<Vec<_>>()));
         let value = meta.get("value").cloned().ok_or_else(|| Error::Api {
             status: 200,
             body: format!("missing upload metadata value: {meta}"),
             correlation_id: None,
         })?;
 
+        // Debug: print what the server actually decided
+        eprintln!("upload_media: value.type={:?}, has singleUploadUrl={:?}, has partUploadRequests={:?}",
+            value.get("type").and_then(|v| v.as_str()),
+            value.get("singleUploadUrl").and_then(|v| v.as_str()).map(|u| u.len()),
+            value.get("partUploadRequests").and_then(|v| v.as_array()).map(|a| a.len()),
+        );
+        // Also print ALL keys in the value object
+        eprintln!("upload_media: value keys: {:?}", value.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        // Print first 200 chars of singleUploadUrl to see endpoint pattern
+        if let Some(url) = value.get("singleUploadUrl").and_then(|v| v.as_str()) {
+            eprintln!("upload_media: singleUploadUrl prefix: {}...", &url[..url.len().min(200)]);
+        }
+
         let cdn = self.cdn_upload_client()?;
 
         // Multi-part flow if LinkedIn returned part upload requests.
         if let Some(parts) = value.get("partUploadRequests").and_then(|v| v.as_array()) {
             if !parts.is_empty() {
+                eprintln!("upload_media: server returned {} multipart parts", parts.len());
                 return self
                     .upload_multipart(&cdn, &value, &bytes, content_type, upload_type, parts)
                     .await;
             }
         }
+
+        // Server returned SINGLE type — log what we got for diagnostics.
+        eprintln!(
+            "upload_media: server returned SINGLE upload (requested={}, type={}, resp_type={})",
+            metadata_type,
+            upload_type,
+            value.get("type").and_then(|v| v.as_str()).unwrap_or("?")
+        );
 
         // Single-part upload.
         let upload_url = value
@@ -529,9 +529,11 @@ impl LinkedInClient {
                 correlation_id: None,
             })?;
 
+        // Mobile app uses application/octet-stream for all CDN uploads (RE doc §2.2).
+        // Using the actual content type (e.g. image/gif) causes 400 for larger files.
         let mut req = cdn
             .put(upload_url)
-            .header(reqwest::header::CONTENT_TYPE, content_type);
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
         if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
             for (name, val) in headers {
                 if let Some(val) = val.as_str() {
@@ -559,84 +561,14 @@ impl LinkedInClient {
         Ok(out)
     }
 
-    /// Convert a large GIF to MP4 and upload via LinkedIn's video pipeline.
+    /// Upload file parts to LinkedIn's CDN using pre-signed URLs (multipart).
     ///
-    /// This is the implementation of the optional `LINKEDIN_GIF_TO_VIDEO=1`
-    /// fallback (see [`gif_to_video_enabled`]). It re-encodes the GIF as a
-    /// LinkedIn-compatible H.264 + silent AAC MP4 and uploads it through the
-    /// `VIDEO_SHARING` flow. The video endpoint has no size cap.
-    async fn upload_gif_as_video(&self, gif_path: &std::path::Path) -> Result<Value, Error> {
-        let mp4_path = convert_gif_to_mp4(gif_path)?;
-        let mp4_filename = mp4_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("video.mp4")
-            .to_string();
-        let mp4_bytes = std::fs::read(&mp4_path)
-            .map_err(|e| Error::InvalidInput(format!("failed to read converted MP4: {e}")))?;
-
-        // Clean up the temp MP4 regardless of upload outcome.
-        let _ = std::fs::remove_file(&mp4_path);
-
-        let body = serde_json::json!({
-            "mediaUploadType": "VIDEO_SHARING",
-            "fileSize": mp4_bytes.len(),
-            "hasOverlayImage": false,
-            "uploadMetadataType": "SINGLE",
-            "filename": mp4_filename,
-        });
-        let meta = self
-            .post("voyagerMediaUploadMetadata?action=upload", &body)
-            .await?;
-        let value = meta.get("value").cloned().ok_or_else(|| Error::Api {
-            status: 200,
-            body: format!("missing upload metadata value: {meta}"),
-            correlation_id: None,
-        })?;
-
-        let upload_url = value
-            .get("singleUploadUrl")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Api {
-                status: 200,
-                body: format!("missing singleUploadUrl: {value}"),
-                correlation_id: None,
-            })?;
-
-        let cdn = self.cdn_upload_client()?;
-        let mut req = cdn
-            .put(upload_url)
-            .header(reqwest::header::CONTENT_TYPE, "video/mp4");
-        if let Some(headers) = value.get("singleUploadHeaders").and_then(|v| v.as_object()) {
-            for (name, val) in headers {
-                if let Some(val) = val.as_str() {
-                    req = req.header(name.as_str(), val);
-                }
-            }
-        }
-        let put = req.body(mp4_bytes.clone()).send().await?;
-        let put_status = put.status().as_u16();
-        if !put.status().is_success() {
-            let err_body = put.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                status: put_status,
-                body: format!(
-                    "CDN video-upload failed ({} bytes from GIF→MP4, status {put_status}): {err_body}",
-                    mp4_bytes.len()
-                ),
-                correlation_id: None,
-            });
-        }
-        let mut out = value;
-        out["media_upload_type"] = serde_json::json!("VIDEO_SHARING");
-        out["content_type"] = serde_json::json!("video/mp4");
-        out["singleUploadStatus"] = serde_json::json!(put_status);
-        out["media_path"] = serde_json::json!(gif_path.display().to_string());
-        out["converted_from_gif"] = serde_json::json!(true);
-        Ok(out)
-    }
-
-    /// Upload file parts to LinkedIn's CDN using pre-signed URLs.
+    /// Handles both the RE doc field names (`uploadUrl`, `firstByte`/`lastByte`,
+    /// `headers`) and the older code names (`partUploadUrl`, `byteRange`,
+    /// `partUploadHeaders`) for robustness.
+    ///
+    /// After all parts are uploaded, calls `completeMultipartUpload` to notify
+    /// LinkedIn that the upload is finished.
     async fn upload_multipart(
         &self,
         cdn: &reqwest::Client,
@@ -646,24 +578,45 @@ impl LinkedInClient {
         upload_type: &str,
         parts: &[Value],
     ) -> Result<Value, Error> {
+        let mut part_responses: Vec<Value> = Vec::with_capacity(parts.len());
+
         for (i, part) in parts.iter().enumerate() {
+            // Field name variants: RE doc uses "uploadUrl", older code used "partUploadUrl"
             let url = part
-                .get("partUploadUrl")
+                .get("uploadUrl")
+                .or_else(|| part.get("partUploadUrl"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Api {
                     status: 200,
-                    body: format!("part {i} missing partUploadUrl: {part}"),
+                    body: format!("part {i} missing uploadUrl/partUploadUrl: {part}"),
                     correlation_id: None,
                 })?;
-            let (start, end) = parse_byte_range(
-                part.get("byteRange").and_then(|v| v.as_str()).unwrap_or(""),
-                bytes.len(),
-            )?;
+
+            // Byte range: RE doc uses firstByte/lastByte, older code used byteRange string
+            let (start, end) = if let (Some(fb), Some(lb)) = (
+                part.get("firstByte").and_then(|v| v.as_u64()),
+                part.get("lastByte").and_then(|v| v.as_u64()),
+            ) {
+                (fb as usize, lb as usize)
+            } else {
+                parse_byte_range(
+                    part.get("byteRange").and_then(|v| v.as_str()).unwrap_or(""),
+                    bytes.len(),
+                )?
+            };
             let slice = bytes[start..=end].to_vec();
+
+            // Mobile app uses application/octet-stream for CDN uploads (RE doc §2.2).
             let mut req = cdn
                 .put(url)
-                .header(reqwest::header::CONTENT_TYPE, content_type);
-            if let Some(headers) = part.get("partUploadHeaders").and_then(|v| v.as_object()) {
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+
+            // Field name variants: RE doc uses "headers", older code used "partUploadHeaders"
+            if let Some(headers) = part
+                .get("headers")
+                .or_else(|| part.get("partUploadHeaders"))
+                .and_then(|v| v.as_object())
+            {
                 for (name, val) in headers {
                     if let Some(val) = val.as_str() {
                         req = req.header(name.as_str(), val);
@@ -672,18 +625,71 @@ impl LinkedInClient {
             }
             let resp = req.body(slice).send().await?;
             let status = resp.status().as_u16();
-            if !resp.status().is_success() {
-                let err_body = resp.text().await.unwrap_or_default();
+            let resp_headers = resp.headers().clone();
+            let resp_body = resp.text().await.unwrap_or_default();
+
+            if status != 200 {
                 return Err(Error::Api {
                     status,
-                    body: format!("CDN part {i} upload failed: {err_body}"),
+                    body: format!("CDN part {i} upload failed (status {status}): {resp_body}"),
                     correlation_id: None,
                 });
             }
+
+            // Collect part response for completion step
+            let mut headers_map = serde_json::Map::new();
+            for (k, v) in resp_headers.iter() {
+                if let Ok(val) = v.to_str() {
+                    headers_map.insert(k.to_string(), serde_json::json!(val));
+                }
+            }
+            part_responses.push(serde_json::json!({
+                "httpStatusCode": status,
+                "headers": headers_map,
+                "body": resp_body,
+            }));
+
+            eprintln!("upload_multipart: part {}/{} uploaded ({}..={})", i + 1, parts.len(), start, end);
         }
+
+        // Phase 3: Complete multipart upload
+        let upload_urn = value.get("urn").and_then(|v| v.as_str()).unwrap_or("");
+        let media_artifact_urn = value
+            .get("mediaArtifactUrn")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let multipart_metadata = value
+            .get("multipartMetadata")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        eprintln!(
+            "upload_multipart: completing upload, urn={}, parts={}",
+            upload_urn,
+            part_responses.len()
+        );
+
+        let completion_body = serde_json::json!({
+            "completeUploadRequest": {
+                "uploadMetadataType": "MULTIPART",
+                "multipartMetadata": multipart_metadata,
+                "mediaArtifactUrn": media_artifact_urn,
+                "partUploadResponses": part_responses,
+            }
+        });
+        let completion_resp = self
+            .post(
+                "voyagerMediaUploadMetadata?action=completeMultipartUpload",
+                &completion_body,
+            )
+            .await?;
+
+        eprintln!("upload_multipart: completion response keys: {:?}", completion_resp.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+
         let mut out = value.clone();
         out["media_upload_type"] = serde_json::json!(upload_type);
         out["content_type"] = serde_json::json!(content_type);
+        out["multipartCompleted"] = serde_json::json!(true);
         Ok(out)
     }
 
@@ -990,81 +996,6 @@ fn parse_byte_range(range: &str, total: usize) -> Result<(usize, usize), Error> 
     Ok((start, end.min(total.saturating_sub(1))))
 }
 
-/// Convert a GIF file to an MP4 (H.264 + silent AAC) using `ffmpeg`.
-///
-/// Returns the path to a temporary MP4 file in the same directory as the
-/// input GIF (to avoid cross-filesystem moves). The caller is responsible
-/// for cleaning up the temp file after the upload completes.
-fn convert_gif_to_mp4(gif_path: &std::path::Path) -> Result<std::path::PathBuf, Error> {
-    use std::process::Command;
-
-    // Build a temp filename in the same directory: `name.tmp-<n>.mp4`.
-    let parent = gif_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let stem = gif_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("upload");
-    let mut tmp_path = parent.join(format!("{stem}.tmp-{}.mp4", std::process::id()));
-    // If pid-based name collides (rare in tests), add a counter.
-    let mut counter = 0u32;
-    while tmp_path.exists() {
-        counter += 1;
-        tmp_path = parent.join(format!("{stem}.tmp-{}-{counter}.mp4", std::process::id()));
-    }
-
-    // LinkedIn-compatible encode: H.264 main profile, yuv420p, plus a silent
-    // AAC audio track (LinkedIn's video pipeline requires an audio stream).
-    // `+faststart` moves the moov atom to the front so playback starts
-    // before the file is fully downloaded.
-    let output = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(gif_path)
-        .arg("-f")
-        .arg("lavfi")
-        .arg("-i")
-        .arg("anullsrc=channel_layout=stereo:sample_rate=44100")
-        .arg("-t")
-        .arg("30") // 30 second cap
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-profile:v")
-        .arg("main")
-        .arg("-crf")
-        .arg("23")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg("128k")
-        .arg("-shortest")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(&tmp_path)
-        .output()
-        .map_err(|e| {
-            Error::InvalidInput(format!(
-                "failed to spawn ffmpeg for GIF→MP4 conversion (is ffmpeg installed?): {e}"
-            ))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::InvalidInput(format!(
-            "ffmpeg failed to convert {} to MP4: {stderr}",
-            gif_path.display()
-        )));
-    }
-    if !tmp_path.exists() {
-        return Err(Error::InvalidInput(format!(
-            "ffmpeg exited successfully but {} was not created",
-            tmp_path.display()
-        )));
-    }
-    Ok(tmp_path)
-}
 
 #[cfg(test)]
 mod tests {
