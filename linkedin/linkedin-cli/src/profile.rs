@@ -974,13 +974,7 @@ pub async fn cmd_profile_posts(
     let mut posts: Vec<Value> = elements_owned.iter().map(extract_post_data).collect();
 
     if with_first_comment {
-        for post in posts.iter_mut() {
-            if let Some(comment_data) = fetch_first_comment_by_author(&client, post).await {
-                if let Some(obj) = post.as_object_mut() {
-                    obj.insert("firstCommentByAuthor".to_string(), comment_data);
-                }
-            }
-        }
+        attach_first_comments(&client, &mut posts).await;
     }
 
     if raw_json {
@@ -999,6 +993,19 @@ pub async fn cmd_profile_posts(
 
     print_posts_human(public_id, &posts);
     Ok(())
+}
+
+/// Fetch each post's author first-comment and attach it under
+/// `firstCommentByAuthor`. Posts with no fetchable comment are left untouched.
+async fn attach_first_comments(client: &LinkedInClient, posts: &mut [Value]) {
+    for post in posts.iter_mut() {
+        let Some(comment_data) = fetch_first_comment_by_author(client, post).await else {
+            continue;
+        };
+        if let Some(obj) = post.as_object_mut() {
+            obj.insert("firstCommentByAuthor".to_string(), comment_data);
+        }
+    }
 }
 
 /// Pull the canonical fields the skill needs out of a single UpdateV2
@@ -1027,54 +1034,18 @@ fn extract_post_data(element: &Value) -> Value {
     let text = nested_text(update, &["commentary", "text", "text"])
         .unwrap_or("")
         .to_string();
-    let posted_relative = nested_text(update, &["actor", "subDescription", "text"])
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches("• \u{a0}\u{a0}")
-        .trim_end_matches('•')
-        .trim()
-        .to_string();
-
-    let permalink = if activity_urn.is_empty() {
-        String::new()
-    } else {
-        format!("https://www.linkedin.com/feed/update/{}", activity_urn)
-    };
-
-    let article_url = nested_text(
+    let posted_relative = extract_posted_relative(update);
+    let permalink = build_permalink(&activity_urn);
+    let article_url = extract_component_action_target(
         update,
-        &[
-            "content",
-            "com.linkedin.voyager.feed.render.ArticleComponent",
-            "navigationContext",
-            "actionTarget",
-        ],
-    )
-    .unwrap_or("")
-    .to_string();
-    let external_video_url = nested_text(
+        "com.linkedin.voyager.feed.render.ArticleComponent",
+    );
+    let external_video_url = extract_component_action_target(
         update,
-        &[
-            "content",
-            "com.linkedin.voyager.feed.render.ExternalVideoComponent",
-            "navigationContext",
-            "actionTarget",
-        ],
-    )
-    .unwrap_or("")
-    .to_string();
-
+        "com.linkedin.voyager.feed.render.ExternalVideoComponent",
+    );
     let inline_urls = extract_hyperlink_attrs(update.get("commentary").and_then(|c| c.get("text")));
-
-    // Priority: dashEntityUrn (urn:li:fsd_socialDetail:..., the modern Dash
-    // URN that socialDashCommentsBySocialDetail accepts) → entityUrn (legacy
-    // fs_socialDetail) → urn (the underlying ugcPost/activity URN; LinkedIn
-    // rejects this with "Deserializing failed").
-    let social_detail_urn = nested_text(update, &["socialDetail", "dashEntityUrn"])
-        .or_else(|| nested_text(update, &["socialDetail", "entityUrn"]))
-        .or_else(|| nested_text(update, &["socialDetail", "urn"]))
-        .unwrap_or("")
-        .to_string();
+    let social_detail_urn = extract_social_detail_urn(update);
 
     json!({
         "activityUrn": activity_urn,
@@ -1090,6 +1061,51 @@ fn extract_post_data(element: &Value) -> Value {
         "socialDetailUrn": social_detail_urn,
         "firstCommentByAuthor": Value::Null,
     })
+}
+
+/// Extract the "posted N ago" relative timestamp, stripping LinkedIn's
+/// trailing bullet/non-breaking-space decorations.
+fn extract_posted_relative(update: &Value) -> String {
+    nested_text(update, &["actor", "subDescription", "text"])
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches("• \u{a0}\u{a0}")
+        .trim_end_matches('•')
+        .trim()
+        .to_string()
+}
+
+/// Build the canonical feed permalink, or an empty string when no activity URN.
+fn build_permalink(activity_urn: &str) -> String {
+    if activity_urn.is_empty() {
+        String::new()
+    } else {
+        format!("https://www.linkedin.com/feed/update/{}", activity_urn)
+    }
+}
+
+/// Pull `content.<component>.navigationContext.actionTarget` out of an update.
+fn extract_component_action_target(update: &Value, component: &str) -> String {
+    nested_text(
+        update,
+        &["content", component, "navigationContext", "actionTarget"],
+    )
+    .unwrap_or("")
+    .to_string()
+}
+
+/// Resolve the social-detail URN used by the comments API.
+///
+/// Priority: dashEntityUrn (urn:li:fsd_socialDetail:..., the modern Dash URN
+/// that socialDashCommentsBySocialDetail accepts) → entityUrn (legacy
+/// fs_socialDetail) → urn (the underlying ugcPost/activity URN; LinkedIn
+/// rejects this with "Deserializing failed").
+fn extract_social_detail_urn(update: &Value) -> String {
+    nested_text(update, &["socialDetail", "dashEntityUrn"])
+        .or_else(|| nested_text(update, &["socialDetail", "entityUrn"]))
+        .or_else(|| nested_text(update, &["socialDetail", "urn"]))
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Best-effort fetch of the post-author's own first comment on their post.
@@ -1262,63 +1278,77 @@ fn print_posts_human(public_id: &str, posts: &[Value]) {
         return;
     }
     for (i, post) in posts.iter().enumerate() {
-        let activity_urn = post
-            .get("activityUrn")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let posted = post
-            .get("postedAtRelative")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let is_reshare = post
-            .get("isReshare")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let actor_name = post.get("actorName").and_then(|v| v.as_str()).unwrap_or("");
-        let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-        let reshare_tag = if is_reshare { " [reshare]" } else { "" };
-        let posted_tag = if posted.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", posted)
-        };
-        println!(
-            "\n[{}] {}{}{}",
-            i + 1,
-            activity_urn,
-            posted_tag,
-            reshare_tag
-        );
-        if is_reshare && !actor_name.is_empty() {
-            println!("    original author: {}", actor_name);
-        }
-        if !text.is_empty() {
-            println!("    {}", truncate_with_ellipsis(text, 200));
-        }
-        if let Some(url) = post.get("articleUrl").and_then(|v| v.as_str()) {
-            println!("    article: {}", url);
-        }
-        if let Some(url) = post.get("externalVideoUrl").and_then(|v| v.as_str()) {
-            println!("    video: {}", url);
-        }
-        if let Some(arr) = post.get("inlineUrls").and_then(|v| v.as_array()) {
-            for url in arr.iter().filter_map(|u| u.as_str()) {
-                println!("    inline: {}", url);
-            }
-        }
-        if let Some(comment) = post
-            .get("firstCommentByAuthor")
-            .filter(|v| !v.is_null())
-            .and_then(|v| v.as_object())
-        {
-            if let Some(arr) = comment.get("extractedUrls").and_then(|v| v.as_array()) {
-                for url in arr.iter().filter_map(|u| u.as_str()) {
-                    println!("    first-comment-link: {}", url);
-                }
-            }
-        }
+        print_one_post(i, post);
     }
+}
+
+/// Render a single post entry (zero-based `index`) in the human-readable format.
+fn print_one_post(index: usize, post: &Value) {
+    let activity_urn = post
+        .get("activityUrn")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let posted = post
+        .get("postedAtRelative")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_reshare = post
+        .get("isReshare")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let actor_name = post.get("actorName").and_then(|v| v.as_str()).unwrap_or("");
+    let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
+
+    let reshare_tag = if is_reshare { " [reshare]" } else { "" };
+    let posted_tag = if posted.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", posted)
+    };
+    println!(
+        "\n[{}] {}{}{}",
+        index + 1,
+        activity_urn,
+        posted_tag,
+        reshare_tag
+    );
+    if is_reshare && !actor_name.is_empty() {
+        println!("    original author: {}", actor_name);
+    }
+    if !text.is_empty() {
+        println!("    {}", truncate_with_ellipsis(text, 200));
+    }
+    print_labeled_url(post, "articleUrl", "article");
+    print_labeled_url(post, "externalVideoUrl", "video");
+    print_url_array(post.get("inlineUrls"), "inline");
+    print_first_comment_links(post);
+}
+
+/// Print `    <label>: <url>` when `post[key]` is a non-empty string.
+fn print_labeled_url(post: &Value, key: &str, label: &str) {
+    if let Some(url) = post.get(key).and_then(|v| v.as_str()) {
+        println!("    {}: {}", label, url);
+    }
+}
+
+/// Print `    <label>: <url>` for each string in the JSON array `value`.
+fn print_url_array(value: Option<&Value>, label: &str) {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return;
+    };
+    for url in arr.iter().filter_map(|u| u.as_str()) {
+        println!("    {}: {}", label, url);
+    }
+}
+
+/// Print the author's first-comment links, when present.
+fn print_first_comment_links(post: &Value) {
+    let comment = post
+        .get("firstCommentByAuthor")
+        .filter(|v| !v.is_null())
+        .and_then(|v| v.as_object());
+    let Some(comment) = comment else { return };
+    print_url_array(comment.get("extractedUrls"), "first-comment-link");
 }
 
 #[cfg(test)]
