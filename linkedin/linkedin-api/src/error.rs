@@ -91,17 +91,21 @@ pub(crate) const CORRELATION_HEADER_CANDIDATES: &[&str] = &[
 /// response header map. Returns `None` when none of the known headers are
 /// present.
 pub(crate) fn extract_correlation_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    for name in CORRELATION_HEADER_CANDIDATES {
-        if let Some(value) = headers.get(*name) {
-            if let Ok(s) = value.to_str() {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
+    CORRELATION_HEADER_CANDIDATES
+        .iter()
+        .find_map(|name| header_nonempty_value(headers, name))
+}
+
+/// Read a single header as a trimmed, non-empty string. Returns `None` when the
+/// header is absent, not valid UTF-8, or blank after trimming.
+fn header_nonempty_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?;
+    let trimmed = value.to_str().ok()?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    None
 }
 
 /// Display wrapper that sanitizes the message when an `Error::Auth` is rendered.
@@ -129,42 +133,51 @@ fn sanitize_body(body: &str) -> String {
     truncate_display(&masked, MAX_DISPLAY_BODY_LEN)
 }
 
+const URN_PREFIX: &str = "urn:li:";
+
 /// Replace LinkedIn URN opaque IDs with `[…]`.
 fn mask_urns(body: &str) -> String {
-    const PREFIX: &str = "urn:li:";
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
-    while let Some(idx) = rest.find(PREFIX) {
+    while let Some(idx) = rest.find(URN_PREFIX) {
         out.push_str(&rest[..idx]);
-        let after_prefix = &rest[idx + PREFIX.len()..];
-        // Read the entity type (alphanumeric + underscore + period) up to ':'.
-        let type_end = after_prefix.find(':').unwrap_or(after_prefix.len());
-        let entity_type = &after_prefix[..type_end];
-        let is_valid_type = !entity_type.is_empty()
-            && entity_type
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
-        if !is_valid_type || type_end == after_prefix.len() {
-            // Not a recognizable URN — emit the prefix literally and advance.
-            out.push_str(PREFIX);
-            rest = after_prefix;
-            continue;
-        }
-        // Skip the opaque ID up to the next URN-terminator character.
-        let id_start = type_end + 1;
-        let id_part = &after_prefix[id_start..];
-        let id_end = id_part
-            .find(|c: char| {
-                !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
-            })
-            .unwrap_or(id_part.len());
-        out.push_str(PREFIX);
-        out.push_str(entity_type);
-        out.push_str(":[…]");
-        rest = &id_part[id_end..];
+        let after_prefix = &rest[idx + URN_PREFIX.len()..];
+        rest = mask_one_urn(after_prefix, &mut out);
     }
     out.push_str(rest);
     out
+}
+
+/// Handle a single `urn:li:` occurrence. `after_prefix` is the text immediately
+/// following the prefix. Pushes the rendered output onto `out` and returns the
+/// remaining text to continue scanning from.
+fn mask_one_urn<'a>(after_prefix: &'a str, out: &mut String) -> &'a str {
+    // Read the entity type (alphanumeric + underscore + period) up to ':'.
+    let type_end = after_prefix.find(':').unwrap_or(after_prefix.len());
+    let entity_type = &after_prefix[..type_end];
+    if !is_valid_urn_type(entity_type) || type_end == after_prefix.len() {
+        // Not a recognizable URN — emit the prefix literally and advance.
+        out.push_str(URN_PREFIX);
+        return after_prefix;
+    }
+    // Skip the opaque ID up to the next URN-terminator character.
+    let id_part = &after_prefix[type_end + 1..];
+    let id_end = id_part
+        .find(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
+        })
+        .unwrap_or(id_part.len());
+    out.push_str(URN_PREFIX);
+    out.push_str(entity_type);
+    out.push_str(":[…]");
+    &id_part[id_end..]
+}
+
+fn is_valid_urn_type(entity_type: &str) -> bool {
+    !entity_type.is_empty()
+        && entity_type
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// Replace email-shaped substrings with `[email]`.
@@ -184,30 +197,42 @@ fn mask_emails(body: &str) -> String {
             i += 1;
             continue;
         }
-        // Expand back through local-part bytes.
-        let mut local_start = i;
-        while local_start > 0 && is_email_local_byte(bytes[local_start - 1]) {
-            local_start -= 1;
-        }
-        // Expand forward through domain bytes.
-        let mut domain_end = i + 1;
-        while domain_end < bytes.len() && is_email_domain_byte(bytes[domain_end]) {
-            domain_end += 1;
-        }
-        let has_local = local_start < i;
-        let domain = &body[i + 1..domain_end];
-        if has_local && domain.contains('.') {
-            // Emit everything from cursor to local_start verbatim, then [email].
-            out.push_str(&body[cursor..local_start]);
-            out.push_str("[email]");
-            cursor = domain_end;
-            i = domain_end;
-        } else {
-            i += 1;
+        match email_span_at(bytes, body, i) {
+            Some((local_start, domain_end)) => {
+                // Emit everything from cursor to local_start verbatim, then [email].
+                out.push_str(&body[cursor..local_start]);
+                out.push_str("[email]");
+                cursor = domain_end;
+                i = domain_end;
+            }
+            None => i += 1,
         }
     }
     out.push_str(&body[cursor..]);
     out
+}
+
+/// Given an `@` at byte index `at`, return the `(local_start, domain_end)` byte
+/// span of a valid email-shaped substring, or `None` when the surrounding text
+/// doesn't look like an email (no local part, or domain without a dot).
+fn email_span_at(bytes: &[u8], body: &str, at: usize) -> Option<(usize, usize)> {
+    // Expand back through local-part bytes.
+    let mut local_start = at;
+    while local_start > 0 && is_email_local_byte(bytes[local_start - 1]) {
+        local_start -= 1;
+    }
+    // Expand forward through domain bytes.
+    let mut domain_end = at + 1;
+    while domain_end < bytes.len() && is_email_domain_byte(bytes[domain_end]) {
+        domain_end += 1;
+    }
+    let has_local = local_start < at;
+    let domain = &body[at + 1..domain_end];
+    if has_local && domain.contains('.') {
+        Some((local_start, domain_end))
+    } else {
+        None
+    }
 }
 
 fn is_email_local_byte(b: u8) -> bool {
