@@ -58,4 +58,5 @@
 # "table not found: wisps" (gastownhall/beads#4176, open). Solo workflow, so
 # the git-tracked issues.jsonl is the durable record and Dolt federation buys
 # nothing. Re-enable only if this repo ever needs cross-machine bd sync.
-sync.remote: "git+https://github.com/olgasafonova/linkedin-rs.git"
+# NOTE: `bd init` re-adds this line. If it reappears, comment it out again.
+# sync.remote: "git+https://github.com/olgasafonova/linkedin-rs.git"
