@@ -120,8 +120,9 @@ impl CliError {
 fn resolution_hint(reason: ProfileResolutionFailure) -> &'static str {
     match reason {
         ProfileResolutionFailure::RateLimited => {
-            "Hint: the resolver was rate limited (HTTP 429). Wait a few minutes and retry the same \
-             slug; do not re-run it in a loop, which is what earned the 429."
+            "Hint: the resolver was rate limited (HTTP 429, or LinkedIn's 999 challenge status). \
+             Wait a few minutes and retry the same slug; do not re-run it in a loop, which is \
+             what earned the block."
         }
         ProfileResolutionFailure::SelfSlugUnsupported => {
             "Hint: that is your own vanity slug. The slug resolvers answer for other members only, \
