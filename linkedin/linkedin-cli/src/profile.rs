@@ -1239,17 +1239,42 @@ fn comment_hyperlinks(comment: &Value) -> Vec<String> {
     plaintext_urls(&comment_commentary_text(comment))
 }
 
+/// Attribute `type` values that carry an outbound URL. `TEXT_LINK` is what
+/// Voyager actually emits on both `feed/updates` and
+/// `identity/profileUpdatesV2`; `HYPERLINK` is kept because older captured
+/// fixtures use it and it costs nothing to accept.
+const LINK_ATTR_TYPES: &[&str] = &["TEXT_LINK", "HYPERLINK"];
+
+/// Pull outbound URLs out of a commentary `text` object's attribute list.
+///
+/// The URL lives at `attributes[].textLink.url` on live responses. A flat
+/// `attributes[].url` is also accepted for the older shape.
+///
+/// Verified 28-07-2026 against 20 live posts on `identity/profileUpdatesV2`
+/// (`li feed my-posts --json`): 6 link attributes, all `TEXT_LINK` with the
+/// URL under `textLink.url`, and zero `HYPERLINK`. Matching only `HYPERLINK`
+/// with a flat `url` — as this did previously — returned an empty vec for
+/// every real post, which is why `inlineUrls` was always `[]`.
 fn extract_hyperlink_attrs(text_obj: Option<&Value>) -> Vec<String> {
     text_obj
         .and_then(|t| t.get("attributes"))
         .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|attr| attr.get("type").and_then(|t| t.as_str()) == Some("HYPERLINK"))
-                .filter_map(|attr| attr.get("url").and_then(|u| u.as_str()).map(String::from))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(link_attr_url).collect())
         .unwrap_or_default()
+}
+
+/// Return the URL carried by a single commentary attribute, or `None` when
+/// the attribute is not a link type (mentions, company tags) or has no URL.
+fn link_attr_url(attr: &Value) -> Option<String> {
+    let attr_type = attr.get("type").and_then(|t| t.as_str())?;
+    if !LINK_ATTR_TYPES.contains(&attr_type) {
+        return None;
+    }
+    attr.get("textLink")
+        .and_then(|l| l.get("url"))
+        .and_then(|u| u.as_str())
+        .or_else(|| attr.get("url").and_then(|u| u.as_str()))
+        .map(String::from)
 }
 
 fn plaintext_urls(text: &str) -> Vec<String> {
@@ -1525,6 +1550,92 @@ mod tests {
             post["socialDetailUrn"],
             "urn:li:fsd_socialDetail:(urn:li:activity:99,urn:li:activity:99,-)"
         );
+    }
+
+    #[test]
+    fn extract_post_data_reads_live_profile_updates_v2_element() {
+        // Verbatim element shape from `identity/profileUpdatesV2?q=memberShareFeed`
+        // captured 28-07-2026 (`li feed my-posts --json`, element 16), with the
+        // miniCompany logo blob trimmed. Three things this pins down:
+        //   1. Elements are FLAT -- no `value.<UpdateV2>` wrapper on this finder,
+        //      so `unwrap_update_v2_local` must fall through to the element.
+        //   2. Link attributes are `TEXT_LINK` with the URL at `textLink.url`,
+        //      never `HYPERLINK` with a flat `url`.
+        //   3. COMPANY_NAME attributes sit alongside and carry no URL.
+        let element = json!({
+            "entityUrn": "urn:li:fs_updateV2:(urn:li:activity:7470215905017401344,MEMBER_SHARES,DEBUG_REASON,DEFAULT,false)",
+            "actor": {
+                "urn": "urn:li:member:4963014",
+                "name": {"text": "Olga Safonova"},
+                "subDescription": {"text": "1mo •   "}
+            },
+            "commentary": {
+                "text": {
+                    "text": "So Anthropic just got #Fable out https://lnkd.in/eDCv4Bwp",
+                    "attributes": [
+                        {
+                            "type": "COMPANY_NAME",
+                            "start": 3,
+                            "length": 9,
+                            "miniCompany": {"name": "Anthropic"}
+                        },
+                        {
+                            "type": "TEXT_LINK",
+                            "start": 96,
+                            "length": 24,
+                            "textLink": {
+                                "url": "https://lnkd.in/eDCv4Bwp",
+                                "viewingBehavior": "DEFAULT"
+                            }
+                        }
+                    ]
+                }
+            },
+            "content": {
+                "com.linkedin.voyager.feed.render.ArticleComponent": {
+                    "navigationContext": {"actionTarget": "https://example.com/article"}
+                }
+            }
+        });
+        let post = extract_post_data(&element);
+        assert_eq!(post["inlineUrls"], json!(["https://lnkd.in/eDCv4Bwp"]));
+        assert_eq!(post["articleUrl"], "https://example.com/article");
+        assert_eq!(post["activityUrn"], "urn:li:activity:7470215905017401344");
+        assert_eq!(post["postedAtRelative"], "1mo");
+    }
+
+    #[test]
+    fn extract_hyperlink_attrs_captures_auto_linkified_bare_text() {
+        // LinkedIn linkifies bare tokens like "SKILL.md" into a TEXT_LINK with
+        // an http:// URL that never appears in the post text. A plain-text URL
+        // scan cannot see these, so the attribute channel is the only source.
+        let text_obj = json!({
+            "text": "documented in SKILL.md",
+            "attributes": [
+                {
+                    "type": "TEXT_LINK",
+                    "start": 14,
+                    "length": 8,
+                    "textLink": {"url": "http://SKILL.md", "viewingBehavior": "DEFAULT"}
+                }
+            ]
+        });
+        assert_eq!(
+            extract_hyperlink_attrs(Some(&text_obj)),
+            vec!["http://SKILL.md"]
+        );
+    }
+
+    #[test]
+    fn extract_hyperlink_attrs_ignores_mention_attributes() {
+        let text_obj = json!({
+            "text": "thanks to everyone",
+            "attributes": [
+                {"type": "PROFILE_MENTION", "start": 0, "length": 6},
+                {"type": "COMPANY_NAME", "start": 7, "length": 2}
+            ]
+        });
+        assert!(extract_hyperlink_attrs(Some(&text_obj)).is_empty());
     }
 
     #[test]
