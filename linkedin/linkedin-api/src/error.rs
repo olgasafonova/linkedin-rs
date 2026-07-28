@@ -80,7 +80,8 @@ pub enum Error {
 /// none of the three; it is not a synonym for "not found".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileResolutionFailure {
-    /// At least one endpoint returned HTTP 429 after exhausting its retries.
+    /// At least one endpoint returned HTTP 429 after exhausting its
+    /// retries, or LinkedIn's 999 bot-challenge status.
     RateLimited,
     /// The requested slug is the authenticated user's own vanity slug.
     SelfSlugUnsupported,
@@ -94,7 +95,8 @@ impl fmt::Display for ProfileResolutionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             Self::RateLimited => {
-                "rate limited: an endpoint returned HTTP 429 after exhausting its retries. \
+                "rate limited: an endpoint returned HTTP 429 after exhausting its retries, or \
+                 LinkedIn's 999 challenge status. \
                  Recovery: back off and retry later; the slug itself is fine."
             }
             Self::SelfSlugUnsupported => {

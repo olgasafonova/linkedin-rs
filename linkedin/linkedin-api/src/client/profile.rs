@@ -103,10 +103,11 @@ impl LinkedInClient {
     /// fetching and caching it from `/me` on first call.
     ///
     /// This costs a network request when nothing has populated the cache
-    /// yet. [`LinkedInClient::resolve_profile_urn`] deliberately does NOT
-    /// call it: adding a request to an already-failing path is the wrong
-    /// trade when the same answer can be seeded offline. Callers that want
-    /// a definitive self-slug answer can call this explicitly.
+    /// yet. [`LinkedInClient::resolve_profile_urn`] consults `/me` only
+    /// when the slug is already known to be the caller's own, or on the
+    /// failure path after every endpoint has been tried — never as an extra
+    /// request on the happy path. Callers that want a definitive self-slug
+    /// answer up front can call this explicitly.
     pub async fn my_public_id(&self) -> Result<&str, Error> {
         self.self_public_id
             .get_or_try_init(|| async {
@@ -175,12 +176,23 @@ impl LinkedInClient {
     /// and reporting it as "profile not found" sends the caller after the
     /// wrong fix.
     ///
-    /// A slug already known to be the caller's own is NOT short-circuited
-    /// before the endpoint round: the endpoints are still tried, and the
-    /// self-slug verdict is only applied to the failure. That keeps the
-    /// classification honest if one of them turns out to answer for a
-    /// self-slug after all.
+    /// A slug already known to be the caller's own never reaches the
+    /// endpoint round: those endpoints answer for other members only, so
+    /// trying them is a by-construction failure. The resolver answers from
+    /// the `/me` profile URN instead. When the self slug is unknown up
+    /// front, the endpoints are tried first and a single `/me` fetch on the
+    /// failure path settles the verdict — and still resolves the URN when
+    /// the slug turns out to be the caller's own.
     pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<ProfileUrn, Error> {
+        if self.slug_is_self(public_id) == Some(true) {
+            if let Ok(urn) = self.my_profile_urn().await {
+                return Ok(ProfileUrn::new(urn.to_string()));
+            }
+            // `/me` failed. Fall through to the endpoint round so the
+            // eventual error still carries per-endpoint outcomes; the
+            // classifier below applies the self-slug verdict to it.
+        }
+
         let mut attempts: Vec<ResolutionAttempt> = Vec::with_capacity(4);
 
         match self.resolve_via_miniprofile(public_id).await {
@@ -200,12 +212,37 @@ impl LinkedInClient {
             Err(err) => record_attempt(&mut attempts, ENDPOINT_PRELOAD, err)?,
         }
 
-        let reason = classify_resolution_failure(&attempts, self.slug_is_self(public_id));
+        let slug_is_self = self.settle_self_verdict(public_id).await;
+        if slug_is_self == Some(true) {
+            if let Ok(urn) = self.my_profile_urn().await {
+                return Ok(ProfileUrn::new(urn.to_string()));
+            }
+        }
+        let reason = classify_resolution_failure(&attempts, slug_is_self);
         Err(Error::ProfileResolution {
             public_id: public_id.to_string(),
             reason,
             attempts,
         })
+    }
+
+    /// Settle the self-slug verdict after every endpoint has failed.
+    ///
+    /// Answers offline when the slug is already cached. Otherwise it costs
+    /// one `/me` fetch, which is the right trade on this path: a match turns
+    /// the failure into a successful resolve, and a mismatch upgrades an
+    /// "inconclusive" verdict to an honest one. A failed `/me` leaves the
+    /// verdict unknown (`None`), never a false `Some(false)`.
+    async fn settle_self_verdict(&self, public_id: &str) -> Option<bool> {
+        if let Some(known) = self.slug_is_self(public_id) {
+            return Some(known);
+        }
+        // `my_profile_urn` caches the self slug off the same `/me` response,
+        // so one request answers both the verdict and (on a match) the URN.
+        match self.my_profile_urn().await {
+            Ok(_) => self.slug_is_self(public_id),
+            Err(_) => None,
+        }
     }
 
     async fn resolve_via_miniprofile(&self, public_id: &str) -> Result<String, Error> {
@@ -331,7 +368,8 @@ fn no_urn_in_payload(endpoint: &str, public_id: &str) -> Error {
 ///    about these endpoints, so backing off and retrying would spend quota
 ///    on a request that can never succeed.
 /// 2. **Rate limited** next, keyed on a real HTTP 429 that survived the
-///    client's own retry loop, never on a guess about response shape.
+///    client's own retry loop or on LinkedIn's 999 bot-challenge status,
+///    never on a guess about response shape.
 /// 3. **Not found** only when every endpoint gave a clean absence (404 or
 ///    an empty payload). One odd status is enough to disqualify it.
 /// 4. Otherwise **inconclusive**, which is a real answer rather than a
@@ -343,10 +381,12 @@ fn classify_resolution_failure(
     if slug_is_self == Some(true) {
         return ProfileResolutionFailure::SelfSlugUnsupported;
     }
-    if attempts
-        .iter()
-        .any(|a| a.outcome == EndpointOutcome::Status(429))
-    {
+    if attempts.iter().any(|a| {
+        matches!(
+            a.outcome,
+            EndpointOutcome::Status(429) | EndpointOutcome::Status(999)
+        )
+    }) {
         return ProfileResolutionFailure::RateLimited;
     }
     let every_endpoint_says_absent = !attempts.is_empty()
@@ -492,6 +532,18 @@ mod tests {
     }
 
     #[test]
+    fn classify_999_challenge_is_rate_limited() {
+        // 999 is LinkedIn's bot-challenge status: back off and retry later,
+        // exactly the RateLimited recovery, and nothing about the slug.
+        let mut attempts = all_absent();
+        attempts[2].outcome = EndpointOutcome::Status(999);
+        assert_eq!(
+            classify_resolution_failure(&attempts, Some(false)),
+            ProfileResolutionFailure::RateLimited
+        );
+    }
+
+    #[test]
     fn classify_self_slug_outranks_rate_limit() {
         // Both signals present. Waiting out the 429 would never help, so the
         // self-slug verdict has to win.
@@ -515,7 +567,7 @@ mod tests {
     fn classify_odd_status_is_inconclusive_not_not_found() {
         // A 403 (block/captcha) or a 5xx is not evidence the profile is
         // missing, so it must not be laundered into NotFound.
-        for status in [403u16, 500, 999] {
+        for status in [403u16, 500] {
             let mut attempts = all_absent();
             attempts[3].outcome = EndpointOutcome::Status(status);
             assert_eq!(
