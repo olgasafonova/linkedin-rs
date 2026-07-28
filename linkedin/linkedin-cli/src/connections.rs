@@ -237,10 +237,10 @@ async fn resolve_invite_target(
         return Ok(ProfileUrn::from(public_id_or_urn));
     }
     eprintln!("Resolving profile URN for '{}'...", public_id_or_urn);
-    client
-        .resolve_profile_urn(public_id_or_urn)
-        .await
-        .map_err(|e| CliError::Other(format!("failed to resolve profile: {e}")))
+    // Propagate the typed error rather than flattening it into a string:
+    // `CliError::hint`/`exit_code` classify `ProfileResolution` by reason,
+    // and a `format!` here would throw that classification away.
+    Ok(client.resolve_profile_urn(public_id_or_urn).await?)
 }
 
 /// Parse a batch input list (one slug/URN per line).

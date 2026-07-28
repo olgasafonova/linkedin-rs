@@ -81,6 +81,7 @@ pub async fn cmd_auth_status(local_only: bool) -> CliResult<()> {
     match client.get_me().await {
         Ok(me) => {
             println!("Status: authenticated");
+            crate::session::remember_self_public_id(&me);
             // Try to extract a display name from the response.
             if let Some(mini) = me.get("miniProfile") {
                 let first = mini.get("firstName").and_then(|v| v.as_str()).unwrap_or("");

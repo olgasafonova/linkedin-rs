@@ -25,6 +25,8 @@ use crate::error::Error;
 ///   client-side per `CsrfCookieHelper.generateJsessionId()`.
 /// - `created_at`: When this session was saved (local clock). We cannot
 ///   determine server-side expiry without making an API call.
+/// - `self_public_id`: The signed-in member's own vanity slug, cached so
+///   that a later command can recognise a self-slug offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// Primary session cookie value (from browser dev tools or server).
@@ -35,6 +37,19 @@ pub struct Session {
 
     /// Timestamp when this session was created/saved.
     pub created_at: DateTime<Utc>,
+
+    /// The signed-in member's own vanity slug (`publicIdentifier`), when a
+    /// previous command learned it from `/me`.
+    ///
+    /// Optional and `serde(default)`, so session files written before this
+    /// field existed still load. Cached rather than fetched because the one
+    /// place that needs it, slug → URN resolution, needs it on a path that
+    /// has already failed; spending another request there is the wrong
+    /// trade. It can go stale if the member changes their vanity URL, which
+    /// costs a wrong self-slug verdict and nothing else. `auth login`
+    /// clears it.
+    #[serde(default)]
+    pub self_public_id: Option<String>,
 }
 
 impl Session {
@@ -44,7 +59,18 @@ impl Session {
             li_at,
             jsessionid,
             created_at: Utc::now(),
+            self_public_id: None,
         }
+    }
+
+    /// Store the signed-in member's own vanity slug, reporting whether the
+    /// value changed (so callers can skip a pointless file write).
+    pub fn set_self_public_id(&mut self, public_id: &str) -> bool {
+        if self.self_public_id.as_deref() == Some(public_id) {
+            return false;
+        }
+        self.self_public_id = Some(public_id.to_string());
+        true
     }
 
     /// Serialize this session to a JSON file at `path`.
@@ -193,6 +219,30 @@ mod tests {
 
         // Clean up.
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_without_self_public_id_field_still_loads() {
+        // Session files written before the field existed must keep working.
+        let legacy = r#"{
+            "li_at": "AQEDATest123",
+            "jsessionid": "ajax:0000000000000000042",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let session: Session = serde_json::from_str(legacy).expect("legacy file must parse");
+        assert!(session.self_public_id.is_none());
+    }
+
+    #[test]
+    fn set_self_public_id_reports_change() {
+        let mut session = Session::new(
+            "AQEDATest123".to_string(),
+            "ajax:0000000000000000042".to_string(),
+        );
+        assert!(session.set_self_public_id("olgasafonova"));
+        assert!(!session.set_self_public_id("olgasafonova"));
+        assert!(session.set_self_public_id("olga-renamed"));
+        assert_eq!(session.self_public_id.as_deref(), Some("olga-renamed"));
     }
 
     #[test]

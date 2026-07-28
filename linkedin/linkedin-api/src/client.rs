@@ -90,6 +90,14 @@ pub struct LinkedInClient {
     /// from the `/me` endpoint on first use.
     pub(super) profile_urn: OnceCell<String>,
 
+    /// Cached vanity slug (`publicIdentifier`) for the authenticated user.
+    ///
+    /// Filled for free whenever `/me` is fetched for any other reason, and
+    /// seedable offline by the caller (see
+    /// [`LinkedInClient::set_self_public_id`]) so that a self-slug can be
+    /// recognised without spending a request on it.
+    pub(super) self_public_id: OnceCell<String>,
+
     /// Timestamp of the last API request, used for rate limiting.
     last_request: Mutex<Instant>,
 
@@ -112,9 +120,16 @@ impl LinkedInClient {
     }
 
     /// Create a client from a persisted [`Session`].
+    ///
+    /// Seeds the self-slug cache from the session file when it carries one,
+    /// so a self-slug is recognisable without a `/me` round trip.
     pub fn with_session(session: &Session) -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
-        Self::build(&device_id, &session.jsessionid, Some(&session.li_at))
+        let client = Self::build(&device_id, &session.jsessionid, Some(&session.li_at))?;
+        if let Some(public_id) = session.self_public_id.as_deref() {
+            client.set_self_public_id(public_id);
+        }
+        Ok(client)
     }
 
     /// Create a client using full browser cookies (from a cookies JSON file).
@@ -194,6 +209,7 @@ impl LinkedInClient {
             device_id: device_id.to_string(),
             x_li_track,
             profile_urn: OnceCell::new(),
+            self_public_id: OnceCell::new(),
             last_request: Mutex::new(Instant::now() - Duration::from_secs(10)),
             min_request_interval: Duration::from_millis(DEFAULT_MIN_REQUEST_INTERVAL_MS),
         })

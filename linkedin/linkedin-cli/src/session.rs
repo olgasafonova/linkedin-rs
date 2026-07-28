@@ -54,6 +54,40 @@ fn browser_cookies_path() -> CliResult<std::path::PathBuf> {
     Ok(session_dir.join("browser_cookies.json"))
 }
 
+/// Cache the signed-in member's own vanity slug into the session file.
+///
+/// Called from the commands that already fetch `/me`, so learning it costs
+/// no extra request. A later `resolve_profile_urn` reads it back offline
+/// and can tell a self-slug from a missing profile. Failures are reported
+/// on stderr and swallowed: this is a cache write, and no command should
+/// fail because it could not update one.
+pub fn remember_self_public_id(me: &serde_json::Value) {
+    let Some(public_id) = me
+        .get("miniProfile")
+        .and_then(|mp| mp.get("publicIdentifier"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+
+    let Ok(path) = Session::default_path() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let Ok(mut session) = Session::load(&path) else {
+        return;
+    };
+    if !session.set_self_public_id(public_id) {
+        return;
+    }
+    if let Err(e) = session.save(&path) {
+        eprintln!("warning: could not cache your public ID in the session file: {e}");
+    }
+}
+
 /// Load the stored session and create an authenticated client.
 pub fn load_session_client() -> CliResult<(LinkedInClient, std::path::PathBuf)> {
     // Check for browser cookies file first (enables write operations).

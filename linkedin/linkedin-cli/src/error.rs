@@ -6,7 +6,7 @@
 //! `Input`, `Other`). The variants drive both the exit code and the
 //! actionable hint without substring-matching the error message.
 
-use linkedin_api::error::Error as ApiError;
+use linkedin_api::error::{Error as ApiError, ProfileResolutionFailure};
 
 /// All errors a `cmd_*` function can produce.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +50,15 @@ impl CliError {
             CliError::Session(_) => exit_code::AUTH,
             CliError::Api(ApiError::Auth(_)) => exit_code::AUTH,
             CliError::Api(ApiError::Api { status: 401, .. }) => exit_code::AUTH,
+            // A slug that will never resolve is bad input, not a failing
+            // API. Scripts can branch on this without parsing the message.
+            CliError::Api(ApiError::ProfileResolution { reason, .. }) => match reason {
+                ProfileResolutionFailure::NotFound
+                | ProfileResolutionFailure::SelfSlugUnsupported => exit_code::INPUT,
+                ProfileResolutionFailure::RateLimited | ProfileResolutionFailure::Inconclusive => {
+                    exit_code::API
+                }
+            },
             CliError::Api(_) => exit_code::API,
             CliError::Input(_) => exit_code::INPUT,
             CliError::Cache(_) | CliError::Other(_) => 1,
@@ -77,6 +86,9 @@ impl CliError {
                 "Hint: rate limited. Wait a few minutes; consider lowering --pacing-ms below 2000 \
                  only if you've checked your quota.",
             ),
+            CliError::Api(ApiError::ProfileResolution { reason, .. }) => {
+                Some(resolution_hint(*reason))
+            }
             CliError::Api(ApiError::Api {
                 status: 200, body, ..
             }) => {
@@ -92,15 +104,38 @@ impl CliError {
                     None
                 }
             }
-            CliError::Other(msg) if msg.contains("failed to resolve profile") => Some(
-                "Hint: the slug→URN resolver flaked. Pass the fsd_profile URN directly if you have it, \
-                 or use 'li search invite N' once the person is in your last search results.",
-            ),
             CliError::Input(msg) if msg.contains("out of range") => Some(
                 "Hint: rerun the parent command (e.g. 'li search people \"…\"' or 'li feed list') first \
                  to populate the cache.",
             ),
             _ => None,
+        }
+    }
+}
+
+/// Next step for each slug → URN resolution failure.
+///
+/// One hint per classification, because the recoveries are opposites:
+/// waiting helps exactly one of these and wastes time on the rest.
+fn resolution_hint(reason: ProfileResolutionFailure) -> &'static str {
+    match reason {
+        ProfileResolutionFailure::RateLimited => {
+            "Hint: the resolver was rate limited (HTTP 429). Wait a few minutes and retry the same \
+             slug; do not re-run it in a loop, which is what earned the 429."
+        }
+        ProfileResolutionFailure::SelfSlugUnsupported => {
+            "Hint: that is your own vanity slug. The slug resolvers answer for other members only, \
+             so retrying will never work. Use 'li profile me' for your own profile, or pass your \
+             fsd_profile URN directly."
+        }
+        ProfileResolutionFailure::NotFound => {
+            "Hint: no endpoint knows that slug. Check the spelling against the profile URL, or the \
+             member renamed or removed the profile."
+        }
+        ProfileResolutionFailure::Inconclusive => {
+            "Hint: the per-endpoint outcomes in the message say what each endpoint returned. A 403 \
+             usually means a captcha challenge (open LinkedIn in a browser); a 5xx or a transport \
+             error means retry later."
         }
     }
 }
@@ -199,6 +234,53 @@ mod tests {
             .hint()
             .unwrap();
         assert!(hint.contains("cache"));
+    }
+
+    fn resolution_err(reason: ProfileResolutionFailure) -> CliError {
+        CliError::Api(ApiError::ProfileResolution {
+            public_id: "olgasafonova".to_string(),
+            reason,
+            attempts: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn exit_code_splits_resolution_failures() {
+        assert_eq!(
+            resolution_err(ProfileResolutionFailure::NotFound).exit_code(),
+            exit_code::INPUT
+        );
+        assert_eq!(
+            resolution_err(ProfileResolutionFailure::SelfSlugUnsupported).exit_code(),
+            exit_code::INPUT
+        );
+        assert_eq!(
+            resolution_err(ProfileResolutionFailure::RateLimited).exit_code(),
+            exit_code::API
+        );
+        assert_eq!(
+            resolution_err(ProfileResolutionFailure::Inconclusive).exit_code(),
+            exit_code::API
+        );
+    }
+
+    #[test]
+    fn resolution_hints_are_distinct_and_actionable() {
+        let hints = [
+            ProfileResolutionFailure::RateLimited,
+            ProfileResolutionFailure::SelfSlugUnsupported,
+            ProfileResolutionFailure::NotFound,
+            ProfileResolutionFailure::Inconclusive,
+        ]
+        .map(|r| resolution_err(r).hint().expect("every reason has a hint"));
+
+        assert!(hints[0].contains("Wait a few minutes"));
+        assert!(hints[1].contains("li profile me"));
+        assert!(hints[2].contains("spelling"));
+        assert!(hints[3].contains("captcha"));
+
+        let unique: std::collections::HashSet<&&str> = hints.iter().collect();
+        assert_eq!(unique.len(), hints.len(), "hints must not be duplicates");
     }
 
     #[test]

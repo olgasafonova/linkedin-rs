@@ -5,7 +5,7 @@ use linkedin_api::client::LinkedInClient;
 use linkedin_api::urn::SocialDetailUrn;
 
 use crate::error::{CliError, CliResult};
-use crate::session::load_session_client;
+use crate::session::{load_session_client, remember_self_public_id};
 use crate::util::truncate_with_ellipsis;
 
 /// Pretty-print a JSON value to stdout.
@@ -39,6 +39,7 @@ pub async fn cmd_profile_me(raw_json: bool) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
 
     let me = client.get_me().await?;
+    remember_self_public_id(&me);
 
     if raw_json {
         print_json(&me)?;

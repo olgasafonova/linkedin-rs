@@ -927,10 +927,8 @@ async fn resolve_send_recipient(client: &LinkedInClient, recipient: &str) -> Cli
         return resolve_recipient_by_name(client, recipient).await;
     }
     eprintln!("Resolving profile URN for '{}'...", recipient);
-    client
-        .resolve_profile_urn(recipient)
-        .await
-        .map_err(|e| CliError::Other(format!("failed to resolve profile URN: {e}")))
+    // Typed propagation: see the note in `connections::resolve_invite_target`.
+    Ok(client.resolve_profile_urn(recipient).await?)
 }
 
 /// One row of the name-fuzzy-match resolver. At least one of `slug` /
@@ -1036,10 +1034,7 @@ async fn urn_for_match(client: &LinkedInClient, m: &NameMatch) -> CliResult<Prof
         ));
     }
     if !m.slug.is_empty() {
-        return client
-            .resolve_profile_urn(&m.slug)
-            .await
-            .map_err(|e| CliError::Other(format!("failed to resolve profile: {e}")));
+        return Ok(client.resolve_profile_urn(&m.slug).await?);
     }
     Err(CliError::Other(
         "matched connection has no URN or slug".to_string(),

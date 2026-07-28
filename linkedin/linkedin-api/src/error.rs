@@ -52,6 +52,150 @@ pub enum Error {
     /// Invalid input provided by the caller.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// Every slug → URN resolver endpoint failed.
+    ///
+    /// Carries a [`ProfileResolutionFailure`] classification because the
+    /// failure modes have opposite recoveries (back off / fix the slug /
+    /// stop using this resolver), plus the per-endpoint outcomes that
+    /// produced the classification so a reader can check the reasoning.
+    #[error("could not resolve profile '{public_id}': {reason} (attempts: {})", AttemptsDisplay(.attempts))]
+    ProfileResolution {
+        /// The vanity slug that failed to resolve.
+        public_id: String,
+        /// Which recovery applies.
+        reason: ProfileResolutionFailure,
+        /// Per-endpoint outcomes, in the order they were tried.
+        attempts: Vec<ResolutionAttempt>,
+    },
+}
+
+/// Which of the mutually-exclusive recoveries applies when
+/// [`Error::ProfileResolution`] fires.
+///
+/// The three named failures need opposite responses: wait it out, fix the
+/// slug, or stop asking these endpoints entirely. Collapsing them into one
+/// opaque message costs the caller the ability to react at all.
+/// `Inconclusive` is the honest fallback for when the evidence singles out
+/// none of the three; it is not a synonym for "not found".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileResolutionFailure {
+    /// At least one endpoint returned HTTP 429 after exhausting its retries.
+    RateLimited,
+    /// The requested slug is the authenticated user's own vanity slug.
+    SelfSlugUnsupported,
+    /// Every endpoint answered, and none of them knows this slug.
+    NotFound,
+    /// The outcomes point at none of the above.
+    Inconclusive,
+}
+
+impl fmt::Display for ProfileResolutionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::RateLimited => {
+                "rate limited: an endpoint returned HTTP 429 after exhausting its retries. \
+                 Recovery: back off and retry later; the slug itself is fine."
+            }
+            Self::SelfSlugUnsupported => {
+                "self-slug unsupported: this is the authenticated user's own vanity slug, and \
+                 the resolver endpoints answer for other members only. \
+                 Recovery: use the `/me` profile URN instead; retrying can never succeed."
+            }
+            Self::NotFound => {
+                "profile not found: every endpoint answered and none of them knows this slug. \
+                 Recovery: check the spelling, or the member renamed or removed the profile."
+            }
+            Self::Inconclusive => {
+                "inconclusive: the endpoint outcomes match neither rate limiting, nor a missing \
+                 profile, nor a self-slug. Recovery: read the per-endpoint outcomes."
+            }
+        };
+        f.write_str(text)
+    }
+}
+
+/// What one resolver endpoint reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointOutcome {
+    /// The endpoint returned this HTTP status.
+    Status(u16),
+    /// The endpoint answered successfully but carried no URN for the slug.
+    /// Also covers this crate's synthesised `Error::Api { status: 0, .. }`
+    /// shape errors, which mean the same thing: a 2xx with nothing in it.
+    Empty,
+    /// The request never produced a status (connection reset, TLS, JSON).
+    Transport(String),
+}
+
+impl EndpointOutcome {
+    /// Classify one endpoint's [`Error`] into an outcome.
+    ///
+    /// `status: 0` is this crate's convention for a synthesised (non-HTTP)
+    /// error, so it maps to [`EndpointOutcome::Empty`] rather than to a
+    /// nonsense HTTP status.
+    pub fn from_error(err: &Error) -> Self {
+        match err {
+            Error::Api { status: 0, .. } => Self::Empty,
+            Error::Api { status, .. } => Self::Status(*status),
+            Error::Http(e) => Self::Transport(e.to_string()),
+            Error::Json(e) => Self::Transport(e.to_string()),
+            Error::Auth(msg) | Error::InvalidInput(msg) => Self::Transport(msg.clone()),
+            // A nested resolution failure can't happen (no resolver calls
+            // another resolver), but the match has to be total.
+            Error::ProfileResolution { reason, .. } => Self::Transport(reason.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for EndpointOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "HTTP {status}"),
+            Self::Empty => f.write_str("empty"),
+            Self::Transport(msg) => write!(f, "transport: {}", sanitize_body(msg)),
+        }
+    }
+}
+
+/// One endpoint's contribution to a failed slug → URN resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionAttempt {
+    /// Short endpoint label, e.g. `identity/miniprofiles`.
+    pub endpoint: &'static str,
+    /// What that endpoint reported.
+    pub outcome: EndpointOutcome,
+}
+
+impl ResolutionAttempt {
+    /// Build an attempt record from an endpoint label and its error.
+    pub fn from_error(endpoint: &'static str, err: &Error) -> Self {
+        Self {
+            endpoint,
+            outcome: EndpointOutcome::from_error(err),
+        }
+    }
+}
+
+impl fmt::Display for ResolutionAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}={}", self.endpoint, self.outcome)
+    }
+}
+
+/// Display wrapper that renders the attempt list as a comma-separated run.
+struct AttemptsDisplay<'a>(&'a [ResolutionAttempt]);
+
+impl fmt::Display for AttemptsDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, attempt) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{attempt}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Display wrapper that sanitizes the body when an `Error::Api` is rendered.
@@ -404,6 +548,69 @@ mod tests {
         assert!(rendered.starts_with("Auth error:"));
         assert!(!rendered.contains("alice@example.com"), "got: {rendered}");
         assert!(rendered.contains("[email]"), "got: {rendered}");
+    }
+
+    #[test]
+    fn profile_resolution_display_names_reason_and_attempts() {
+        let err = Error::ProfileResolution {
+            public_id: "eric-vyacheslav".to_string(),
+            reason: ProfileResolutionFailure::RateLimited,
+            attempts: vec![
+                ResolutionAttempt {
+                    endpoint: "identity/miniprofiles",
+                    outcome: EndpointOutcome::Status(429),
+                },
+                ResolutionAttempt {
+                    endpoint: "graphql:ProfilesByMemberIdentity",
+                    outcome: EndpointOutcome::Empty,
+                },
+            ],
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("eric-vyacheslav"), "got: {rendered}");
+        assert!(rendered.contains("rate limited"), "got: {rendered}");
+        assert!(
+            rendered.contains("identity/miniprofiles=HTTP 429"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("graphql:ProfilesByMemberIdentity=empty"),
+            "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn profile_resolution_reasons_carry_distinct_recoveries() {
+        // The whole point of the variant: three failures, three different
+        // things the caller should do next.
+        let rendered: Vec<String> = [
+            ProfileResolutionFailure::RateLimited,
+            ProfileResolutionFailure::SelfSlugUnsupported,
+            ProfileResolutionFailure::NotFound,
+            ProfileResolutionFailure::Inconclusive,
+        ]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+        for text in &rendered {
+            assert!(text.contains("Recovery:"), "missing recovery: {text}");
+        }
+        assert!(rendered[0].contains("back off"));
+        assert!(rendered[1].contains("never succeed"));
+        assert!(rendered[2].contains("spelling"));
+        // All four messages must be distinguishable from each other.
+        let unique: std::collections::HashSet<&String> = rendered.iter().collect();
+        assert_eq!(unique.len(), rendered.len());
+    }
+
+    #[test]
+    fn transport_outcome_display_is_sanitized() {
+        let outcome = EndpointOutcome::Transport(
+            "error sending request for urn:li:fsd_profile:ACoAAAJqB-cBb1234".to_string(),
+        );
+        let rendered = outcome.to_string();
+        assert!(!rendered.contains("ACoAAAJqB-cBb1234"), "got: {rendered}");
+        assert!(rendered.contains("[…]"), "got: {rendered}");
     }
 
     #[test]
