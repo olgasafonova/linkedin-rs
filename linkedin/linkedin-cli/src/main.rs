@@ -11,6 +11,7 @@ mod graphql_print;
 mod messages;
 mod notifications;
 mod profile;
+mod profile_posts;
 mod search;
 mod session;
 mod spam;
@@ -40,9 +41,9 @@ use messages::{
 };
 use notifications::{cmd_notifications_list, cmd_notifications_mentions};
 use profile::{
-    cmd_profile_audit, cmd_profile_me, cmd_profile_posts, cmd_profile_view, cmd_profile_viewers,
-    cmd_profile_visit,
+    cmd_profile_audit, cmd_profile_me, cmd_profile_view, cmd_profile_viewers, cmd_profile_visit,
 };
+use profile_posts::cmd_profile_posts;
 use search::{
     cmd_search_invite, cmd_search_jobs, cmd_search_people, cmd_search_posts, cmd_search_react,
     cmd_search_view,
