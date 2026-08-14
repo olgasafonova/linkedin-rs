@@ -69,41 +69,11 @@ impl CliError {
     /// than substring-matched against the formatted message.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
-            CliError::Api(ApiError::Auth(_))
-            | CliError::Api(ApiError::Api { status: 401, .. })
-            | CliError::Session(_) => Some(
-                "Hint: session looks stale. Refresh with: li auth login <li_at_cookie>",
-            ),
-            CliError::Api(ApiError::Api { status: 301, .. }) => Some(
-                "Hint: HTTP 301 from a Voyager endpoint usually means LinkedIn retired it. \
-                 Check re/ docs for the modern path; if the path is still listed there, file an issue.",
-            ),
-            CliError::Api(ApiError::Api { status: 403, .. }) => Some(
-                "Hint: LinkedIn blocked the request. This often means a captcha challenge — \
-                 open the site in a browser and complete any pending verification.",
-            ),
-            CliError::Api(ApiError::Api { status: 429, .. }) => Some(
-                "Hint: rate limited. Wait a few minutes; consider lowering --pacing-ms below 2000 \
-                 only if you've checked your quota.",
-            ),
+            CliError::Api(ApiError::Auth(_)) | CliError::Session(_) => Some(STALE_SESSION_HINT),
             CliError::Api(ApiError::ProfileResolution { reason, .. }) => {
                 Some(resolution_hint(*reason))
             }
-            CliError::Api(ApiError::Api {
-                status: 200, body, ..
-            }) => {
-                if body.contains("Internal error fetching data from downstream")
-                    || body.contains("Failed to get response from server")
-                {
-                    Some(
-                        "Hint: transient GraphQL error. The client already retried up to MAX_RETRIES \
-                         times — if you see this often, LinkedIn's mesh is degraded. \
-                         Try again in a minute.",
-                    )
-                } else {
-                    None
-                }
-            }
+            CliError::Api(ApiError::Api { status, body, .. }) => api_status_hint(*status, body),
             CliError::Input(msg) if msg.contains("out of range") => Some(
                 "Hint: rerun the parent command (e.g. 'li search people \"…\"' or 'li feed list') first \
                  to populate the cache.",
@@ -111,6 +81,40 @@ impl CliError {
             _ => None,
         }
     }
+}
+
+const STALE_SESSION_HINT: &str =
+    "Hint: session looks stale. Refresh with: li auth login <li_at_cookie>";
+
+/// Next step for an `ApiError::Api` response, keyed on the HTTP status.
+fn api_status_hint(status: u16, body: &str) -> Option<&'static str> {
+    match status {
+        401 => Some(STALE_SESSION_HINT),
+        301 => Some(
+            "Hint: HTTP 301 from a Voyager endpoint usually means LinkedIn retired it. \
+             Check re/ docs for the modern path; if the path is still listed there, file an issue.",
+        ),
+        403 => Some(
+            "Hint: LinkedIn blocked the request. This often means a captcha challenge — \
+             open the site in a browser and complete any pending verification.",
+        ),
+        429 => Some(
+            "Hint: rate limited. Wait a few minutes; consider lowering --pacing-ms below 2000 \
+             only if you've checked your quota.",
+        ),
+        200 if is_transient_graphql_error(body) => Some(
+            "Hint: transient GraphQL error. The client already retried up to MAX_RETRIES \
+             times — if you see this often, LinkedIn's mesh is degraded. \
+             Try again in a minute.",
+        ),
+        _ => None,
+    }
+}
+
+/// True when a 200-status GraphQL body carries a known transient mesh error.
+fn is_transient_graphql_error(body: &str) -> bool {
+    body.contains("Internal error fetching data from downstream")
+        || body.contains("Failed to get response from server")
 }
 
 /// Next step for each slug → URN resolution failure.
