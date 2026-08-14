@@ -278,6 +278,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Assert that `update` extracts to exactly this title/url pair.
+    fn assert_extracts_article(update: &serde_json::Value, title: &str, url: &str) {
+        assert_eq!(
+            extract_article_info(update),
+            Some(ArticleInfo {
+                title: title.to_string(),
+                url: url.to_string(),
+            })
+        );
+    }
+
     #[test]
     fn extract_article_info_reads_article_component() {
         let update = json!({
@@ -288,13 +299,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(
-            extract_article_info(&update),
-            Some(ArticleInfo {
-                title: "Headline".to_string(),
-                url: "https://example.com/post".to_string(),
-            })
-        );
+        assert_extracts_article(&update, "Headline", "https://example.com/post");
     }
 
     #[test]
@@ -307,13 +312,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(
-            extract_article_info(&update),
-            Some(ArticleInfo {
-                title: "Open link".to_string(),
-                url: "https://example.com/link".to_string(),
-            })
-        );
+        assert_extracts_article(&update, "Open link", "https://example.com/link");
     }
 
     #[test]
