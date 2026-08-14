@@ -184,39 +184,22 @@ impl LinkedInClient {
     /// failure path settles the verdict — and still resolves the URN when
     /// the slug turns out to be the caller's own.
     pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<ProfileUrn, Error> {
-        if self.slug_is_self(public_id) == Some(true) {
-            if let Ok(urn) = self.my_profile_urn().await {
-                return Ok(ProfileUrn::new(urn.to_string()));
-            }
-            // `/me` failed. Fall through to the endpoint round so the
-            // eventual error still carries per-endpoint outcomes; the
-            // classifier below applies the self-slug verdict to it.
+        // A failed `/me` here falls through to the endpoint round so the
+        // eventual error still carries per-endpoint outcomes; the
+        // classifier below applies the self-slug verdict to it.
+        let known_self = self.slug_is_self(public_id) == Some(true);
+        if let Some(urn) = self.resolve_as_self_if(known_self).await {
+            return Ok(urn);
         }
 
         let mut attempts: Vec<ResolutionAttempt> = Vec::with_capacity(4);
-
-        match self.resolve_via_miniprofile(public_id).await {
-            Ok(urn) => return Ok(ProfileUrn::new(urn)),
-            Err(err) => record_attempt(&mut attempts, ENDPOINT_MINIPROFILE, err)?,
-        }
-        match self.resolve_via_rest_profile(public_id).await {
-            Ok(urn) => return Ok(ProfileUrn::new(urn)),
-            Err(err) => record_attempt(&mut attempts, ENDPOINT_REST_PROFILE, err)?,
-        }
-        match self.resolve_via_graphql(public_id).await {
-            Ok(urn) => return Ok(ProfileUrn::new(urn)),
-            Err(err) => record_attempt(&mut attempts, ENDPOINT_GRAPHQL, err)?,
-        }
-        match self.resolve_profile_urn_via_preload(public_id).await {
-            Ok(urn) => return Ok(urn),
-            Err(err) => record_attempt(&mut attempts, ENDPOINT_PRELOAD, err)?,
+        if let Some(urn) = self.resolve_via_endpoints(public_id, &mut attempts).await? {
+            return Ok(urn);
         }
 
         let slug_is_self = self.settle_self_verdict(public_id).await;
-        if slug_is_self == Some(true) {
-            if let Ok(urn) = self.my_profile_urn().await {
-                return Ok(ProfileUrn::new(urn.to_string()));
-            }
+        if let Some(urn) = self.resolve_as_self_if(slug_is_self == Some(true)).await {
+            return Ok(urn);
         }
         let reason = classify_resolution_failure(&attempts, slug_is_self);
         Err(Error::ProfileResolution {
@@ -224,6 +207,46 @@ impl LinkedInClient {
             reason,
             attempts,
         })
+    }
+
+    /// Resolve the caller's own URN via `/me`, but only when `is_self`
+    /// says the slug is the caller's. `None` on a failed `/me` or a
+    /// non-self slug; the caller decides what a miss means.
+    async fn resolve_as_self_if(&self, is_self: bool) -> Option<ProfileUrn> {
+        if !is_self {
+            return None;
+        }
+        self.my_profile_urn()
+            .await
+            .ok()
+            .map(|urn| ProfileUrn::new(urn.to_string()))
+    }
+
+    /// Try each resolution endpoint in order, recording every failure in
+    /// `attempts`. `Ok(Some)` on the first hit, `Ok(None)` when all four
+    /// missed; an auth error short-circuits via `record_attempt`.
+    async fn resolve_via_endpoints(
+        &self,
+        public_id: &str,
+        attempts: &mut Vec<ResolutionAttempt>,
+    ) -> Result<Option<ProfileUrn>, Error> {
+        match self.resolve_via_miniprofile(public_id).await {
+            Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
+            Err(err) => record_attempt(attempts, ENDPOINT_MINIPROFILE, err)?,
+        }
+        match self.resolve_via_rest_profile(public_id).await {
+            Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
+            Err(err) => record_attempt(attempts, ENDPOINT_REST_PROFILE, err)?,
+        }
+        match self.resolve_via_graphql(public_id).await {
+            Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
+            Err(err) => record_attempt(attempts, ENDPOINT_GRAPHQL, err)?,
+        }
+        match self.resolve_profile_urn_via_preload(public_id).await {
+            Ok(urn) => return Ok(Some(urn)),
+            Err(err) => record_attempt(attempts, ENDPOINT_PRELOAD, err)?,
+        }
+        Ok(None)
     }
 
     /// Settle the self-slug verdict after every endpoint has failed.
