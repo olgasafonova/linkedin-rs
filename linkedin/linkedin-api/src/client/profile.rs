@@ -17,6 +17,25 @@ const ENDPOINT_REST_PROFILE: &str = "identity/profiles";
 const ENDPOINT_GRAPHQL: &str = "graphql:ProfilesByMemberIdentity";
 const ENDPOINT_PRELOAD: &str = "preload/custom-invite";
 
+/// A member's vanity URL slug (the `public_id` in profile URLs), typed so
+/// the resolver plumbing can't confuse it with a URN or an endpoint label —
+/// both of which travel as strings through the same functions. Public API
+/// entry points still accept `&str` and wrap at the boundary.
+#[derive(Clone, Copy)]
+struct Slug<'a>(&'a str);
+
+impl Slug<'_> {
+    fn as_str(&self) -> &str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Slug<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl LinkedInClient {
     /// Fetch a user's full profile by public identifier (vanity URL slug).
     pub async fn get_profile(&self, public_id: &str) -> Result<Value, Error> {
@@ -143,9 +162,9 @@ impl LinkedInClient {
     /// `Some(true)` / `Some(false)` when the user's own slug is known,
     /// `None` when it isn't. The distinction matters: the classifier must
     /// not read "unknown" as "not a self-slug".
-    fn slug_is_self(&self, public_id: &str) -> Option<bool> {
+    fn slug_is_self(&self, slug: Slug<'_>) -> Option<bool> {
         self.known_self_public_id()
-            .map(|me| me.eq_ignore_ascii_case(public_id))
+            .map(|me| me.eq_ignore_ascii_case(slug.as_str()))
     }
 
     /// Opportunistically cache the self slug off a `/me` response.
@@ -184,20 +203,21 @@ impl LinkedInClient {
     /// failure path settles the verdict — and still resolves the URN when
     /// the slug turns out to be the caller's own.
     pub async fn resolve_profile_urn(&self, public_id: &str) -> Result<ProfileUrn, Error> {
+        let slug = Slug(public_id);
         // A failed `/me` here falls through to the endpoint round so the
         // eventual error still carries per-endpoint outcomes; the
         // classifier below applies the self-slug verdict to it.
-        let known_self = self.slug_is_self(public_id) == Some(true);
+        let known_self = self.slug_is_self(slug) == Some(true);
         if let Some(urn) = self.resolve_as_self_if(known_self).await {
             return Ok(urn);
         }
 
         let mut attempts: Vec<ResolutionAttempt> = Vec::with_capacity(4);
-        if let Some(urn) = self.resolve_via_endpoints(public_id, &mut attempts).await? {
+        if let Some(urn) = self.resolve_via_endpoints(slug, &mut attempts).await? {
             return Ok(urn);
         }
 
-        let slug_is_self = self.settle_self_verdict(public_id).await;
+        let slug_is_self = self.settle_self_verdict(slug).await;
         if let Some(urn) = self.resolve_as_self_if(slug_is_self == Some(true)).await {
             return Ok(urn);
         }
@@ -227,22 +247,22 @@ impl LinkedInClient {
     /// missed; an auth error short-circuits via `record_attempt`.
     async fn resolve_via_endpoints(
         &self,
-        public_id: &str,
+        slug: Slug<'_>,
         attempts: &mut Vec<ResolutionAttempt>,
     ) -> Result<Option<ProfileUrn>, Error> {
-        match self.resolve_via_miniprofile(public_id).await {
+        match self.resolve_via_miniprofile(slug).await {
             Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
             Err(err) => record_attempt(attempts, ENDPOINT_MINIPROFILE, err)?,
         }
-        match self.resolve_via_rest_profile(public_id).await {
+        match self.resolve_via_rest_profile(slug).await {
             Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
             Err(err) => record_attempt(attempts, ENDPOINT_REST_PROFILE, err)?,
         }
-        match self.resolve_via_graphql(public_id).await {
+        match self.resolve_via_graphql(slug).await {
             Ok(urn) => return Ok(Some(ProfileUrn::new(urn))),
             Err(err) => record_attempt(attempts, ENDPOINT_GRAPHQL, err)?,
         }
-        match self.resolve_profile_urn_via_preload(public_id).await {
+        match self.resolve_profile_urn_via_preload(slug.as_str()).await {
             Ok(urn) => return Ok(Some(urn)),
             Err(err) => record_attempt(attempts, ENDPOINT_PRELOAD, err)?,
         }
@@ -256,23 +276,20 @@ impl LinkedInClient {
     /// the failure into a successful resolve, and a mismatch upgrades an
     /// "inconclusive" verdict to an honest one. A failed `/me` leaves the
     /// verdict unknown (`None`), never a false `Some(false)`.
-    async fn settle_self_verdict(&self, public_id: &str) -> Option<bool> {
-        if let Some(known) = self.slug_is_self(public_id) {
+    async fn settle_self_verdict(&self, slug: Slug<'_>) -> Option<bool> {
+        if let Some(known) = self.slug_is_self(slug) {
             return Some(known);
         }
         // `my_profile_urn` caches the self slug off the same `/me` response,
         // so one request answers both the verdict and (on a match) the URN.
         match self.my_profile_urn().await {
-            Ok(_) => self.slug_is_self(public_id),
+            Ok(_) => self.slug_is_self(slug),
             Err(_) => None,
         }
     }
 
-    async fn resolve_via_miniprofile(&self, public_id: &str) -> Result<String, Error> {
-        let path = format!(
-            "identity/miniprofiles?q=memberIdentity&memberIdentity={}",
-            public_id
-        );
+    async fn resolve_via_miniprofile(&self, slug: Slug<'_>) -> Result<String, Error> {
+        let path = format!("identity/miniprofiles?q=memberIdentity&memberIdentity={slug}");
         let resp = self.get(&path).await?;
         resp.get("elements")
             .and_then(|e| e.as_array())
@@ -280,11 +297,11 @@ impl LinkedInClient {
             .and_then(|mp| mp.get("dashEntityUrn").or(mp.get("entityUrn")))
             .and_then(|v| v.as_str())
             .map(coerce_to_fsd_profile)
-            .ok_or_else(|| no_urn_in_payload(ENDPOINT_MINIPROFILE, public_id))
+            .ok_or_else(|| no_urn_in_payload(ENDPOINT_MINIPROFILE, slug))
     }
 
-    async fn resolve_via_rest_profile(&self, public_id: &str) -> Result<String, Error> {
-        let path = format!("identity/profiles/{}", public_id);
+    async fn resolve_via_rest_profile(&self, slug: Slug<'_>) -> Result<String, Error> {
+        let path = format!("identity/profiles/{slug}");
         let resp = self.get(&path).await?;
         if let Some(urn) = resp
             .get("miniProfile")
@@ -296,18 +313,18 @@ impl LinkedInClient {
         resp.get("entityUrn")
             .and_then(|v| v.as_str())
             .map(coerce_to_fsd_profile)
-            .ok_or_else(|| no_urn_in_payload(ENDPOINT_REST_PROFILE, public_id))
+            .ok_or_else(|| no_urn_in_payload(ENDPOINT_REST_PROFILE, slug))
     }
 
     /// Resolve a slug via the GraphQL profile query, returning the
     /// `entityUrn` of the first matching profile.
-    async fn resolve_via_graphql(&self, public_id: &str) -> Result<String, Error> {
-        let profile = self.get_profile(public_id).await?;
+    async fn resolve_via_graphql(&self, slug: Slug<'_>) -> Result<String, Error> {
+        let profile = self.get_profile(slug.as_str()).await?;
         profile
             .get("entityUrn")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .ok_or_else(|| no_urn_in_payload(ENDPOINT_GRAPHQL, public_id))
+            .ok_or_else(|| no_urn_in_payload(ENDPOINT_GRAPHQL, slug))
     }
 
     /// Resolve a slug → fsd_profile URN by scraping the
@@ -346,9 +363,9 @@ impl LinkedInClient {
         // HTTP one: the request succeeded and the page simply carried no
         // URN. The crate-wide convention is that 0 means "we made this up",
         // and `EndpointOutcome::from_error` reads it as an empty answer.
-        extract_profile_urn_from_preload_html(&html, public_id)
+        extract_profile_urn_from_preload_html(&html, Slug(public_id))
             .map(ProfileUrn::new)
-            .ok_or_else(|| no_urn_in_payload(ENDPOINT_PRELOAD, public_id))
+            .ok_or_else(|| no_urn_in_payload(ENDPOINT_PRELOAD, Slug(public_id)))
     }
 }
 
@@ -370,10 +387,10 @@ fn record_attempt(
 }
 
 /// Synthesised "the endpoint answered but carried no URN" error.
-fn no_urn_in_payload(endpoint: &str, public_id: &str) -> Error {
+fn no_urn_in_payload(endpoint: &str, slug: Slug<'_>) -> Error {
     Error::Api {
         status: 0,
-        body: format!("{endpoint} returned no profile URN for '{public_id}'"),
+        body: format!("{endpoint} returned no profile URN for '{slug}'"),
         correlation_id: None,
     }
 }
@@ -453,7 +470,7 @@ fn coerce_to_fsd_profile(urn: &str) -> String {
 /// characters appear as `&quot;`. The viewer's URN appears earlier in the
 /// document, so we anchor on the slug and look 500 bytes back for the
 /// nearest preceding `entityUrn` value.
-fn extract_profile_urn_from_preload_html(html: &str, slug: &str) -> Option<String> {
+fn extract_profile_urn_from_preload_html(html: &str, slug: Slug<'_>) -> Option<String> {
     let slug_marker = format!("publicIdentifier&quot;:&quot;{}&quot;", slug);
     let slug_pos = html.find(&slug_marker)?;
     let window_start = slug_pos.saturating_sub(500);
@@ -494,21 +511,21 @@ mod tests {
         }}
         </code>"#;
 
-        let urn = extract_profile_urn_from_preload_html(html, "target-user").unwrap();
+        let urn = extract_profile_urn_from_preload_html(html, Slug("target-user")).unwrap();
         assert_eq!(urn, "urn:li:fsd_profile:ACoAAA222TARGET");
     }
 
     #[test]
     fn preload_extractor_picks_correct_urn_when_viewer_listed_first() {
         let html = r#"&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:VIEWER&quot;,&quot;publicIdentifier&quot;:&quot;me&quot;,...later...&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:TARGET&quot;,&quot;publicIdentifier&quot;:&quot;target-slug&quot;"#;
-        let urn = extract_profile_urn_from_preload_html(html, "target-slug").unwrap();
+        let urn = extract_profile_urn_from_preload_html(html, Slug("target-slug")).unwrap();
         assert_eq!(urn, "urn:li:fsd_profile:TARGET");
     }
 
     #[test]
     fn preload_extractor_returns_none_when_slug_absent() {
         let html = r#"&quot;publicIdentifier&quot;:&quot;someone-else&quot;"#;
-        assert!(extract_profile_urn_from_preload_html(html, "missing").is_none());
+        assert!(extract_profile_urn_from_preload_html(html, Slug("missing")).is_none());
     }
 
     // ----- resolution failure classification -----
@@ -621,7 +638,7 @@ mod tests {
 
     #[test]
     fn synthesised_empty_error_maps_to_empty_outcome() {
-        let err = no_urn_in_payload(ENDPOINT_GRAPHQL, "someone");
+        let err = no_urn_in_payload(ENDPOINT_GRAPHQL, Slug("someone"));
         assert_eq!(EndpointOutcome::from_error(&err), EndpointOutcome::Empty);
     }
 
@@ -693,7 +710,7 @@ mod tests {
     #[test]
     fn slug_is_self_is_unknown_until_seeded() {
         let client = LinkedInClient::new().expect("client creation must succeed");
-        assert_eq!(client.slug_is_self("olgasafonova"), None);
+        assert_eq!(client.slug_is_self(Slug("olgasafonova")), None);
         assert!(client.known_self_public_id().is_none());
     }
 
@@ -701,8 +718,8 @@ mod tests {
     fn slug_is_self_matches_case_insensitively_once_seeded() {
         let client = LinkedInClient::new().expect("client creation must succeed");
         assert!(client.set_self_public_id("olgasafonova"));
-        assert_eq!(client.slug_is_self("OlgaSafonova"), Some(true));
-        assert_eq!(client.slug_is_self("eric-vyacheslav"), Some(false));
+        assert_eq!(client.slug_is_self(Slug("OlgaSafonova")), Some(true));
+        assert_eq!(client.slug_is_self(Slug("eric-vyacheslav")), Some(false));
     }
 
     #[test]
@@ -720,6 +737,6 @@ mod tests {
             "&quot;entityUrn&quot;:&quot;urn:li:fsd_profile:TARGET&quot; {} &quot;publicIdentifier&quot;:&quot;jomar&quot;",
             big_padding
         );
-        assert!(extract_profile_urn_from_preload_html(&html, "jomar").is_none());
+        assert!(extract_profile_urn_from_preload_html(&html, Slug("jomar")).is_none());
     }
 }
