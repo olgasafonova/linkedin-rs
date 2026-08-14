@@ -69,7 +69,7 @@ impl LinkedInClient {
     ) -> Result<Value, Error> {
         let conv_data = self.get_conversations(20, None).await?;
         let my_urn = self.my_profile_urn().await?;
-        let thread_id = strip_messaging_thread_prefix(conversation_id.as_str());
+        let thread_id = ThreadId::parse(conversation_id.as_str());
 
         let elements = conv_data
             .get("elements")
@@ -79,7 +79,7 @@ impl LinkedInClient {
         let conversation = elements.iter().find(|conv| {
             conv.get("backendUrn")
                 .and_then(|u| u.as_str())
-                .map(strip_messaging_thread_prefix)
+                .map(ThreadId::parse)
                 == Some(thread_id)
         });
 
@@ -125,7 +125,7 @@ impl LinkedInClient {
         let full_urn = if raw.starts_with("urn:li:msg_conversation:") {
             raw.to_string()
         } else {
-            let thread_id = strip_messaging_thread_prefix(raw);
+            let thread_id = ThreadId::parse(raw);
             let profile_urn = self.my_profile_urn().await?;
             format!("urn:li:msg_conversation:({},{})", profile_urn, thread_id)
         };
@@ -145,10 +145,24 @@ impl LinkedInClient {
     }
 }
 
-/// Strip the `urn:li:messagingThread:` prefix if present, returning the bare
-/// thread id (e.g. `2-abc123`). Idempotent: bare ids pass through unchanged.
-fn strip_messaging_thread_prefix(urn: &str) -> &str {
-    urn.strip_prefix("urn:li:messagingThread:").unwrap_or(urn)
+/// A bare messaging thread id (e.g. `2-abc123`), typed so it can't be
+/// confused with the `urn:li:messagingThread:`-prefixed URN form of the
+/// same identifier — the shape mix-up behind the InMail misroute bug.
+#[derive(Clone, Copy, PartialEq)]
+struct ThreadId<'a>(&'a str);
+
+impl<'a> ThreadId<'a> {
+    /// Parse from either a bare id or a full `messagingThread` URN.
+    /// Idempotent: bare ids pass through unchanged.
+    fn parse(urn: &'a str) -> Self {
+        Self(urn.strip_prefix("urn:li:messagingThread:").unwrap_or(urn))
+    }
+}
+
+impl std::fmt::Display for ThreadId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// Build a synthesized (non-HTTP) API error with status 0.
@@ -189,17 +203,17 @@ fn is_inmail_conversation(conv: &Value) -> bool {
 /// while the HTTP call still returns 200 — a success receipt that lies.
 /// A missing URN in the response is not treated as a failure; only a
 /// present-and-different one is.
-fn verify_reply_landed_in_thread(response: &Value, requested_thread_id: &str) -> Result<(), Error> {
+fn verify_reply_landed_in_thread(response: &Value, requested: ThreadId<'_>) -> Result<(), Error> {
     let landed = response
         .pointer("/value/backendConversationUrn")
         .and_then(|u| u.as_str())
-        .map(strip_messaging_thread_prefix);
+        .map(ThreadId::parse);
     match landed {
-        Some(actual) if actual != requested_thread_id => Err(synthesized_error(format!(
+        Some(actual) if actual != requested => Err(synthesized_error(format!(
             "message was SENT but landed in a different conversation \
              ('{}' instead of '{}'): LinkedIn created a new thread rather \
              than replying. This happens on InMail threads.",
-            actual, requested_thread_id
+            actual, requested
         ))),
         _ => Ok(()),
     }
@@ -303,12 +317,12 @@ mod tests {
         let resp = json!({"value": {
             "backendConversationUrn": "urn:li:messagingThread:2-abc123"
         }});
-        assert!(verify_reply_landed_in_thread(&resp, "2-abc123").is_ok());
+        assert!(verify_reply_landed_in_thread(&resp, ThreadId("2-abc123")).is_ok());
     }
 
     #[test]
     fn reply_verification_tolerates_missing_urn() {
-        assert!(verify_reply_landed_in_thread(&json!({}), "2-abc123").is_ok());
+        assert!(verify_reply_landed_in_thread(&json!({}), ThreadId("2-abc123")).is_ok());
     }
 
     #[test]
@@ -316,7 +330,7 @@ mod tests {
         let resp = json!({"value": {
             "backendConversationUrn": "urn:li:messagingThread:2-NEW"
         }});
-        let err = verify_reply_landed_in_thread(&resp, "2-abc123").unwrap_err();
+        let err = verify_reply_landed_in_thread(&resp, ThreadId("2-abc123")).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SENT"),
