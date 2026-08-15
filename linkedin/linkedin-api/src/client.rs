@@ -22,8 +22,11 @@ mod feed;
 mod internal;
 mod messaging;
 mod notifications;
+mod options;
 mod profile;
 mod search;
+
+pub use options::ClientOptions;
 
 use internal::{check_graphql_errors, check_response};
 
@@ -103,6 +106,9 @@ pub struct LinkedInClient {
 
     /// Minimum interval between requests (milliseconds).
     min_request_interval: Duration,
+
+    /// Runtime options (proxy URL, etc.) this client was built with.
+    options: ClientOptions,
 }
 
 impl LinkedInClient {
@@ -111,12 +117,26 @@ impl LinkedInClient {
     pub fn new() -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
         let jsessionid = generate_jsessionid();
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
     }
 
     /// Create a client with a specific device ID and JSESSIONID.
     pub fn with_identity(device_id: String, jsessionid: String) -> Result<Self, Error> {
-        Self::build(&device_id, &jsessionid, None)
+        Self::build(&device_id, &jsessionid, None, ClientOptions::from_env())
+    }
+
+    /// Create a client with explicit runtime options, generating a fresh
+    /// device identity and CSRF token. Preferred over reading proxy config
+    /// from the environment when the caller wants to control it directly.
+    pub fn with_options(options: ClientOptions) -> Result<Self, Error> {
+        let device_id = uuid::Uuid::new_v4().to_string();
+        let jsessionid = generate_jsessionid();
+        Self::build(&device_id, &jsessionid, None, options)
+    }
+
+    /// Runtime options this client was constructed with.
+    pub fn options(&self) -> &ClientOptions {
+        &self.options
     }
 
     /// Create a client from a persisted [`Session`].
@@ -125,7 +145,12 @@ impl LinkedInClient {
     /// so a self-slug is recognisable without a `/me` round trip.
     pub fn with_session(session: &Session) -> Result<Self, Error> {
         let device_id = uuid::Uuid::new_v4().to_string();
-        let client = Self::build(&device_id, &session.jsessionid, Some(&session.li_at))?;
+        let client = Self::build(
+            &device_id,
+            &session.jsessionid,
+            Some(&session.li_at),
+            ClientOptions::from_env(),
+        )?;
         if let Some(public_id) = session.self_public_id.as_deref() {
             client.set_self_public_id(public_id);
         }
@@ -143,7 +168,7 @@ impl LinkedInClient {
             .unwrap_or_else(generate_jsessionid);
 
         let li_at = cookies.get("li_at").map(|s| s.as_str());
-        let client = Self::build(&device_id, &jsessionid, li_at)?;
+        let client = Self::build(&device_id, &jsessionid, li_at, ClientOptions::from_env())?;
 
         let base_url: url::Url = BASE_URL.parse().unwrap();
         for (name, value) in cookies {
@@ -171,7 +196,12 @@ impl LinkedInClient {
     }
 
     /// Shared client construction logic.
-    fn build(device_id: &str, jsessionid: &str, li_at: Option<&str>) -> Result<Self, Error> {
+    fn build(
+        device_id: &str,
+        jsessionid: &str,
+        li_at: Option<&str>,
+        options: ClientOptions,
+    ) -> Result<Self, Error> {
         let x_li_track = build_x_li_track(device_id);
         let default_headers = build_default_headers(device_id, &x_li_track)?;
 
@@ -197,10 +227,15 @@ impl LinkedInClient {
             );
         }
 
-        let http = reqwest::Client::builder()
+        let mut http_builder = reqwest::Client::builder()
             .cookie_provider(jar.clone())
-            .default_headers(default_headers)
-            .build()?;
+            .default_headers(default_headers);
+        if let Some(proxy_url) = options.proxy_url.as_deref() {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| Error::Auth(format!("invalid proxy URL '{proxy_url}': {e}")))?;
+            http_builder = http_builder.proxy(proxy);
+        }
+        let http = http_builder.build()?;
 
         Ok(Self {
             cookie_jar: jar,
@@ -212,6 +247,7 @@ impl LinkedInClient {
             self_public_id: OnceCell::new(),
             last_request: Mutex::new(Instant::now() - Duration::from_secs(10)),
             min_request_interval: Duration::from_millis(DEFAULT_MIN_REQUEST_INTERVAL_MS),
+            options,
         })
     }
 
