@@ -31,13 +31,13 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | `feed comment <urn> <text>` | Comment on a feed post |
 | `feed my-posts` | List your own posts with engagement analytics |
 | `feed reactions <urn>` | Show who reacted to a post (names, headlines, reaction types) |
-| `feed stats` | Aggregate engagement stats across your recent posts |
+| `feed stats` | Aggregate engagement across your recent posts: totals, per-post averages, and engagement rate (interactions ÷ views) |
 | `feed post <text>` | Create a new text post (public or connections-only) |
 | **Messages** | |
-| `messages list` | List conversations (cursor-based pagination) |
+| `messages list` | List conversations from the primary or spam inbox (`--category primary\|spam`); cursor-based pagination |
 | `messages read <id>` | Read messages in a conversation (cursor-paginated via `--before`; no `--count`) |
 | `messages send <recipient> <text>` | Send a message to a connection (new conversation) |
-| `messages reply <id> <text>` | Reply to an existing conversation thread |
+| `messages reply <id> <text>` | Reply to an existing conversation thread (stays in-thread for InMail/recruiter threads too) |
 | **Connections** | |
 | `connections list` | List your connections (paginated) |
 | `connections invite <id>` | Send a connection request with optional message |
@@ -125,6 +125,25 @@ li auth status
 
 The session is stored locally at `~/.config/linkedin-cli/session.json`.
 
+### Routing through a proxy
+
+Set a proxy URL to route API requests through an HTTP(S)/SOCKS proxy (useful for
+inspecting traffic or egress control). The client checks `LINKEDIN_PROXY_URL`
+first, then `HTTPS_PROXY`, then `HTTP_PROXY`; a blank value counts as unset.
+
+```bash
+LINKEDIN_PROXY_URL="http://127.0.0.1:8888" li messages list
+```
+
+Library callers can pass this explicitly instead of via the environment:
+
+```rust
+use linkedin_api::client::{ClientOptions, LinkedInClient};
+let client = LinkedInClient::with_options(ClientOptions {
+    proxy_url: Some("http://127.0.0.1:8888".into()),
+})?;
+```
+
 ## Usage
 
 ### Profile
@@ -208,13 +227,18 @@ li feed post "Only for my network" --visibility CONNECTIONS_ONLY --yes
 # List conversations
 li messages list --count 20
 
+# List the spam / filtered inbox instead of the primary one
+li messages list --category spam
+
 # Read a conversation
 li messages read 2-abc123
 
 # Send a message (new conversation)
 li messages send john-doe-123 "Hey, wanted to connect about..." --yes
 
-# Reply to an existing conversation
+# Reply to an existing conversation. The reply is pinned to the thread by
+# conversation URN, so it stays in the same thread for InMail/recruiter
+# threads as well as regular ones (rather than forking a new conversation).
 li messages reply 2-abc123 "Thanks for getting back to me" --yes
 ```
 
