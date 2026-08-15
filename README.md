@@ -22,7 +22,7 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | `profile audit` | Audit your profile for staleness and missing sections |
 | `profile posts <id>` | List recent posts by a member (most-recent first); `--with-first-comment` also surfaces URLs from the post author's own first comment (LinkedIn's link-in-first-comment pattern) |
 | **Feed** | |
-| `feed list` | List feed updates (paginated) |
+| `feed list` | List feed updates (paginated); filter with `--author` or `--keyword` |
 | `feed read <n>` | Show full post details for item N from the last `feed list` |
 | `feed view <urn>` | Display a post by activity URN; scans your top-50 feed first and falls back to LinkedIn's `highlightedFeed` finder for out-of-window posts |
 | `feed comments <n>` | Show comments on post N from the last `feed list` |
@@ -39,7 +39,7 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | `messages send <recipient> <text>` | Send a message to a connection (new conversation) |
 | `messages reply <id> <text>` | Reply to an existing conversation thread (stays in-thread for InMail/recruiter threads too) |
 | **Connections** | |
-| `connections list` | List your connections (paginated) |
+| `connections list` | List your connections (paginated); `--all` to fetch every one, `--keyword` to filter |
 | `connections invite <id>` | Send a connection request with optional message |
 | `connections invite-batch --from-file <path>` | Send invitations to multiple members from a list (file or stdin) |
 | `connections invitations` | List pending received invitations |
@@ -119,8 +119,11 @@ li auth login --li-at "AQEDAQx..."
 export LINKEDIN_LI_AT="AQEDAQx..."
 li auth login
 
-# Verify the session works
+# Verify the session works (makes a live API call)
 li auth status
+
+# Check only the local session file, without an API call
+li auth status --local
 ```
 
 The session is stored locally at `~/.config/linkedin-cli/session.json`.
@@ -155,6 +158,9 @@ li profile me
 # View someone's profile
 li profile view john-doe-123
 
+# Compact summary instead of the full ~150KB profile dump (good for scripting)
+li profile view john-doe-123 --summary
+
 # Visit a profile (shows up in "who viewed")
 li profile visit john-doe-123
 
@@ -178,6 +184,11 @@ li profile posts john-doe-123 --count 20 --with-first-comment --json
 ```bash
 # List recent feed items
 li feed list --count 20
+
+# Filter the feed by author or by keyword in the post text
+# (both case-insensitive substring matches)
+li feed list --count 40 --author "jane doe"
+li feed list --count 40 --keyword "rust"
 
 # Read full details of post #3 from the last feed list
 li feed read 3
@@ -248,6 +259,11 @@ li messages reply 2-abc123 "Thanks for getting back to me" --yes
 # List connections
 li connections list --count 50
 
+# Fetch every connection (auto-paginates with throttling), or filter by
+# name/headline substring
+li connections list --all
+li connections list --keyword "product"
+
 # Send a connection request
 li connections invite john-doe-123
 li connections invite john-doe-123 --message "Met you at the conference"
@@ -255,6 +271,8 @@ li connections invite john-doe-123 --message "Met you at the conference"
 # Batch invitations from a file (one public ID or fsd_profile URN per line;
 # also accepts stdin via --from-file -)
 li connections invite-batch --from-file invites.txt --message "Hi from the meetup"
+# Tune the throttle (default 2000ms between calls) or halt on the first failure
+li connections invite-batch --from-file invites.txt --pacing-ms 3000 --stop-on-error
 
 # List pending received invitations
 li connections invitations
