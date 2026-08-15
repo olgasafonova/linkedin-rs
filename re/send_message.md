@@ -109,3 +109,45 @@ Without this field, or with a UUID/string value, the server returns `{"status": 
 | 400 | Missing `trackingId`, or `trackingId` is a UUID string instead of raw bytes |
 | 403 | Wrong endpoint (e.g., `action=create`), or CSRF token mismatch |
 | 200 | Success |
+
+## Reply to an existing thread (incl. InMail)
+
+Same endpoint (`action=createMessage`), but a reply is addressed by
+**conversation URN**, not recipient set. Captured live 15-08-2026 from a web
+reply to an InMail thread (raw capture in `secrets/inmail_reply_capture.md`).
+
+### Reply payload
+
+```json
+{
+  "message": {
+    "body": { "attributes": [], "text": "..." },
+    "renderContentUnions": [],
+    "conversationUrn": "urn:li:msg_conversation:(urn:li:fsd_profile:<SELF>,<THREAD_ID>)",
+    "originToken": "<uuid v4>"
+  },
+  "mailboxUrn": "urn:li:fsd_profile:<SELF>",
+  "trackingId": "<16 raw bytes as chars>",
+  "dedupeByClientGeneratedToken": false
+}
+```
+
+### Difference from a new message
+
+| | New message | Reply |
+|---|---|---|
+| Addressing | `hostRecipientUrns: [profileUrn]` | `message.conversationUrn` |
+| Other field | no `conversationUrn` | no `hostRecipientUrns` |
+
+Sending a reply with `hostRecipientUrns` (recipient-set routing) works for
+regular member-to-member threads but **forks InMail threads into a new
+conversation** — the bug behind linkedin-rs-gey. `message.conversationUrn`
+pins the thread for both types.
+
+The conversation URN is `urn:li:msg_conversation:(<own fsd_profile urn>,<bare
+thread id>)` — the same shape `get_conversation_events` already builds.
+
+Note: this reply shape is validated from **web** traffic. The Rust client sends
+the identical payload to the same endpoint with the same auth, and
+`verify_reply_landed_in_thread` guards against a misroute, but a CLI-originated
+reply to an InMail thread has not been round-tripped live.

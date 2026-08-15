@@ -92,7 +92,11 @@ impl LinkedInClient {
     ) -> Result<Value, Error> {
         let my_urn = self.my_profile_urn().await?;
         let recipients = vec![recipient_profile_urn.as_str().to_string()];
-        let payload = build_create_message_payload(my_urn, &recipients, message_body);
+        let payload = build_create_message_payload(
+            my_urn,
+            message_body,
+            MessageTarget::NewConversation(&recipients),
+        );
 
         self.post(
             "voyagerMessagingDashMessengerMessages?action=createMessage",
@@ -101,57 +105,36 @@ impl LinkedInClient {
         .await
     }
 
-    /// Reply to an existing messaging conversation by sending to the same
-    /// participants. LinkedIn routes to the existing thread when the
-    /// recipient set matches — but only for regular member-to-member
-    /// threads. InMail/recruiter threads are a different thread type and
-    /// the recipient-set heuristic silently creates a NEW conversation
-    /// (observed live 14-08-2026), so those are rejected up front. As a
-    /// second line of defence, the response's conversation URN is checked
-    /// against the requested thread and a mismatch is reported as an
-    /// error rather than a false success.
+    /// Reply to an existing messaging conversation, pinning the reply to that
+    /// exact thread with a `conversationUrn` in the payload.
+    ///
+    /// The earlier implementation sent `hostRecipientUrns` and relied on
+    /// LinkedIn routing by recipient set, which silently forked InMail threads
+    /// into a new conversation (observed live 14-08-2026). Capturing a live
+    /// web reply to an InMail thread (15-08-2026, `secrets/inmail_reply_capture.md`)
+    /// showed the web sends `message.conversationUrn` —
+    /// `urn:li:msg_conversation:(<mailbox>,<threadId>)` — and no
+    /// `hostRecipientUrns` at all. That URN pins the thread for InMail and
+    /// regular conversations alike, so no per-type branching is needed and no
+    /// conversation lookup is required to find recipients.
+    ///
+    /// `verify_reply_landed_in_thread` stays as a safety net: if a future API
+    /// change ever misroutes the reply, the mismatch is reported as an error
+    /// instead of a false success.
     pub async fn reply_to_conversation(
         &self,
         conversation_id: &ConversationUrn,
         message_body: &str,
     ) -> Result<Value, Error> {
-        let conv_data = self.get_conversations(20, None).await?;
         let my_urn = self.my_profile_urn().await?;
         let thread_id = ThreadId::parse(conversation_id.as_str());
+        let conversation_urn = format!("urn:li:msg_conversation:({},{})", my_urn, thread_id);
 
-        let elements = conv_data
-            .get("elements")
-            .and_then(|e| e.as_array())
-            .ok_or_else(|| synthesized_error("no conversations found".to_string()))?;
-
-        let conversation = elements.iter().find(|conv| {
-            conv.get("backendUrn")
-                .and_then(|u| u.as_str())
-                .map(ThreadId::parse)
-                == Some(thread_id)
-        });
-
-        if conversation.is_some_and(is_inmail_conversation) {
-            return Err(synthesized_error(format!(
-                "conversation '{}' is an InMail thread; replying via createMessage \
-                 would create a new conversation instead of a reply, so it is not \
-                 supported. Reply from the LinkedIn app instead.",
-                conversation_id
-            )));
-        }
-
-        let recipient_urns = conversation
-            .map(|conv| extract_recipient_urns(conv, my_urn))
-            .unwrap_or_default();
-
-        if recipient_urns.is_empty() {
-            return Err(synthesized_error(format!(
-                "could not find conversation '{}' or extract participant URNs",
-                conversation_id
-            )));
-        }
-
-        let payload = build_create_message_payload(my_urn, &recipient_urns, message_body);
+        let payload = build_create_message_payload(
+            my_urn,
+            message_body,
+            MessageTarget::Reply(&conversation_urn),
+        );
         let response = self
             .post(
                 "voyagerMessagingDashMessengerMessages?action=createMessage",
@@ -249,29 +232,6 @@ fn synthesized_error(body: String) -> Error {
     }
 }
 
-/// True when a Dash conversation element is an InMail/recruiter thread.
-///
-/// Primary signal: the conversation's `categories` array contains
-/// `INMAIL` (Dash category enum; see `re/pegasus_models.md` messaging
-/// enums). Fallback: a `conversationTypeText` label mentioning InMail,
-/// which LinkedIn attaches to sponsored/recruiter threads.
-fn is_inmail_conversation(conv: &Value) -> bool {
-    let has_inmail_category = conv
-        .get("categories")
-        .and_then(|c| c.as_array())
-        .is_some_and(|cats| cats.iter().any(|c| c.as_str() == Some("INMAIL")));
-    if has_inmail_category {
-        return true;
-    }
-    conv.get("conversationTypeText")
-        .and_then(|t| {
-            t.get("text")
-                .and_then(|v| v.as_str())
-                .or_else(|| t.as_str())
-        })
-        .is_some_and(|label| label.to_lowercase().contains("inmail"))
-}
-
 /// Check that the `createMessage` response's conversation URN matches the
 /// thread we meant to reply to. LinkedIn routes replies by recipient set,
 /// and when that heuristic fails the message lands in a brand-new thread
@@ -294,68 +254,53 @@ fn verify_reply_landed_in_thread(response: &Value, requested: ThreadId<'_>) -> R
     }
 }
 
-/// Build the JSON payload for the
-/// `voyagerMessagingDashMessengerMessages?action=createMessage` endpoint.
+/// How a createMessage payload is addressed — the only structural difference
+/// between starting a conversation and replying to one.
+enum MessageTarget<'a> {
+    /// A brand-new conversation, addressed by recipient profile URN(s) via
+    /// `hostRecipientUrns`.
+    NewConversation(&'a [String]),
+    /// A reply to an existing thread, pinned by `message.conversationUrn`.
+    /// Captured from a live web InMail reply (15-08-2026,
+    /// `secrets/inmail_reply_capture.md`): the conversation URN keeps the reply
+    /// in the existing thread instead of forking a new one, which
+    /// `hostRecipientUrns`-based routing did for InMail threads.
+    Reply(&'a str),
+}
+
+/// Build the `voyagerMessagingDashMessengerMessages?action=createMessage`
+/// payload. The envelope is identical for new messages and replies; only the
+/// addressing field differs, carried by [`MessageTarget`].
 ///
-/// `recipient_urns` carries one URN for a new message and one or more URNs
-/// for a thread reply; LinkedIn routes to the existing thread when the set
-/// matches.
-///
-/// Captured from live browser traffic via Chrome DevTools MCP. Key
-/// discovery: `trackingId` must be 16 random bytes mapped via `byte as
-/// char`, NOT base64-encoded — unlike `send_connection_request`. Without
-/// this field, or with a UUID/string value, the server returns
-/// `{"status": 400}` with no further detail. See `re/send_message.md`.
-fn build_create_message_payload(
-    my_urn: &str,
-    recipient_urns: &[String],
-    message_body: &str,
-) -> Value {
+/// The `trackingId` must be 16 random bytes mapped via `byte as char`, NOT
+/// base64-encoded — unlike `send_connection_request`. Without it, or with a
+/// UUID/string value, the server returns `{"status": 400}` with no further
+/// detail. See `re/send_message.md`.
+fn build_create_message_payload(my_urn: &str, message_body: &str, target: MessageTarget) -> Value {
     let origin_token = uuid::Uuid::new_v4().to_string();
     let tracking_bytes: [u8; 16] = rand::random();
     let tracking_id: String = tracking_bytes.iter().map(|&b| b as char).collect();
 
-    serde_json::json!({
-        "message": {
-            "body": {
-                "attributes": [],
-                "text": message_body
-            },
-            "originToken": origin_token,
-            "renderContentUnions": []
-        },
+    let mut message = serde_json::json!({
+        "body": { "attributes": [], "text": message_body },
+        "originToken": origin_token,
+        "renderContentUnions": []
+    });
+    let mut payload = serde_json::json!({
         "mailboxUrn": my_urn,
         "trackingId": tracking_id,
-        "dedupeByClientGeneratedToken": false,
-        "hostRecipientUrns": recipient_urns
-    })
-}
-
-/// Extract recipient URNs from a conversation, excluding `my_urn`.
-fn extract_recipient_urns(conv: &Value, my_urn: &str) -> Vec<String> {
-    let Some(participants) = conv
-        .get("conversationParticipants")
-        .and_then(|p| p.as_array())
-    else {
-        return Vec::new();
-    };
-    participants
-        .iter()
-        .filter_map(participant_urn)
-        .filter(|u| *u != my_urn)
-        .map(str::to_string)
-        .collect()
-}
-
-fn participant_urn(p: &Value) -> Option<&str> {
-    if let Some(u) = p.get("hostIdentityUrn").and_then(|u| u.as_str()) {
-        return Some(u);
+        "dedupeByClientGeneratedToken": false
+    });
+    match target {
+        MessageTarget::NewConversation(recipient_urns) => {
+            payload["hostRecipientUrns"] = serde_json::json!(recipient_urns);
+        }
+        MessageTarget::Reply(conversation_urn) => {
+            message["conversationUrn"] = serde_json::json!(conversation_urn);
+        }
     }
-    let member = p.get("participantType").and_then(|pt| pt.get("member"))?;
-    member
-        .get("entityUrn")
-        .or_else(|| member.get("hostIdentityUrn"))
-        .and_then(|u| u.as_str())
+    payload["message"] = message;
+    payload
 }
 
 #[cfg(test)]
@@ -409,27 +354,35 @@ mod tests {
     }
 
     #[test]
-    fn inmail_detected_via_categories() {
-        let conv = json!({"categories": ["INBOX", "INMAIL"]});
-        assert!(is_inmail_conversation(&conv));
+    fn reply_payload_pins_conversation_and_omits_recipients() {
+        let convo = "urn:li:msg_conversation:(urn:li:fsd_profile:ME,2-abc123)";
+        let p = build_create_message_payload(
+            "urn:li:fsd_profile:ME",
+            "hello",
+            MessageTarget::Reply(convo),
+        );
+        assert_eq!(p["message"]["conversationUrn"], convo);
+        assert_eq!(p["message"]["body"]["text"], "hello");
+        // A reply must NOT carry hostRecipientUrns — that is the recipient-set
+        // routing that forked InMail threads.
+        assert!(p.get("hostRecipientUrns").is_none());
+        assert_eq!(p["dedupeByClientGeneratedToken"], false);
+        assert_eq!(
+            p["trackingId"].as_str().map(|s| s.chars().count()),
+            Some(16)
+        );
     }
 
     #[test]
-    fn inmail_detected_via_type_text() {
-        let obj_label = json!({"conversationTypeText": {"text": "InMail"}});
-        let bare_label = json!({"conversationTypeText": "InMail"});
-        assert!(is_inmail_conversation(&obj_label));
-        assert!(is_inmail_conversation(&bare_label));
-    }
-
-    #[test]
-    fn regular_conversation_is_not_inmail() {
-        let conv = json!({
-            "categories": ["INBOX", "PRIMARY_INBOX"],
-            "conversationTypeText": {"text": "Sponsored"}
-        });
-        assert!(!is_inmail_conversation(&conv));
-        assert!(!is_inmail_conversation(&json!({})));
+    fn new_message_payload_uses_recipients_not_conversation() {
+        let recips = vec!["urn:li:fsd_profile:OTHER".to_string()];
+        let p = build_create_message_payload(
+            "urn:li:fsd_profile:ME",
+            "hi",
+            MessageTarget::NewConversation(&recips),
+        );
+        assert_eq!(p["hostRecipientUrns"][0], "urn:li:fsd_profile:OTHER");
+        assert!(p["message"].get("conversationUrn").is_none());
     }
 
     #[test]
@@ -457,19 +410,5 @@ mod tests {
             "must state the message went out: {msg}"
         );
         assert!(msg.contains("new thread"), "must name the misroute: {msg}");
-    }
-
-    #[test]
-    fn recipient_urns_exclude_self() {
-        let conv = json!({"conversationParticipants": [
-            {"hostIdentityUrn": "urn:li:fsd_profile:ME"},
-            {"hostIdentityUrn": "urn:li:fsd_profile:OTHER"},
-            {"participantType": {"member": {"entityUrn": "urn:li:fsd_profile:THIRD"}}}
-        ]});
-        let urns = extract_recipient_urns(&conv, "urn:li:fsd_profile:ME");
-        assert_eq!(
-            urns,
-            vec!["urn:li:fsd_profile:OTHER", "urn:li:fsd_profile:THIRD"]
-        );
     }
 }
