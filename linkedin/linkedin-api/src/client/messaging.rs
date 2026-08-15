@@ -1,5 +1,7 @@
 //! Messaging API methods on `LinkedInClient`.
 
+use std::str::FromStr;
+
 use serde_json::Value;
 
 use crate::error::Error;
@@ -8,25 +10,71 @@ use crate::urn::{ConversationUrn, ProfileUrn};
 use super::internal::{graphql_params, restli_encode_string, unwrap_graphql};
 use super::LinkedInClient;
 
+/// Inbox category accepted by LinkedIn's `messengerConversationsByCategory`
+/// GraphQL query. LinkedIn splits conversations into a focused primary inbox
+/// and a filtered spam/other folder; this selects which one to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConversationCategory {
+    /// The focused primary inbox — the default view.
+    #[default]
+    PrimaryInbox,
+    /// The filtered spam / "other" folder.
+    Spam,
+}
+
+impl ConversationCategory {
+    /// Wire-format string sent to the GraphQL endpoint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryInbox => "PRIMARY_INBOX",
+            Self::Spam => "SPAM",
+        }
+    }
+}
+
+impl FromStr for ConversationCategory {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_uppercase().replace('-', "_").as_str() {
+            "PRIMARY" | "PRIMARY_INBOX" | "INBOX" => Ok(Self::PrimaryInbox),
+            "SPAM" | "OTHER" => Ok(Self::Spam),
+            other => Err(format!(
+                "unknown conversation category '{other}' (expected 'primary' or 'spam')"
+            )),
+        }
+    }
+}
+
 impl LinkedInClient {
-    /// Fetch the user's messaging conversations.
+    /// Fetch the user's primary-inbox conversations, optionally paginating
+    /// backwards with a `lastActivityBefore` timestamp cursor.
+    ///
+    /// Thin wrapper over [`get_conversations_by_category`] pinned to
+    /// [`ConversationCategory::PrimaryInbox`] for the many existing callers.
     pub async fn get_conversations(
         &self,
         count: u32,
         created_before: Option<u64>,
     ) -> Result<Value, Error> {
+        self.get_conversations_by_category(
+            count,
+            created_before,
+            ConversationCategory::PrimaryInbox,
+        )
+        .await
+    }
+
+    /// Fetch conversations from a specific inbox `category`, optionally
+    /// paginating backwards with a `last_activity_before` timestamp cursor.
+    pub async fn get_conversations_by_category(
+        &self,
+        count: u32,
+        last_activity_before: Option<u64>,
+        category: ConversationCategory,
+    ) -> Result<Value, Error> {
         let mailbox_urn = self.my_profile_urn().await?;
-        let encoded_urn = restli_encode_string(mailbox_urn);
-        let vars = match created_before {
-            Some(ts) => format!(
-                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{},lastActivityBefore:{})",
-                encoded_urn, count, ts
-            ),
-            None => format!(
-                "(mailboxUrn:{},category:PRIMARY_INBOX,count:{})",
-                encoded_urn, count
-            ),
-        };
+        let vars = build_conversations_vars(mailbox_urn, category, count, last_activity_before);
         let params = graphql_params(
             &vars,
             "voyagerMessagingDashMessengerConversations.7dc50d3efc3953190125aca9c05f0af6",
@@ -165,6 +213,33 @@ impl std::fmt::Display for ThreadId<'_> {
     }
 }
 
+/// Build the GraphQL `variables` tuple for `messengerConversationsByCategory`.
+/// The `lastActivityBefore` clause is appended only when a cursor timestamp
+/// is supplied, matching the shapes captured from live traffic.
+fn build_conversations_vars(
+    mailbox_urn: &str,
+    category: ConversationCategory,
+    count: u32,
+    last_activity_before: Option<u64>,
+) -> String {
+    let encoded_urn = restli_encode_string(mailbox_urn);
+    match last_activity_before {
+        Some(ts) => format!(
+            "(mailboxUrn:{},category:{},count:{},lastActivityBefore:{})",
+            encoded_urn,
+            category.as_str(),
+            count,
+            ts
+        ),
+        None => format!(
+            "(mailboxUrn:{},category:{},count:{})",
+            encoded_urn,
+            category.as_str(),
+            count
+        ),
+    }
+}
+
 /// Build a synthesized (non-HTTP) API error with status 0.
 fn synthesized_error(body: String) -> Error {
     Error::Api {
@@ -287,6 +362,51 @@ fn participant_urn(p: &Value) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn category_parses_aliases_case_insensitively() {
+        for s in ["primary", "PRIMARY_INBOX", "inbox", "Primary-Inbox"] {
+            assert_eq!(s.parse(), Ok(ConversationCategory::PrimaryInbox));
+        }
+        for s in ["spam", "OTHER"] {
+            assert_eq!(s.parse(), Ok(ConversationCategory::Spam));
+        }
+        assert!("archive".parse::<ConversationCategory>().is_err());
+    }
+
+    #[test]
+    fn category_default_is_primary_inbox() {
+        assert_eq!(
+            ConversationCategory::default(),
+            ConversationCategory::PrimaryInbox
+        );
+    }
+
+    #[test]
+    fn conversations_vars_omit_cursor_when_absent() {
+        let vars = build_conversations_vars(
+            "urn:li:fsd_profile:ME",
+            ConversationCategory::Spam,
+            20,
+            None,
+        );
+        assert_eq!(
+            vars,
+            "(mailboxUrn:urn%3Ali%3Afsd_profile%3AME,category:SPAM,count:20)"
+        );
+    }
+
+    #[test]
+    fn conversations_vars_append_cursor_when_present() {
+        let vars = build_conversations_vars(
+            "urn:li:fsd_profile:ME",
+            ConversationCategory::PrimaryInbox,
+            10,
+            Some(1774352369361),
+        );
+        assert!(vars.contains("category:PRIMARY_INBOX"));
+        assert!(vars.ends_with(",lastActivityBefore:1774352369361)"));
+    }
 
     #[test]
     fn inmail_detected_via_categories() {

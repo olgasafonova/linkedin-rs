@@ -26,6 +26,7 @@ mod options;
 mod profile;
 mod search;
 
+pub use messaging::ConversationCategory;
 pub use options::ClientOptions;
 
 use internal::{check_graphql_errors, check_response};

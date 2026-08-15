@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use linkedin_api::client::LinkedInClient;
+use linkedin_api::client::{ConversationCategory, LinkedInClient};
 use linkedin_api::models::{ConnectionsResponse, Paging};
 use linkedin_api::urn::{ConversationUrn, ProfileUrn};
 
@@ -780,18 +780,22 @@ pub fn extract_conversation_names(conv: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Handle `messages list [--count N] [--start N] [--json]`.
+/// Handle `messages list [--count N] [--before TS] [--category primary|spam] [--json]`.
 ///
-/// Loads the session, calls GET /voyager/api/messaging/conversations with
-/// pagination params, and prints the results.
+/// Loads the session, fetches conversations from the requested inbox
+/// category, and prints the results.
 pub async fn cmd_messages_list(
     count: u32,
     created_before: Option<u64>,
+    category: &str,
     raw_json: bool,
 ) -> CliResult<()> {
+    let category: ConversationCategory = category.parse().map_err(CliError::Input)?;
     let (client, _path) = load_session_client()?;
 
-    let value = client.get_conversations(count, created_before).await?;
+    let value = client
+        .get_conversations_by_category(count, created_before, category)
+        .await?;
 
     if raw_json {
         return print_json(&value);

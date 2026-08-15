@@ -114,8 +114,9 @@ async fn dispatch_messages(action: MessagesAction) {
         MessagesAction::List {
             count,
             before,
+            category,
             json,
-        } => exit_on_err(cmd_messages_list(count, before, json).await),
+        } => exit_on_err(cmd_messages_list(count, before, &category, json).await),
         MessagesAction::Read {
             conversation_id,
             before,

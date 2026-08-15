@@ -668,6 +668,10 @@ pub enum MessagesAction {
         #[arg(long)]
         before: Option<u64>,
 
+        /// Inbox category to read: "primary" (default) or "spam"
+        #[arg(long, default_value = "primary")]
+        category: String,
+
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
         json: bool,
