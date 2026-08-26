@@ -134,14 +134,31 @@ but two things captured live on 26-08-2026 change how this actually works:
    `organizationActorUrn` body field is the legacy voyager mechanism; the SDUI
    endpoint uses the header.
 
-**Open question (do NOT brute-force):** whether the legacy voyager
-`CreateSocialDashNormComments` mutation honours the `x-li-actor` header. Sending
-`organizationActorUrn` in the body alone returns 500 (`urn:li:organization:`
-form) or 403 `UnauthorizedUrnException: Failed to decorate the URN`
-(`urn:li:fsd_company:` form). Adding the `x-li-actor` header to the voyager call
-is the untested candidate. It was NOT tested on 26-08-2026 because the session
-appeared write-throttled after ~5 rapid failed attempts (see below); test it
-from a fresh, un-poked session with a single attempt.
+**RESOLVED 26-08-2026 — the voyager mutation cannot post as a company page.**
+Tested with the full mechanism (`x-li-actor` header + `organizationActor` query
+param + `organizationActorUrn` body, all three at once) on a **fresh, un-throttled
+post** (Dementiy Besarab, `urn:li:activity:7496146635555733504`, 6 days old,
+never previously touched). Result: HTTP 500 `DataFetchingException: Internal
+error fetching data from downstream`, `createSocialDashNormComments: null`.
+Because the post was fresh, this is **not** the write-throttle below — it is
+structural. Summary of every combination tried:
+
+| Payload | Result |
+|---|---|
+| body `organizationActorUrn: urn:li:organization:<id>` only | 500 downstream error |
+| body `organizationActorUrn: urn:li:fsd_company:<id>` only | 403 `UnauthorizedUrnException: Failed to decorate the URN` |
+| body + `organizationActor` param + `x-li-actor` header (organization form) | 500 downstream error |
+
+Conclusion: company-page comments go **only** through the SDUI endpoint
+(`com.linkedin.sdui.comments.createComment`, item 1 above), whose body carries
+server-generated render-state keys a headless client cannot fabricate. There is
+**no voyager path** for acting-as-page comments. The `--as-org` flag and its
+`x-li-actor`/`organizationActor`/`organizationActorUrn` plumbing are retained in
+the code (they are correct against the captured web *identity* encoding, and
+harmless for member comments), but do not expect them to succeed against
+voyager. Commenting as a member (no `--as-org`) is unaffected. For automated
+page comments, the only viable channel is the official LinkedIn Community
+Management API (developer app + OAuth), not the internal voyager surface.
 
 **Write-throttle observation (26-08-2026):** after ~5 failed comment-create
 attempts on one post in a short window (2 browser, 3 voyager API), *even a
