@@ -56,13 +56,20 @@ pub async fn cmd_feed_unreact(
     Ok(())
 }
 
-pub async fn cmd_feed_comment(
-    post_urn: &str,
-    text: &str,
-    confirmed: bool,
-    raw_json: bool,
-) -> CliResult<()> {
-    if !confirmed {
+/// Arguments for `feed comment`. Bundled into a struct to match the
+/// `FeedListOptions` / `FeedReactionsOptions` pattern used elsewhere in this
+/// module and to keep the handler under the argument-count threshold.
+pub struct FeedCommentOptions<'a> {
+    pub post_urn: &'a str,
+    pub text: &'a str,
+    /// Comment as a company page the session member administers.
+    pub as_org: Option<&'a str>,
+    pub confirmed: bool,
+    pub raw_json: bool,
+}
+
+pub async fn cmd_feed_comment(opts: FeedCommentOptions<'_>) -> CliResult<()> {
+    if !opts.confirmed {
         return Err(CliError::Input(
             "this will create a REAL COMMENT on a LinkedIn post. \
              Pass --yes to confirm."
@@ -70,18 +77,43 @@ pub async fn cmd_feed_comment(
         ));
     }
 
-    let resolved_urn = resolve_post_urn(post_urn)?;
+    let org_urn = opts.as_org.map(normalize_org_urn).transpose()?;
+
+    let resolved_urn = resolve_post_urn(opts.post_urn)?;
     let (client, _path) = load_session_client()?;
 
-    eprintln!("Commenting on {}...", resolved_urn);
-    let result = client.comment_on_post(&resolved_urn, text).await?;
+    match &org_urn {
+        Some(org) => eprintln!("Commenting on {} as {}...", resolved_urn, org),
+        None => eprintln!("Commenting on {}...", resolved_urn),
+    }
+    let result = client
+        .comment_on_post(&resolved_urn, opts.text, org_urn.as_deref())
+        .await?;
 
-    if raw_json {
+    if opts.raw_json {
         print_json(&result)?;
     } else {
-        println!("Commented on {}", resolved_urn);
+        match &org_urn {
+            Some(org) => println!("Commented on {} as {}", resolved_urn, org),
+            None => println!("Commented on {}", resolved_urn),
+        }
     }
     Ok(())
+}
+
+/// Accept a bare numeric organization ID or a full organization/company URN.
+fn normalize_org_urn(input: &str) -> CliResult<String> {
+    if input.chars().all(|c| c.is_ascii_digit()) && !input.is_empty() {
+        return Ok(format!("urn:li:organization:{}", input));
+    }
+    if input.starts_with("urn:li:organization:") || input.starts_with("urn:li:fsd_company:") {
+        return Ok(input.to_string());
+    }
+    Err(CliError::Input(format!(
+        "invalid --as-org value '{}': expected a numeric organization ID, \
+         urn:li:organization:<id>, or urn:li:fsd_company:<id>",
+        input
+    )))
 }
 
 pub async fn cmd_feed_post(

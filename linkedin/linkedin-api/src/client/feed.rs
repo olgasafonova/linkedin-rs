@@ -11,7 +11,7 @@ use crate::urn::{ActivityUrn, ProfileUrn, SocialDetailUrn};
 use super::internal::{
     check_graphql_errors, check_response, graphql_params, restli_encode_string, unwrap_graphql,
 };
-use super::{LinkedInClient, API_PREFIX, BASE_URL};
+use super::{GraphqlExtras, GraphqlMutation, LinkedInClient, API_PREFIX, BASE_URL};
 
 /// Valid reaction type strings accepted by the LinkedIn API.
 ///
@@ -272,23 +272,54 @@ impl LinkedInClient {
     }
 
     /// Comment on a feed post.
+    ///
+    /// Pass `organization_actor` (an `urn:li:organization:<id>`) to comment
+    /// as a company page the session member administers. `NormCommentForUpdate`
+    /// carries this as the optional `organizationActorUrn` field; see
+    /// `re/comments.md` for the decompiled model.
     pub async fn comment_on_post(
         &self,
         post_urn: &ActivityUrn,
         text: &str,
+        organization_actor: Option<&str>,
     ) -> Result<Value, Error> {
         let thread = post_urn.as_str();
-        let variables = serde_json::json!({
-            "entity": {
-                "commentary": { "text": text },
-                "threadUrn": thread,
-                "origin": "FEED"
-            }
+        let mut entity = serde_json::json!({
+            "commentary": { "text": text },
+            "threadUrn": thread,
+            "origin": "FEED"
         });
-        self.graphql_post(
+        if let Some(org_urn) = organization_actor {
+            entity["organizationActorUrn"] = serde_json::Value::String(org_urn.to_string());
+        }
+        let variables = serde_json::json!({ "entity": entity });
+
+        // Acting-as-page context. The web client (captured 26-08-2026) sends
+        // the identity in an `x-li-actor` header whose value is base64 of
+        // `organizationId=<numeric id>`, alongside the body field. We send both
+        // and let the server pick. See `re/comments.md`.
+        let actor_header = organization_actor
+            .and_then(organization_id_from_urn)
+            .map(|id| encode_actor(&id));
+        let params: Vec<(&str, &str)> = match organization_actor {
+            Some(org_urn) => vec![("organizationActor", org_urn)],
+            None => Vec::new(),
+        };
+        let headers: Vec<(&str, &str)> = match &actor_header {
+            Some(value) => vec![("x-li-actor", value.as_str())],
+            None => Vec::new(),
+        };
+
+        self.graphql_post_full(
             &variables,
-            "voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e",
-            "CreateSocialDashNormComments",
+            GraphqlMutation {
+                query_id: "voyagerSocialDashNormComments.cd3d2a3fd6c9b2881c7cac32847ec05e",
+                query_name: "CreateSocialDashNormComments",
+                extras: GraphqlExtras {
+                    params: &params,
+                    headers: &headers,
+                },
+            },
         )
         .await
     }
@@ -393,10 +424,55 @@ fn metadata_contains_id(metadata: &Value, id: &str) -> bool {
     urn_match || share_match
 }
 
+/// Extract the numeric organization id from an `urn:li:organization:<id>` or
+/// `urn:li:fsd_company:<id>` URN. Returns `None` if the URN is not one of those
+/// forms or has a non-numeric tail.
+fn organization_id_from_urn(urn: &str) -> Option<String> {
+    let id = urn
+        .strip_prefix("urn:li:organization:")
+        .or_else(|| urn.strip_prefix("urn:li:fsd_company:"))?;
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Encode an organization id as the `x-li-actor` header value the web client
+/// sends: base64 of `organizationId=<id>`.
+fn encode_actor(org_id: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(format!("organizationId={}", org_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn organization_id_parses_both_urn_forms() {
+        assert_eq!(
+            organization_id_from_urn("urn:li:organization:110432675"),
+            Some("110432675".to_string())
+        );
+        assert_eq!(
+            organization_id_from_urn("urn:li:fsd_company:110432675"),
+            Some("110432675".to_string())
+        );
+        assert_eq!(organization_id_from_urn("urn:li:activity:123"), None);
+        assert_eq!(organization_id_from_urn("urn:li:organization:abc"), None);
+        assert_eq!(organization_id_from_urn("urn:li:organization:"), None);
+    }
+
+    #[test]
+    fn encode_actor_matches_captured_web_value() {
+        // Captured from the live web client 26-08-2026 for org 110432675.
+        assert_eq!(
+            encode_actor("110432675"),
+            "b3JnYW5pemF0aW9uSWQ9MTEwNDMyNjc1"
+        );
+    }
 
     #[test]
     fn element_matches_activity_id_via_entity_urn() {
