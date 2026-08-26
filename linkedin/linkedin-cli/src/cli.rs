@@ -206,6 +206,11 @@ pub enum FeedAction {
         /// The comment text
         text: String,
 
+        /// Comment as a company page you administer: numeric organization
+        /// ID or full urn:li:organization:<id> URN
+        #[arg(long = "as-org")]
+        as_org: Option<String>,
+
         /// Skip confirmation prompt (required for non-interactive use)
         #[arg(long)]
         yes: bool,

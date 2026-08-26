@@ -34,7 +34,7 @@ use events::{cmd_event_attendees, cmd_event_view};
 use feed::{
     cmd_feed_comment, cmd_feed_comments, cmd_feed_list, cmd_feed_my_posts, cmd_feed_post,
     cmd_feed_react, cmd_feed_reactions, cmd_feed_read, cmd_feed_stats, cmd_feed_unreact,
-    cmd_feed_view, FeedListOptions, FeedReactionsOptions,
+    cmd_feed_view, FeedCommentOptions, FeedListOptions, FeedReactionsOptions,
 };
 use messages::{
     cmd_inbox, cmd_messages_list, cmd_messages_read, cmd_messages_reply, cmd_messages_send, cmd_who,
@@ -202,9 +202,19 @@ async fn dispatch_feed_write(action: FeedAction) {
         FeedAction::Comment {
             post_urn,
             text,
+            as_org,
             yes,
             json,
-        } => exit_on_err(cmd_feed_comment(&post_urn, &text, yes, json).await),
+        } => {
+            let opts = FeedCommentOptions {
+                post_urn: &post_urn,
+                text: &text,
+                as_org: as_org.as_deref(),
+                confirmed: yes,
+                raw_json: json,
+            };
+            exit_on_err(cmd_feed_comment(opts).await);
+        }
         FeedAction::Post {
             text,
             visibility,

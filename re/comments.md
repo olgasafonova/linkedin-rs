@@ -104,6 +104,54 @@ For a text-only comment, only these fields are needed:
 - `entity.threadUrn` - The post URN
 - `entity.origin` - Usually `FEED`
 
+### Commenting as a company page (organization actor)
+
+`NormCommentForUpdate` carries `organizationActorUrn` for page-admin comments,
+but two things captured live on 26-08-2026 change how this actually works:
+
+1. **The modern web client no longer uses the voyager GraphQL endpoint for
+   comment creation.** It POSTs to the server-driven-UI action endpoint:
+
+   ```
+   POST /flagship-web/rsc-action/actions/server-request?sduiid=<...>&parentSpanId=<...>
+   requestId: com.linkedin.sdui.comments.createComment
+   ```
+
+   The body is an SDUI payload keyed by server-generated render state
+   (`commentBoxText-CgsIgMDVwMX3y4rQAQ-...`), so it **cannot be reconstructed
+   offline** — the state keys come from the live page render. Replaying this
+   endpoint from a headless CLI is not practical.
+
+2. **The acting identity is carried in an `x-li-actor` HTTP header, not a body
+   field.** Value is base64 of a query-string form:
+
+   ```
+   x-li-actor: b3JnYW5pemF0aW9uSWQ9MTEwNDMyNjc1
+   # base64-decodes to: organizationId=110432675
+   ```
+
+   So acting-as-page = `x-li-actor: base64("organizationId=<id>")`. The
+   `organizationActorUrn` body field is the legacy voyager mechanism; the SDUI
+   endpoint uses the header.
+
+**Open question (do NOT brute-force):** whether the legacy voyager
+`CreateSocialDashNormComments` mutation honours the `x-li-actor` header. Sending
+`organizationActorUrn` in the body alone returns 500 (`urn:li:organization:`
+form) or 403 `UnauthorizedUrnException: Failed to decorate the URN`
+(`urn:li:fsd_company:` form). Adding the `x-li-actor` header to the voyager call
+is the untested candidate. It was NOT tested on 26-08-2026 because the session
+appeared write-throttled after ~5 rapid failed attempts (see below); test it
+from a fresh, un-poked session with a single attempt.
+
+**Write-throttle observation (26-08-2026):** after ~5 failed comment-create
+attempts on one post in a short window (2 browser, 3 voyager API), *even a
+genuine manual comment from the browser stopped persisting* — the create request
+fired but the post's comment count never incremented across multiple reloads.
+Reactions still persisted. This looks like a per-post/per-session comment-write
+soft-block, not a payload problem. The lesson mirrors the beads
+receipts-that-lie rule: verify the effect (fresh reload), and back off rather
+than retry into an anti-abuse surface.
+
 ### Notes
 
 - The operation name follows the Dash convention: `CreateSocialDashNormComments`

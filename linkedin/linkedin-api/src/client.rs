@@ -348,21 +348,25 @@ impl LinkedInClient {
         query_id: &str,
         query_name: &str,
     ) -> Result<Value, Error> {
-        let url = format!(
-            "{}{}graphql?action=execute&queryId={}&queryName={}",
-            BASE_URL, API_PREFIX, query_id, query_name
-        );
-        let body = build_graphql_post_body(variables, query_id, query_name);
+        self.graphql_post_full(variables, GraphqlMutation::new(query_id, query_name))
+            .await
+    }
+
+    /// Send a GraphQL mutation POST, optionally carrying acting-context extras
+    /// (a company-page identity) via [`GraphqlMutation::extras`].
+    pub async fn graphql_post_full(
+        &self,
+        variables: &Value,
+        mutation: GraphqlMutation<'_>,
+    ) -> Result<Value, Error> {
+        let url = build_graphql_url(&mutation);
+        let body = build_graphql_post_body(variables, mutation.query_id, mutation.query_name);
 
         let mut attempt = 0u32;
         loop {
             self.throttle().await;
             let resp = self
-                .http
-                .post(&url)
-                .header("Csrf-Token", &self.jsessionid)
-                .header("x-li-graphql-pegasus-client", "true")
-                .json(&body)
+                .graphql_request(&url, &body, mutation.extras.headers)
                 .send()
                 .await?;
             match handle_graphql_post_response(resp).await {
@@ -382,6 +386,26 @@ impl LinkedInClient {
                 GraphqlPostResult::Retry(e) | GraphqlPostResult::Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Build the `reqwest` request for a GraphQL mutation: the standard CSRF and
+    /// pegasus-client headers plus any acting-context headers, with the JSON
+    /// body attached. Kept out of the retry loop so that loop stays flat.
+    fn graphql_request(
+        &self,
+        url: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .http
+            .post(url)
+            .header("Csrf-Token", &self.jsessionid)
+            .header("x-li-graphql-pegasus-client", "true");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.json(body)
     }
 
     /// Send a GET request to an arbitrary path on the LinkedIn host (NOT
@@ -420,6 +444,55 @@ impl LinkedInClient {
     pub fn base_url(&self) -> &str {
         BASE_URL
     }
+}
+
+/// A GraphQL mutation to POST: its query identifiers plus optional
+/// acting-context [`GraphqlExtras`]. Bundling the identifiers with the extras
+/// keeps the request methods to a single descriptor argument.
+pub struct GraphqlMutation<'a> {
+    pub query_id: &'a str,
+    pub query_name: &'a str,
+    pub extras: GraphqlExtras<'a>,
+}
+
+impl<'a> GraphqlMutation<'a> {
+    /// A mutation with no acting-context extras (a plain member write).
+    pub fn new(query_id: &'a str, query_name: &'a str) -> Self {
+        Self {
+            query_id,
+            query_name,
+            extras: GraphqlExtras::default(),
+        }
+    }
+}
+
+/// Acting-context extras for a GraphQL mutation POST.
+///
+/// `params` are appended to the URL query string; `headers` are added to the
+/// request. Used to carry a company-page acting identity on writes — an
+/// `organizationActor` query param and an `x-li-actor` header. Empty by
+/// default, so a plain member write leaves both slices empty.
+#[derive(Default)]
+pub struct GraphqlExtras<'a> {
+    pub params: &'a [(&'a str, &'a str)],
+    pub headers: &'a [(&'a str, &'a str)],
+}
+
+/// Build the Voyager GraphQL execute URL for a mutation, appending any
+/// acting-context query parameters (values minimally percent-encoded for `:`,
+/// which covers URN values).
+fn build_graphql_url(mutation: &GraphqlMutation<'_>) -> String {
+    let mut url = format!(
+        "{}{}graphql?action=execute&queryId={}&queryName={}",
+        BASE_URL, API_PREFIX, mutation.query_id, mutation.query_name
+    );
+    for (name, value) in mutation.extras.params {
+        url.push('&');
+        url.push_str(name);
+        url.push('=');
+        url.push_str(&value.replace(':', "%3A"));
+    }
+    url
 }
 
 // ---------------------------------------------------------------------------
