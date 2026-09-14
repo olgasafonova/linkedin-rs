@@ -18,7 +18,7 @@ rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
 iana-time-zone = "0.1"
 tokio = { version = "1", features = ["sync", "time"] }
-dirs = "6"
+dirs = "7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
