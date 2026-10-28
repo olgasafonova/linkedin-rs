@@ -125,9 +125,14 @@ async fn dispatch_messages(action: MessagesAction) {
         MessagesAction::Send {
             recipient,
             message,
+            also,
             yes,
             json,
-        } => exit_on_err(cmd_messages_send(&recipient, &message, yes, json).await),
+        } => {
+            let mut recipients = vec![recipient];
+            recipients.extend(also);
+            exit_on_err(cmd_messages_send(&recipients, &message, yes, json).await)
+        }
         MessagesAction::Reply {
             conversation_id,
             message,

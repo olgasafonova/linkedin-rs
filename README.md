@@ -36,7 +36,7 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | **Messages** | |
 | `messages list` | List conversations from the primary or spam inbox (`--category primary\|spam`); cursor-based pagination |
 | `messages read <id>` | Read messages in a conversation (cursor-paginated via `--before`; no `--count`) |
-| `messages send <recipient> <text>` | Send a message to a connection (new conversation) |
+| `messages send <recipient> <text> [--also <recipient>]...` | Send a message to a connection (new conversation); repeat `--also` to start a group conversation |
 | `messages reply <id> <text>` | Reply to an existing conversation thread (stays in-thread for InMail/recruiter threads too) |
 | **Connections** | |
 | `connections list` | List your connections (paginated); `--all` to fetch every one, `--keyword` to filter |
