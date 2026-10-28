@@ -90,8 +90,22 @@ impl LinkedInClient {
         recipient_profile_urn: &ProfileUrn,
         message_body: &str,
     ) -> Result<Value, Error> {
+        self.send_group_message(std::slice::from_ref(recipient_profile_urn), message_body)
+            .await
+    }
+
+    /// Start a new conversation with one or more members. With several
+    /// recipients this creates a group conversation including all of them.
+    pub async fn send_group_message(
+        &self,
+        recipient_profile_urns: &[ProfileUrn],
+        message_body: &str,
+    ) -> Result<Value, Error> {
         let my_urn = self.my_profile_urn().await?;
-        let recipients = vec![recipient_profile_urn.as_str().to_string()];
+        let recipients: Vec<String> = recipient_profile_urns
+            .iter()
+            .map(|urn| urn.as_str().to_string())
+            .collect();
         let payload = build_create_message_payload(
             my_urn,
             message_body,

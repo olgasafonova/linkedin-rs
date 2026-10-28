@@ -705,6 +705,10 @@ pub enum MessagesAction {
         /// Message text to send
         message: String,
 
+        /// Additional recipient for a group conversation (repeatable)
+        #[arg(long = "also", value_name = "RECIPIENT")]
+        also: Vec<String>,
+
         /// Skip confirmation prompt (required for non-interactive use)
         #[arg(long)]
         yes: bool,

@@ -870,34 +870,39 @@ pub async fn cmd_messages_read(
     Ok(())
 }
 
-/// Handle `messages send <recipient> <message> [--yes] [--json]`.
+/// Handle `messages send <recipient> <message> [--also <recipient>]... [--yes] [--json]`.
 ///
-/// Resolves the recipient's public identifier to an fsd_profile URN, then
-/// sends a message via the REST messaging/conversations?action=create endpoint.
+/// Resolves each recipient's public identifier to an fsd_profile URN, then
+/// sends one message that starts a new conversation with all of them.
 pub async fn cmd_messages_send(
-    recipient: &str,
+    recipients: &[String],
     message: &str,
     confirmed: bool,
     raw_json: bool,
 ) -> CliResult<()> {
+    let names = recipients.join(", ");
     if !confirmed {
-        return Err(CliError::Input(send_confirmation_error(recipient, message)));
+        return Err(CliError::Input(send_confirmation_error(&names, message)));
     }
 
     let (client, _path) = load_session_client()?;
-    let profile_urn = resolve_send_recipient(&client, recipient).await?;
-    eprintln!("Recipient URN: {}", profile_urn);
+    let mut profile_urns = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let profile_urn = resolve_send_recipient(&client, recipient).await?;
+        eprintln!("Recipient URN: {}", profile_urn);
+        profile_urns.push(profile_urn);
+    }
 
     eprintln!("Sending message...");
     let value = client
-        .send_message(&profile_urn, message)
+        .send_group_message(&profile_urns, message)
         .await
         .map_err(|e| CliError::Other(format!("failed to send message: {e}")))?;
 
     if raw_json {
         print_json(&value)?;
     } else {
-        println!("Message sent to {} ({})", recipient, profile_urn);
+        println!("Message sent to {}", names);
     }
     Ok(())
 }
