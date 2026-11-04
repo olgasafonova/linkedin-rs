@@ -833,13 +833,14 @@ pub async fn cmd_messages_list(
 pub async fn cmd_messages_read(
     conversation_id: &str,
     created_before: Option<u64>,
+    count: usize,
     raw_json: bool,
 ) -> CliResult<()> {
     let (client, _path) = load_session_client()?;
     let conv_urn = ConversationUrn::from(conversation_id);
 
     let value = client
-        .get_conversation_events(&conv_urn, created_before)
+        .get_conversation_events(&conv_urn, created_before, count)
         .await?;
 
     if raw_json {
@@ -1095,7 +1096,7 @@ async fn preview_thread_then_abort(conversation_id: &str, message: &str) -> CliR
     let (client, _path) = load_session_client()?;
     let conv_urn = ConversationUrn::from(conversation_id);
     let events = client
-        .get_conversation_events(&conv_urn, None)
+        .get_conversation_events(&conv_urn, None, 3)
         .await
         .map_err(|e| CliError::Other(format!("failed to load conversation: {e}")))?;
     let elements = elements_slice(&events);

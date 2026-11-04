@@ -120,8 +120,9 @@ async fn dispatch_messages(action: MessagesAction) {
         MessagesAction::Read {
             conversation_id,
             before,
+            count,
             json,
-        } => exit_on_err(cmd_messages_read(&conversation_id, before, json).await),
+        } => exit_on_err(cmd_messages_read(&conversation_id, before, count, json).await),
         MessagesAction::Send {
             recipient,
             message,

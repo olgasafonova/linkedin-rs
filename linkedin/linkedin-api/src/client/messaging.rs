@@ -160,11 +160,20 @@ impl LinkedInClient {
         Ok(response)
     }
 
-    /// Fetch events (messages) within a specific conversation.
+    /// Fetch the latest `count` messages in a conversation, optionally only
+    /// those delivered before `created_before` (epoch millis).
+    ///
+    /// LinkedIn returns this query oldest-first and silently ignores a
+    /// `deliveredBefore` variable, so a single request only ever yields the
+    /// first page of the thread. The only paging it honours is the
+    /// `metadata.nextCursor` it hands back, which walks forward. This follows
+    /// that cursor to the end of the thread, then filters and trims
+    /// client-side. Returns `{ elements, metadata }` like a single page.
     pub async fn get_conversation_events(
         &self,
         conversation_urn: &ConversationUrn,
         created_before: Option<u64>,
+        count: usize,
     ) -> Result<Value, Error> {
         let raw = conversation_urn.as_str();
         let full_urn = if raw.starts_with("urn:li:msg_conversation:") {
@@ -176,18 +185,81 @@ impl LinkedInClient {
         };
         let encoded_urn = restli_encode_string(&full_urn);
 
-        let variables = match created_before {
-            Some(ts) => format!("(conversationUrn:{},deliveredBefore:{})", encoded_urn, ts),
-            None => format!("(conversationUrn:{})", encoded_urn),
-        };
-        let params = graphql_params(
-            &variables,
-            "voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a",
-            "MessengerMessagesByConversation",
-        );
-        let raw = self.graphql_get(&params).await?;
-        unwrap_graphql(&raw, "messengerMessagesByConversation")
+        let mut all: Vec<Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut metadata = Value::Null;
+        for _ in 0..MAX_MESSAGE_PAGES {
+            let variables = match &cursor {
+                Some(c) => format!(
+                    "(conversationUrn:{},count:{},nextCursor:{})",
+                    encoded_urn,
+                    MESSAGE_PAGE_SIZE,
+                    restli_encode_string(c)
+                ),
+                None => format!(
+                    "(conversationUrn:{},count:{})",
+                    encoded_urn, MESSAGE_PAGE_SIZE
+                ),
+            };
+            let params = graphql_params(
+                &variables,
+                "voyagerMessagingDashMessengerMessages.7cde5843a127bbecc3de900d3894a74a",
+                "MessengerMessagesByConversation",
+            );
+            let raw = self.graphql_get(&params).await?;
+            let page = unwrap_graphql(&raw, "messengerMessagesByConversation")?;
+            let elements = page
+                .get("elements")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            metadata = page.get("metadata").cloned().unwrap_or(Value::Null);
+            let next = metadata
+                .get("nextCursor")
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
+            let page_empty = elements.is_empty();
+            all.extend(elements);
+            if thread_exhausted(page_empty, &next, &cursor) {
+                break;
+            }
+            cursor = next;
+        }
+
+        let elements = select_latest_messages(all, created_before, count);
+        Ok(serde_json::json!({ "elements": elements, "metadata": metadata }))
     }
+}
+
+/// Messages per request when walking a thread. LinkedIn accepts larger
+/// values; 100 keeps each response modest.
+const MESSAGE_PAGE_SIZE: usize = 100;
+
+/// Upper bound on requests per thread read (10,000 messages), so a cursor
+/// that never terminates cannot loop forever.
+const MAX_MESSAGE_PAGES: usize = 100;
+
+/// True when the last page was empty or LinkedIn handed back no new cursor.
+fn thread_exhausted(page_empty: bool, next: &Option<String>, current: &Option<String>) -> bool {
+    page_empty || next.is_none() || next == current
+}
+
+/// Keep messages delivered strictly before `before` (if given), deduplicate
+/// by `entityUrn`, sort oldest-first, and return the newest `count`.
+fn select_latest_messages(messages: Vec<Value>, before: Option<u64>, count: usize) -> Vec<Value> {
+    let delivered = |m: &Value| m.get("deliveredAt").and_then(|t| t.as_u64()).unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<Value> = messages
+        .into_iter()
+        .filter(|m| before.is_none_or(|b| delivered(m) < b))
+        .filter(|m| match m.get("entityUrn").and_then(|u| u.as_str()) {
+            Some(urn) => seen.insert(urn.to_string()),
+            None => true,
+        })
+        .collect();
+    kept.sort_by_key(delivered);
+    let skip = kept.len().saturating_sub(count);
+    kept.split_off(skip)
 }
 
 /// A bare messaging thread id (e.g. `2-abc123`), typed so it can't be
@@ -321,6 +393,35 @@ fn build_create_message_payload(my_urn: &str, message_body: &str, target: Messag
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn msg(urn: &str, at: u64) -> Value {
+        json!({ "entityUrn": urn, "deliveredAt": at })
+    }
+
+    fn urns(v: &[Value]) -> Vec<&str> {
+        v.iter().map(|m| m["entityUrn"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn select_latest_returns_newest_in_order() {
+        let all = vec![msg("a", 1), msg("b", 2), msg("c", 3), msg("d", 4)];
+        assert_eq!(urns(&select_latest_messages(all, None, 2)), ["c", "d"]);
+    }
+
+    #[test]
+    fn select_latest_applies_before_filter_strictly() {
+        let all = vec![msg("a", 1), msg("b", 2), msg("c", 3), msg("d", 4)];
+        assert_eq!(urns(&select_latest_messages(all, Some(3), 20)), ["a", "b"]);
+    }
+
+    #[test]
+    fn select_latest_dedupes_and_sorts_unordered_pages() {
+        let all = vec![msg("c", 3), msg("a", 1), msg("c", 3), msg("b", 2)];
+        assert_eq!(
+            urns(&select_latest_messages(all, None, 20)),
+            ["a", "b", "c"]
+        );
+    }
 
     #[test]
     fn category_parses_aliases_case_insensitively() {

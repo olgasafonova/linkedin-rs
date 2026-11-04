@@ -35,7 +35,7 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | `feed post <text>` | Create a new text post (public or connections-only) |
 | **Messages** | |
 | `messages list` | List conversations from the primary or spam inbox (`--category primary\|spam`); cursor-based pagination |
-| `messages read <id>` | Read messages in a conversation (cursor-paginated via `--before`; no `--count`) |
+| `messages read <id>` | Read the newest messages in a conversation (`--count`, default 20; `--before <epoch_ms>` to filter) |
 | `messages send <recipient> <text> [--also <recipient>]...` | Send a message to a connection (new conversation); repeat `--also` to start a group conversation |
 | `messages reply <id> <text>` | Reply to an existing conversation thread (stays in-thread for InMail/recruiter threads too) |
 | **Connections** | |
@@ -67,7 +67,7 @@ The CLI (`linkedin-cli`) exposes 45 subcommands across 11 domains:
 | **Shell** | |
 | `completions <shell>` | Generate shell completions (bash, zsh, fish, powershell, elvish) |
 
-Most list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. Exception: `messages read <id>` returns the whole conversation window LinkedIn hands back and paginates only via `--before <epoch_ms>`; it doesn't take `--count`. Write commands that have a visible side effect on others (`feed react`, `feed comment`, `feed post`, `messages send`, `messages reply`) require `--yes` to confirm.
+Most list commands support `--count`, `--start` (or `--before` for cursor pagination), and `--json` for raw JSON output. `messages read <id>` walks the whole thread and shows the newest `--count` messages; `--before <epoch_ms>` limits it to messages delivered before that time. Write commands that have a visible side effect on others (`feed react`, `feed comment`, `feed post`, `messages send`, `messages reply`) require `--yes` to confirm.
 
 ## Installation
 
