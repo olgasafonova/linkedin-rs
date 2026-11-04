@@ -686,9 +686,13 @@ pub enum MessagesAction {
         /// Conversation ID (thread ID portion of URN, e.g. 2-abc123)
         conversation_id: String,
 
-        /// Cursor for pagination: epoch-millis timestamp to fetch messages created before
+        /// Only show messages delivered before this epoch-millis timestamp
         #[arg(long)]
         before: Option<u64>,
+
+        /// Number of most recent messages to show
+        #[arg(long, default_value_t = 20)]
+        count: usize,
 
         /// Output raw JSON instead of human-readable format
         #[arg(long)]
